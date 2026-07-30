@@ -1,10 +1,14 @@
-"""Mach-O binary parser — sections, libraries, symbols, and chained fixups."""
+"""Mach-O binary parser — sections, libraries, symbols, chained fixups, and disassembly."""
 
+import re
 import struct
 import os
 from dataclasses import dataclass, field
 from typing import Optional
 from enum import IntEnum
+
+CALL_MNEMONICS = frozenset({"call", "bl", "blx", "blr"})
+_CALL_TARGET_RE = re.compile(r"#?(0x[0-9a-fA-F]+)")
 
 # Mach-O magic values
 MH_MAGIC = 0xFEEDFACE
@@ -666,12 +670,107 @@ def parse(path: str, slice_index: int = 0) -> MachOInfo:
 
 
 @dataclass
+class BinaryString:
+    file_offset: int    # absolute file offset into the binary
+    addr: int           # virtual address (0 if not mapped)
+    section: str        # e.g. "__TEXT,__cstring"
+    value: str
+
+
+def extract_strings(info: MachOInfo, min_len: int = 4) -> list[BinaryString]:
+    """Scan all data-bearing segments for printable ASCII strings (≥ min_len chars).
+
+    Scans each segment's full raw file region (not just individual sections) so
+    that inter-section gaps are included, matching the coverage of ``strings -a``.
+    Tab (0x09) is included in the printable set, consistent with the strings(1) tool.
+    """
+    results: list[BinaryString] = []
+    # tab is included — consistent with strings(1) behaviour
+    _PRINTABLE = frozenset(range(0x20, 0x7F)) | {0x09}
+
+    with open(info.path, "rb") as fh:
+        data = fh.read()
+
+    # Build a sorted list of (file_start, file_end, "seg,sect") for annotation.
+    sec_ranges: list[tuple[int, int, str]] = []
+    for seg in info.segments:
+        for sect in seg.sections:
+            if sect.offset and sect.size:
+                sec_ranges.append((sect.offset, sect.offset + sect.size,
+                                   f"{sect.segment},{sect.name}"))
+    sec_ranges.sort()
+
+    def _section_at(abs_off: int) -> str:
+        lo, hi = 0, len(sec_ranges) - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            s, e, lbl = sec_ranges[mid]
+            if abs_off < s:
+                hi = mid - 1
+            elif abs_off >= e:
+                lo = mid + 1
+            else:
+                return lbl
+        return "—"
+
+    for seg in info.segments:
+        if seg.filesize == 0:
+            continue
+        seg_data = data[seg.fileoff: seg.fileoff + seg.filesize]
+        i = 0
+        while i < len(seg_data):
+            if seg_data[i] in _PRINTABLE:
+                j = i
+                while j < len(seg_data) and seg_data[j] in _PRINTABLE:
+                    j += 1
+                if j - i >= min_len:
+                    abs_off = seg.fileoff + i
+                    vaddr = (seg.vmaddr + i) if seg.vmaddr else 0
+                    results.append(BinaryString(
+                        file_offset=abs_off,
+                        addr=vaddr,
+                        section=_section_at(abs_off),
+                        value=seg_data[i:j].decode("ascii", errors="replace"),
+                    ))
+                i = j + 1
+            else:
+                i += 1
+
+    results.sort(key=lambda s: s.file_offset)
+    return results
+
+
+@dataclass
 class DisasmInstruction:
     addr: int
     size: int
     mnemonic: str
     op_str: str
     raw: bytes
+
+
+@dataclass
+class CallGraph:
+    addr_to_name: dict[int, str]                     # func start addr → symbol name
+    name_to_addr: dict[str, int]                     # symbol name → func start addr
+    callees: dict[str, list[tuple[str, int]]]        # name → [(callee_name, callee_addr)]
+    callers: dict[str, list[tuple[str, int]]]        # name → [(caller_name, caller_addr)]
+    _sorted_addrs: list[int] = field(default_factory=list)
+
+    def func_at(self, addr: int) -> str | None:
+        """Return the name of the function whose body contains addr."""
+        sa = self._sorted_addrs
+        if not sa:
+            return None
+        lo, hi = 0, len(sa) - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if sa[mid] <= addr:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        idx = lo - 1
+        return self.addr_to_name.get(sa[idx]) if idx >= 0 else None
 
 
 def _cs_arch_mode(arch: str, bits: int) -> tuple[int, int]:
@@ -727,6 +826,78 @@ def disassemble_section(
         )
         for insn in md.disasm(code, target.addr)
     ]
+
+
+def build_call_graph(info: MachOInfo, instrs: list[DisasmInstruction]) -> CallGraph:
+    """Build a call graph from a disassembled instruction list.
+
+    Uses symbol table + exports to name functions; detects call/bl/blx/blr
+    instructions and resolves their targets.  Indirect calls (e.g. ``blr x8``)
+    are recorded as ``<indirect:operand>``.
+    """
+    addr_to_name: dict[int, str] = {}
+    for sym in info.symbols:
+        if not sym.stab and sym.addr and sym.name and (sym.sym_type & N_TYPE) == N_SECT:
+            addr_to_name.setdefault(sym.addr, sym.name)
+    for exp in info.exports:
+        a, n = exp.get("addr", 0), exp.get("name", "")
+        if a and n:
+            addr_to_name.setdefault(a, n)
+
+    sorted_addrs = sorted(addr_to_name)
+    name_to_addr = {v: k for k, v in addr_to_name.items()}
+    callees: dict[str, list[tuple[str, int]]] = {n: [] for n in addr_to_name.values()}
+    callers: dict[str, list[tuple[str, int]]] = {n: [] for n in addr_to_name.values()}
+
+    def _func_at(addr: int) -> tuple[str, int] | None:
+        if not sorted_addrs:
+            return None
+        lo, hi = 0, len(sorted_addrs) - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if sorted_addrs[mid] <= addr:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        idx = lo - 1
+        if idx < 0:
+            return None
+        a = sorted_addrs[idx]
+        return addr_to_name[a], a
+
+    seen: set[tuple[str, str]] = set()
+    for insn in instrs:
+        if insn.mnemonic not in CALL_MNEMONICS:
+            continue
+        result = _func_at(insn.addr)
+        if result is None:
+            continue
+        caller_name, caller_addr = result
+
+        m = _CALL_TARGET_RE.search(insn.op_str)
+        if m:
+            tgt = int(m.group(1), 16)
+            callee_name = addr_to_name.get(tgt, f"sub_{tgt:x}")
+            callee_addr = tgt
+        else:
+            callee_name = f"<indirect:{insn.op_str.strip()}>"
+            callee_addr = 0
+
+        edge = (caller_name, callee_name)
+        if edge in seen:
+            continue
+        seen.add(edge)
+
+        callees.setdefault(caller_name, []).append((callee_name, callee_addr))
+        callers.setdefault(callee_name, []).append((caller_name, caller_addr))
+
+    return CallGraph(
+        addr_to_name=addr_to_name,
+        name_to_addr=name_to_addr,
+        callees=callees,
+        callers=callers,
+        _sorted_addrs=sorted_addrs,
+    )
 
 
 def list_fat_slices(path: str) -> list[tuple[int, str]]:

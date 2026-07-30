@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 from typing import ClassVar
 
+from rich.text import Text
 from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -23,10 +25,109 @@ from textual.widgets import (
     Static,
     TabbedContent,
     TabPane,
+    Tree,
 )
 from textual import work
 
 from disasm import macho
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Disassembly syntax highlighting
+# ──────────────────────────────────────────────────────────────────────────────
+
+_MNEM_RET = frozenset({"ret", "retq", "retn", "eret", "iret", "iretq"})
+_MNEM_NOP = frozenset({"nop", "nopw", "nopl", "fnop"})
+_MNEM_STACK = frozenset({"push", "pop", "pushf", "popf", "pushfq", "popfq"})
+_MNEM_CMP = frozenset({
+    "cmp", "test", "tst", "cmn", "fcmp", "ftst",
+    "ucomisd", "ucomiss", "comisd", "comiss",
+})
+_MNEM_BRANCH = frozenset({
+    "call", "bl", "blr", "blx", "br", "b",
+    "jmp", "je", "jne", "jz", "jnz", "jl", "jg", "jle", "jge",
+    "ja", "jb", "jae", "jbe", "jc", "jnc", "js", "jns", "jo", "jno",
+    "jp", "jnp", "jcxz", "jecxz", "jrcxz",
+    "cbz", "cbnz", "tbz", "tbnz",
+})
+_MNEM_LOGIC = frozenset({
+    "and", "or", "xor", "not", "neg", "inc", "dec", "adc", "sbc",
+    "madd", "msub", "sdiv", "udiv", "lsl", "lsr", "asr", "ror",
+    "shl", "shr", "sar", "rol", "adcs", "subs", "adds", "ands",
+    "orr", "eor", "bic", "mvn",
+})
+
+_X86_REG_RE = re.compile(
+    r'\b('
+    r'r(?:ax|bx|cx|dx|si|di|sp|bp|ip|flags)|'
+    r'r(?:1[0-5]|[89])[bwd]?|'
+    r'e(?:ax|bx|cx|dx|si|di|sp|bp|ip|flags)|'
+    r'[abcd][xhl]|(?:si|di|sp|bp)l?|'
+    r'(?:xmm|ymm|zmm)(?:[12]?\d|3[01])|'
+    r'mm[0-7]|[cdefgs]s|cr[0-8]|dr[0-7]'
+    r')\b',
+    re.IGNORECASE,
+)
+_ARM_REG_RE = re.compile(
+    r'\b('
+    r'[xw](?:[12]?\d|30)|sp|lr|xzr|wzr|fp|pc|'
+    r'[vqdsb](?:[12]?\d|3[01])(?:\.\d[bBhHsS])?'
+    r')\b',
+)
+_HEX_RE = re.compile(r'#?-?0x[0-9a-fA-F]+')
+_DEC_IMM_RE = re.compile(r'#-?\d+(?!\w)')
+
+
+def _colorize_mnemonic(mnemonic: str) -> Text:
+    m = mnemonic.lower()
+    if m in _MNEM_RET:
+        return Text(mnemonic, style="bold red")
+    if m in _MNEM_BRANCH or m.startswith("b.") or (m.startswith("j") and len(m) > 1):
+        return Text(mnemonic, style="bold yellow")
+    if m in _MNEM_NOP:
+        return Text(mnemonic, style="dim")
+    if m in _MNEM_STACK:
+        return Text(mnemonic, style="cyan")
+    if m in _MNEM_CMP:
+        return Text(mnemonic, style="magenta")
+    if m.startswith(("mov", "ldr", "str", "ldp", "stp", "lea", "ld", "st")):
+        return Text(mnemonic, style="green")
+    if m in _MNEM_LOGIC or m.startswith(("add", "sub", "mul", "imul", "div", "idiv")):
+        return Text(mnemonic, style="blue")
+    return Text(mnemonic)
+
+
+def _colorize_operands(op_str: str, arch: str) -> Text:
+    if not op_str:
+        return Text("")
+    reg_re = _ARM_REG_RE if "arm" in arch.lower() else _X86_REG_RE
+
+    spans: list[tuple[int, int, str]] = []
+    for m in _HEX_RE.finditer(op_str):
+        spans.append((m.start(), m.end(), "yellow"))
+    for m in _DEC_IMM_RE.finditer(op_str):
+        spans.append((m.start(), m.end(), "yellow"))
+    for m in reg_re.finditer(op_str):
+        spans.append((m.start(), m.end(), "bright_green"))
+
+    spans.sort(key=lambda x: x[0])
+    deduped: list[tuple[int, int, str]] = []
+    last = 0
+    for s, e, style in spans:
+        if s >= last:
+            deduped.append((s, e, style))
+            last = e
+
+    result = Text()
+    pos = 0
+    for s, e, style in deduped:
+        if pos < s:
+            result.append(op_str[pos:s])
+        result.append(op_str[s:e], style=style)
+        pos = e
+    if pos < len(op_str):
+        result.append(op_str[pos:])
+    return result
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -371,6 +472,129 @@ class ChainedFixupsTab(TabPane):
             event.stop()
 
 
+class CallFlowScreen(Screen):
+    """Modal showing the call graph for a single function — callers and callees."""
+
+    BINDINGS = [
+        Binding("escape", "dismiss(None)", "Close"),
+        Binding("b", "back", "Back"),
+    ]
+
+    def __init__(self, graph: macho.CallGraph, func_name: str) -> None:
+        super().__init__()
+        self._graph = graph
+        self._func_name = func_name
+        self._history: list[str] = []
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="cf-box"):
+            yield Label("", id="cf-title")
+            yield Rule()
+            yield Tree("Call Graph", id="cf-tree")
+            yield Rule()
+            yield Label(
+                "[dim]↑↓ navigate  Enter drill in  b back  Esc close[/dim]",
+                id="cf-hint",
+            )
+
+    def on_mount(self) -> None:
+        self._populate(self._func_name)
+
+    def _populate(self, func_name: str) -> None:
+        graph = self._graph
+        addr = graph.name_to_addr.get(func_name, 0)
+        addr_s = f"0x{addr:x}" if addr else "external"
+        self.query_one("#cf-title", Label).update(
+            f"[bold]{func_name}[/bold]  [dim]{addr_s}[/dim]"
+        )
+
+        tree: Tree = self.query_one("#cf-tree", Tree)
+        tree.root.set_label("Call Graph")
+        tree.root.remove_children()
+
+        callees = graph.callees.get(func_name, [])
+        callers = graph.callers.get(func_name, [])
+
+        callee_node = tree.root.add(
+            f"[green]▶ Calls ({len(callees)})[/green]", expand=True
+        )
+        for name, c_addr in sorted(callees, key=lambda x: x[0]):
+            lbl = name if not c_addr else f"{name}  [dim]0x{c_addr:x}[/dim]"
+            callee_node.add_leaf(lbl, data=("nav", name))
+
+        caller_node = tree.root.add(
+            f"[yellow]▶ Called by ({len(callers)})[/yellow]", expand=True
+        )
+        for name, c_addr in sorted(callers, key=lambda x: x[0]):
+            lbl = f"{name}  [dim]0x{c_addr:x}[/dim]"
+            caller_node.add_leaf(lbl, data=("nav", name))
+
+        tree.root.expand()
+
+    @on(Tree.NodeSelected, "#cf-tree")
+    def _node_selected(self, event: Tree.NodeSelected) -> None:
+        data = event.node.data
+        if not isinstance(data, tuple):
+            return
+        _, func_name = data
+        if func_name == self._func_name:
+            return
+        self._history.append(self._func_name)
+        self._func_name = func_name
+        self._populate(func_name)
+
+    def action_back(self) -> None:
+        if self._history:
+            self._func_name = self._history.pop()
+            self._populate(self._func_name)
+        else:
+            self.dismiss(None)
+
+
+class StringsTab(TabPane):
+    def __init__(self) -> None:
+        super().__init__("Strings", id="tab-strings")
+        self._table: DataTable | None = None
+
+    def compose(self) -> ComposeResult:
+        yield DataTable(id="str-table", cursor_type="row")
+        yield Static("", id="str-status")
+
+    def on_mount(self) -> None:
+        t = self.query_one("#str-table", DataTable)
+        t.add_columns("File Offset", "Address", "Section", "String")
+        self._table = t
+
+    def load(self, info: macho.MachOInfo) -> None:
+        self._load_strings(info)
+
+    @work(thread=True)
+    def _load_strings(self, info: macho.MachOInfo) -> None:
+        self.app.call_from_thread(self._set_status, "Extracting strings…")
+        strings = macho.extract_strings(info)
+        self.app.call_from_thread(self._populate, strings)
+
+    def _set_status(self, msg: str) -> None:
+        try:
+            self.query_one("#str-status", Static).update(msg)
+        except Exception:
+            pass
+
+    def _populate(self, strings: list) -> None:
+        t = self._table
+        if t is None:
+            return
+        t.clear()
+        for s in strings:
+            t.add_row(
+                f"0x{s.file_offset:08x}",
+                f"0x{s.addr:016x}" if s.addr else "—",
+                s.section,
+                s.value,
+            )
+        self._set_status(f"{len(strings):,} strings found")
+
+
 class DisasmTab(TabPane):
     def __init__(self) -> None:
         super().__init__("Disasm", id="tab-disasm")
@@ -378,6 +602,8 @@ class DisasmTab(TabPane):
         self._sections: list[tuple[str, str]] = []
         self._table: DataTable | None = None
         self._list: ListView | None = None
+        self._instrs: list[macho.DisasmInstruction] = []
+        self._call_graph: macho.CallGraph | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="disasm-body"):
@@ -426,7 +652,8 @@ class DisasmTab(TabPane):
             return
         self.app.call_from_thread(self._set_status, f"Disassembling {seg},{sect}…")
         instrs = macho.disassemble_section(self._info, seg, sect)
-        self.app.call_from_thread(self._populate, seg, sect, instrs)
+        graph = macho.build_call_graph(self._info, instrs) if instrs else None
+        self.app.call_from_thread(self._populate, seg, sect, instrs, graph)
 
     def _set_status(self, msg: str) -> None:
         try:
@@ -434,23 +661,54 @@ class DisasmTab(TabPane):
         except Exception:
             pass
 
-    def _populate(self, seg: str, sect: str, instrs: list) -> None:
+    def _populate(self, seg: str, sect: str, instrs: list, graph) -> None:
+        self._instrs = instrs
+        self._call_graph = graph
         t = self._table
         if t is None:
             return
         t.clear()
         if not instrs:
-            self._set_status(f"[red]No output — capstone not installed or section unreadable[/red]")
+            self._set_status("[red]No output — capstone not installed or section unreadable[/red]")
             return
+        arch = self._info.arch if self._info else ""
         for insn in instrs:
             raw_hex = " ".join(f"{b:02x}" for b in insn.raw)
             t.add_row(
-                f"0x{insn.addr:016x}",
-                raw_hex,
-                insn.mnemonic,
-                insn.op_str,
+                Text(f"0x{insn.addr:016x}", style="cyan"),
+                Text(raw_hex, style="dim"),
+                _colorize_mnemonic(insn.mnemonic),
+                _colorize_operands(insn.op_str, arch),
             )
-        self._set_status(f"[dim]{seg},{sect}[/dim]  {len(instrs):,} instructions")
+        self._set_status(
+            f"[dim]{seg},{sect}[/dim]  {len(instrs):,} instructions"
+            "  [dim]c → call flow[/dim]"
+        )
+
+    def on_key(self, event) -> None:
+        if not self.has_focus_within:
+            return
+        if event.key == "c":
+            self._open_call_flow()
+            event.stop()
+
+    def _open_call_flow(self) -> None:
+        if self._call_graph is None or self._table is None:
+            self.app.notify("Disassemble a section first", timeout=3)
+            return
+        row = self._table.cursor_row
+        if row < 0 or row >= len(self._instrs):
+            self.app.notify("Select an instruction row", timeout=2)
+            return
+        addr = self._instrs[row].addr
+        func_name = self._call_graph.func_at(addr)
+        if func_name is None:
+            self.app.notify(
+                f"No function symbol found at 0x{addr:x} — binary may be stripped",
+                timeout=4,
+            )
+            return
+        self.app.push_screen(CallFlowScreen(self._call_graph, func_name))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -493,6 +751,28 @@ DataTable {
 #sym-filter-bar Label, #fix-filter-bar Label {
     margin-right: 2;
 }
+CallFlowScreen {
+    align: center middle;
+    background: $background 60%;
+}
+#cf-box {
+    width: 80;
+    height: 30;
+    border: round $primary;
+    background: $surface;
+    padding: 0 1;
+}
+#cf-title {
+    padding: 1;
+    text-align: center;
+}
+#cf-hint {
+    padding: 0 1 1 1;
+    text-align: center;
+}
+#cf-tree {
+    height: 1fr;
+}
 #disasm-body {
     height: 1fr;
 }
@@ -505,7 +785,7 @@ DataTable {
     width: 1fr;
     height: 1fr;
 }
-#disasm-status {
+#disasm-status, #str-status {
     height: 1;
     padding: 0 1;
     background: $panel;
@@ -541,12 +821,13 @@ class DisasmApp(App):
         Binding("r", "reload", "Reload"),
         Binding("s", "slice", "Switch slice"),
         Binding("1", "tab('tab-segments')",  "Segments"),
-        Binding("2", "tab('tab-sections')",  "Sections"),
-        Binding("3", "tab('tab-libraries')", "Libraries"),
-        Binding("4", "tab('tab-symbols')",   "Symbols"),
-        Binding("5", "tab('tab-exports')",   "Exports"),
-        Binding("6", "tab('tab-fixups')",    "Fixups"),
-        Binding("7", "tab('tab-disasm')",    "Disasm"),
+        Binding("2", "tab('tab-strings')",   "Strings"),
+        Binding("3", "tab('tab-sections')",  "Sections"),
+        Binding("4", "tab('tab-libraries')", "Libraries"),
+        Binding("5", "tab('tab-symbols')",   "Symbols"),
+        Binding("6", "tab('tab-exports')",   "Exports"),
+        Binding("7", "tab('tab-fixups')",    "Fixups"),
+        Binding("8", "tab('tab-disasm')",    "Disasm"),
     ]
 
     _path: reactive[str] = reactive("", recompose=False)
@@ -564,6 +845,7 @@ class DisasmApp(App):
         yield InfoBar(id="info-bar")
         with TabbedContent(id="main-tabs"):
             yield SegmentsTab()
+            yield StringsTab()
             yield SectionsTab()
             yield LibrariesTab()
             yield SymbolsTab()
@@ -582,6 +864,7 @@ class DisasmApp(App):
 
         self.query_one(InfoBar).update_info(info)
         self.query_one(SegmentsTab).load(info)
+        self.query_one(StringsTab).load(info)
         self.query_one(SectionsTab).load(info)
         self.query_one(LibrariesTab).load(info)
         self.query_one(SymbolsTab).load(info)
