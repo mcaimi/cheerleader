@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from disasm.libs.types import BinaryInfo
+from cheerleader.libs.types import BinaryInfo
 
 
 class FormatParser(Protocol):

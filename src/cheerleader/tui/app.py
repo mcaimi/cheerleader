@@ -10,34 +10,43 @@ from textual.binding import Binding
 from textual.reactive import reactive
 from textual.widgets import Footer, Header, TabbedContent
 
-from disasm.formats import detect_format, parse
-from disasm.formats.macho import MachOInfo, list_fat_slices
-from disasm.libs.types import BinaryInfo
-from disasm.tui.screens import SlicePicker
-from disasm.tui.tabs import (
-    ChainedFixupsTab, DisasmTab, ExportsTab, LibrariesTab,
-    SectionsTab, SegmentsTab, StringsTab, SymbolsTab,
+from cheerleader.formats import detect_format, parse
+from cheerleader.formats.macho import MachOInfo, list_fat_slices
+from cheerleader.libs.types import BinaryInfo
+from cheerleader.tui.screens import SlicePicker
+from cheerleader.tui.tabs import (
+    ChainedFixupsTab,
+    DisasmTab,
+    ExportsTab,
+    LibrariesTab,
+    SectionsTab,
+    SegmentsTab,
+    StringsTab,
+    SymbolsTab,
 )
-from disasm.tui.widgets import InfoBar
+from cheerleader.tui.widgets import InfoBar
+
+APP_TITLE = "CHEERLEADER"
+
 
 class DisasmApp(App):
     """Binary inspector TUI."""
 
     CSS_PATH = "app.tcss"
-    TITLE = "disasm — binary inspector"
+    TITLE = "CHEERLEADER — binary inspector"
 
     BINDINGS: ClassVar[list[Binding]] = [
         Binding("q", "quit", "Quit"),
         Binding("r", "reload", "Reload"),
         Binding("s", "slice", "Switch slice"),
-        Binding("1", "tab('tab-segments')",  "Segments"),
-        Binding("2", "tab('tab-strings')",   "Strings"),
-        Binding("3", "tab('tab-sections')",  "Sections"),
+        Binding("1", "tab('tab-segments')", "Segments"),
+        Binding("2", "tab('tab-strings')", "Strings"),
+        Binding("3", "tab('tab-sections')", "Sections"),
         Binding("4", "tab('tab-libraries')", "Libraries"),
-        Binding("5", "tab('tab-symbols')",   "Symbols"),
-        Binding("6", "tab('tab-exports')",   "Exports"),
-        Binding("7", "tab('tab-fixups')",    "Fixups"),
-        Binding("8", "tab('tab-disasm')",    "Disasm"),
+        Binding("5", "tab('tab-symbols')", "Symbols"),
+        Binding("6", "tab('tab-exports')", "Exports"),
+        Binding("7", "tab('tab-fixups')", "Fixups"),
+        Binding("8", "tab('tab-disasm')", "Disasm"),
     ]
 
     _path: reactive[str] = reactive("", recompose=False)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from disasm.libs.types import BinaryInfo, DisasmInstruction, N_TYPE, N_SECT
+from cheerleader.libs.types import BinaryInfo, DisasmInstruction, N_TYPE, N_SECT
 
 CALL_MNEMONICS = frozenset({"call", "bl", "blx", "blr"})
 _CALL_TARGET_RE = re.compile(r"#?(0x[0-9a-fA-F]+)")

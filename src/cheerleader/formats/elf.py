@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from disasm.libs.types import BinaryInfo
+from cheerleader.libs.types import BinaryInfo
 
 ELF_MAGIC = b'\x7fELF'
 

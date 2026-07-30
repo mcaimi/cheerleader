@@ -6,7 +6,7 @@ import os
 
 from textual.widgets import Static
 
-from disasm.libs.types import BinaryInfo
+from cheerleader.libs.types import BinaryInfo
 
 
 class InfoBar(Static):
@@ -29,7 +29,7 @@ class InfoBar(Static):
             f"[yellow]{info.file_type}[/yellow]",
         ]
         # Mach-O specific metadata
-        from disasm.formats.macho import MachOInfo
+        from cheerleader.formats.macho import MachOInfo
         if isinstance(info, MachOInfo):
             meta = []
             if info.uuid:

@@ -8,13 +8,13 @@ from textual.containers import Horizontal
 from textual.widgets import DataTable, Label, ListItem, ListView, Static, TabPane
 from rich.text import Text
 
-from disasm.libs.cfg import CallGraph, build_call_graph, build_cfg
-from disasm.libs.disasm import disassemble_section, extract_strings
-from disasm.libs.types import BinaryInfo, ChainedFixup, DisasmInstruction, N_TYPE, N_UNDF, Symbol
-from disasm.tui.highlight import (
+from cheerleader.libs.cfg import CallGraph, build_call_graph, build_cfg
+from cheerleader.libs.disasm import disassemble_section, extract_strings
+from cheerleader.libs.types import BinaryInfo, ChainedFixup, DisasmInstruction, N_TYPE, N_UNDF, Symbol
+from cheerleader.tui.highlight import (
     _colorize_mnemonic, _colorize_operands, _fmt_addr, _fmt_size,
 )
-from disasm.tui.screens import CallFlowScreen, CFGScreen
+from cheerleader.tui.screens import CallFlowScreen, CFGScreen
 
 
 class SegmentsTab(TabPane):

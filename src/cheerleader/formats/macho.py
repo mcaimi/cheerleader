@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Optional
 
-from disasm.libs.types import (
+from cheerleader.libs.types import (
     BinaryInfo,
     ChainedFixup,
     Library,

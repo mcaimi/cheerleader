@@ -9,8 +9,8 @@ from textual.containers import Vertical, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Label, ListItem, ListView, Rule, Static, Tree
 
-from disasm.libs.cfg import CallGraph, ControlFlowGraph
-from disasm.tui.highlight import _esc_markup, _render_cfg
+from cheerleader.libs.cfg import CallGraph, ControlFlowGraph
+from cheerleader.tui.highlight import _esc_markup, _render_cfg
 
 
 class SlicePicker(Screen):

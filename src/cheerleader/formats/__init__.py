@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import struct
 
-from disasm.libs.types import BinaryInfo
+from cheerleader.libs.types import BinaryInfo
 
 _MACHO_MAGICS = frozenset({
     0xFEEDFACE, 0xCEFAEDFE,   # 32-bit LE/BE
@@ -37,9 +37,9 @@ def parse(path: str, **kwargs) -> BinaryInfo:
     """Detect format and dispatch to the appropriate parser."""
     fmt = detect_format(path)
     if fmt == "macho":
-        from disasm.formats.macho import parse as _macho_parse
+        from cheerleader.formats.macho import parse as _macho_parse
         return _macho_parse(path, **kwargs)
     if fmt == "elf":
-        from disasm.formats.elf import parse as _elf_parse
+        from cheerleader.formats.elf import parse as _elf_parse
         return _elf_parse(path, **kwargs)
     return BinaryInfo(path=path, error="Unrecognised file format")

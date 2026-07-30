@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from disasm.libs.types import BinaryInfo, BinaryString, DisasmInstruction, Section
+from cheerleader.libs.types import BinaryInfo, BinaryString, DisasmInstruction, Section
 
 
 def _cs_arch_mode(arch: str, bits: int) -> tuple[int, int]:

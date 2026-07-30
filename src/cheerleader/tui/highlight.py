@@ -6,7 +6,7 @@ import re
 
 from rich.text import Text
 
-from disasm.libs.cfg import ControlFlowGraph
+from cheerleader.libs.cfg import ControlFlowGraph
 
 _MNEM_RET = frozenset({"ret", "retq", "retn", "eret", "iret", "iretq"})
 _MNEM_NOP = frozenset({"nop", "nopw", "nopl", "fnop"})
