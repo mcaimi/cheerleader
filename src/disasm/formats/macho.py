@@ -1,36 +1,27 @@
 """Mach-O binary parser — sections, libraries, symbols, chained fixups, and disassembly."""
 
+from __future__ import annotations
+
+import os
 import re
 import struct
-import os
 from dataclasses import dataclass, field
-from typing import Optional
 from enum import IntEnum
+from typing import Optional
 
-CALL_MNEMONICS = frozenset({"call", "bl", "blx", "blr"})
-_CALL_TARGET_RE = re.compile(r"#?(0x[0-9a-fA-F]+)")
-
-# CFG branch classification
-_CFG_TARGET_RE = re.compile(r"#?(0x[0-9a-fA-F]+)")
-_CFG_RET   = frozenset({"ret", "retq", "retn", "eret", "iret", "iretq"})
-_CFG_UNCOND = frozenset({"jmp", "b", "br"})
-_CFG_COND  = frozenset({
-    "je", "jne", "jz", "jnz", "jl", "jg", "jle", "jge",
-    "ja", "jb", "jae", "jbe", "jc", "jnc", "js", "jns",
-    "jo", "jno", "jp", "jnp", "jcxz", "jecxz", "jrcxz",
-    "cbz", "cbnz", "tbz", "tbnz",
-    "loop", "loope", "loopne",
-})
+from disasm.libs.types import (
+    BinaryInfo, ChainedFixup, Library, N_EXT, N_SECT, N_STAB, N_TYPE,
+    Section, Segment, Symbol,
+)
 
 # Mach-O magic values
-MH_MAGIC = 0xFEEDFACE
-MH_CIGAM = 0xCEFAEDFE
+MH_MAGIC    = 0xFEEDFACE
+MH_CIGAM    = 0xCEFAEDFE
 MH_MAGIC_64 = 0xFEEDFACF
 MH_CIGAM_64 = 0xCFFAEDFE
-FAT_MAGIC = 0xCAFEBABE
-FAT_CIGAM = 0xBEBAFECA
+FAT_MAGIC   = 0xCAFEBABE
+FAT_CIGAM   = 0xBEBAFECA
 
-# CPU types
 CPU_TYPE = {
     0x00000007: "x86",
     0x01000007: "x86_64",
@@ -39,7 +30,6 @@ CPU_TYPE = {
     0x0200000C: "arm64_32",
 }
 
-# File types
 FILE_TYPE = {
     0x1: "MH_OBJECT",
     0x2: "MH_EXECUTE",
@@ -50,7 +40,7 @@ FILE_TYPE = {
     0xB: "MH_DSYM",
 }
 
-# Load command types
+
 class LC(IntEnum):
     SEGMENT            = 0x01
     SYMTAB             = 0x02
@@ -79,27 +69,8 @@ class LC(IntEnum):
     DYLD_CHAINED_FIXUPS= 0x80000034
     FILESET_ENTRY      = 0x80000035
 
+
 LC_NAMES = {v.value: v.name for v in LC}
-
-# Symbol types (n_type flags)
-N_STAB  = 0xE0
-N_PEXT  = 0x10
-N_TYPE  = 0x0E
-N_EXT   = 0x01
-
-N_UNDF  = 0x00
-N_ABS   = 0x02
-N_SECT  = 0x0E
-N_PBUD  = 0x0C
-N_INDR  = 0x0A
-
-SYM_TYPE = {
-    N_UNDF: "UNDEF",
-    N_ABS:  "ABS",
-    N_SECT: "SECT",
-    N_PBUD: "PBUD",
-    N_INDR: "INDR",
-}
 
 # Chained fixup pointer kinds
 DYLD_CHAINED_PTR_ARM64E              = 1
@@ -132,132 +103,16 @@ CHAINED_PTR_NAMES = {
 
 
 @dataclass
-class Section:
-    name: str
-    segment: str
-    addr: int
-    size: int
-    offset: int
-    align: int
-    flags: int
-    reloff: int
-    nreloc: int
-
-    @property
-    def type_str(self) -> str:
-        t = self.flags & 0xFF
-        types = {
-            0x00: "regular",
-            0x01: "zerofill",
-            0x02: "cstring_literals",
-            0x03: "4byte_literals",
-            0x04: "8byte_literals",
-            0x05: "literal_pointers",
-            0x06: "non_lazy_symbol_pointers",
-            0x07: "lazy_symbol_pointers",
-            0x08: "symbol_stubs",
-            0x09: "mod_init_func_pointers",
-            0x0A: "mod_term_func_pointers",
-            0x0B: "coalesced",
-            0x0C: "gb_zerofill",
-            0x0D: "interposing",
-            0x0E: "16byte_literals",
-            0x0F: "dtrace_dof",
-            0x10: "lazy_dylib_symbol_pointers",
-            0x11: "thread_local_regular",
-            0x12: "thread_local_zerofill",
-            0x13: "thread_local_variables",
-            0x14: "thread_local_variable_pointers",
-            0x15: "thread_local_init_function_pointers",
-        }
-        return types.get(t, f"0x{t:02x}")
-
-
-@dataclass
-class Segment:
-    name: str
-    vmaddr: int
-    vmsize: int
-    fileoff: int
-    filesize: int
-    maxprot: int
-    initprot: int
-    sections: list[Section] = field(default_factory=list)
-
-    @property
-    def prot_str(self) -> str:
-        def _p(p: int) -> str:
-            return ("r" if p & 1 else "-") + ("w" if p & 2 else "-") + ("x" if p & 4 else "-")
-        return f"{_p(self.initprot)}/{_p(self.maxprot)}"
-
-
-@dataclass
-class Library:
-    name: str
-    current_version: str
-    compat_version: str
-    load_type: str
-    offset: int
-
-
-@dataclass
-class Symbol:
-    name: str
-    addr: int
-    sym_type: int
-    sect: int
-    desc: int
-    external: bool
-    stab: bool
-
-    @property
-    def type_str(self) -> str:
-        if self.stab:
-            return "STAB"
-        return SYM_TYPE.get(self.sym_type & N_TYPE, f"0x{self.sym_type:02x}")
-
-    @property
-    def binding(self) -> str:
-        if self.external:
-            return "global"
-        if self.sym_type & N_PEXT:
-            return "private"
-        return "local"
-
-
-@dataclass
-class ChainedFixup:
-    segment: str
-    offset: int
-    kind: str
-    lib_ordinal: Optional[int]
-    name: Optional[str]
-    addend: int
-    is_rebase: bool
-    target: Optional[int]
-
-
-@dataclass
-class MachOInfo:
-    path: str
-    arch: str
-    bits: int
-    file_type: str
-    flags: int
-    ncmds: int
-    uuid: Optional[str]
-    min_os: Optional[str]
-    sdk: Optional[str]
-    source_version: Optional[str]
-    slice_offset: int = 0          # absolute file offset of this Mach-O slice
-    segments: list[Segment] = field(default_factory=list)
-    libraries: list[Library] = field(default_factory=list)
-    symbols: list[Symbol] = field(default_factory=list)
-    chained_fixups: list[ChainedFixup] = field(default_factory=list)
-    exports: list[dict] = field(default_factory=list)
+class MachOInfo(BinaryInfo):
+    """Mach-O specific metadata extending the common BinaryInfo base."""
+    flags: int = 0
+    ncmds: int = 0
+    uuid: Optional[str] = None
+    min_os: Optional[str] = None
+    sdk: Optional[str] = None
+    source_version: Optional[str] = None
     rpaths: list[str] = field(default_factory=list)
     dylinker: Optional[str] = None
-    error: Optional[str] = None
 
 
 def _ver(v: int) -> str:
@@ -266,8 +121,6 @@ def _ver(v: int) -> str:
 
 def _parse_sections(data: bytes, off: int, nsects: int, is64: bool, endian: str) -> list[Section]:
     sections = []
-    # section_64: sectname(16) segname(16) addr(Q) size(Q) offset align reloff nreloc flags reserved1 reserved2 reserved3
-    # section:    sectname(16) segname(16) addr(I) size(I) offset align reloff nreloc flags reserved1 reserved2
     fmt = f"{endian}16s16sQQIIIIIIII" if is64 else f"{endian}16s16sIIIIIIIII"
     sz = struct.calcsize(fmt)
     for _ in range(nsects):
@@ -331,7 +184,6 @@ def _parse_exports_trie(data: bytes, off: int, size: int) -> list[dict]:
         child_count = trie[node_off + terminal_sz + n] if (node_off + terminal_sz + n) < len(trie) else 0
         child_off = node_off + terminal_sz + n + 1
         for _ in range(child_count):
-            # read label
             end = trie.index(b"\x00", child_off) if b"\x00" in trie[child_off:] else len(trie)
             label = trie[child_off:end].decode("utf-8", errors="replace")
             child_off = end + 1
@@ -361,8 +213,6 @@ def _read_uleb128(data: bytes, off: int) -> tuple[int, int]:
 def _parse_chained_fixups(data: bytes, lc_off: int, lc_size: int,
                            segments: list[Segment], libs: list[Library]) -> list[ChainedFixup]:
     """Parse LC_DYLD_CHAINED_FIXUPS payload."""
-    # The load command points to a linkedit blob
-    # Structure: dyld_chained_fixups_header -> imports table -> symbol pool -> starts
     fixups: list[ChainedFixup] = []
     try:
         dataoff, datasize = struct.unpack_from("<II", data, lc_off + 8)
@@ -373,13 +223,11 @@ def _parse_chained_fixups(data: bytes, lc_off: int, lc_size: int,
         if len(hdr) < 32:
             return fixups
 
-        # dyld_chained_fixups_header
         (fixups_version, starts_offset, imports_offset, symbols_offset,
          imports_count, imports_format, symbols_format) = struct.unpack_from("<IIIIIII", hdr, 0)
 
-        # Parse import table — each entry is 4 bytes (format 1) or 8 bytes (format 2/3)
         entry_sz = {1: 4, 2: 8, 3: 8}.get(imports_format, 4)
-        import_names: list[tuple[int, int, int]] = []  # (lib_ordinal, weak, name_off)
+        import_names: list[tuple[int, int, int]] = []
         for i in range(imports_count):
             raw = hdr[imports_offset + i * entry_sz: imports_offset + i * entry_sz + entry_sz]
             if imports_format == 1:
@@ -414,7 +262,6 @@ def _parse_chained_fixups(data: bytes, lc_off: int, lc_size: int,
                 return os.path.basename(libs[idx].name)
             return f"<lib#{ord}>"
 
-        # Parse segment starts
         if starts_offset == 0:
             return fixups
 
@@ -438,7 +285,7 @@ def _parse_chained_fixups(data: bytes, lc_off: int, lc_size: int,
             page_starts_off = seg_info_off + 22
             for pi in range(page_count):
                 page_start = struct.unpack_from("<H", hdr, page_starts_off + pi * 2)[0]
-                if page_start == 0xFFFF:  # DYLD_CHAINED_PTR_START_NONE
+                if page_start == 0xFFFF:
                     continue
 
                 chain_off = (seg.fileoff if seg else 0) + pi * page_sz + page_start
@@ -446,12 +293,10 @@ def _parse_chained_fixups(data: bytes, lc_off: int, lc_size: int,
 
                 while chain_off not in visited and chain_off < len(data):
                     visited.add(chain_off)
-                    # Read 8-byte pointer for 64-bit formats
                     if chain_off + 8 > len(data):
                         break
                     raw_ptr = struct.unpack_from("<Q", data, chain_off)[0]
 
-                    # Decode bind vs rebase based on format
                     is_bind = False
                     ordinal = 0
                     sym_name_str = None
@@ -500,7 +345,6 @@ def _parse_chained_fixups(data: bytes, lc_off: int, lc_size: int,
                         target=target,
                     ))
 
-                    # Advance chain — stride depends on format
                     if ptr_format in (DYLD_CHAINED_PTR_64, DYLD_CHAINED_PTR_64_OFFSET,
                                       DYLD_CHAINED_PTR_ARM64E, DYLD_CHAINED_PTR_ARM64E_USERLAND,
                                       DYLD_CHAINED_PTR_ARM64E_USERLAND24):
@@ -526,7 +370,6 @@ def parse(path: str, slice_index: int = 0) -> MachOInfo:
     with open(path, "rb") as f:
         data = f.read()
 
-    # Detect fat binary — FAT magic is always big-endian in the file
     fat_magic = struct.unpack_from(">I", data, 0)[0]
     arch_offset = 0
     arch_size   = len(data)
@@ -543,9 +386,6 @@ def parse(path: str, slice_index: int = 0) -> MachOInfo:
             slice_index = 0
         _, arch_offset, arch_size = slices[slice_index]
 
-    # Detect endianness and bitness — read magic as little-endian (native on all modern Apple hw)
-    # MAGIC values = file is same endian as the constant definition (little-endian)
-    # CIGAM values = file is opposite endian (big-endian)
     magic_at = struct.unpack_from("<I", data, arch_offset)[0]
     if magic_at == MH_MAGIC:
         is64, endian = False, "<"
@@ -556,8 +396,7 @@ def parse(path: str, slice_index: int = 0) -> MachOInfo:
     elif magic_at == MH_CIGAM_64:
         is64, endian = True, ">"
     else:
-        return MachOInfo(path=path, arch="?", bits=0, file_type="?", flags=0,
-                         ncmds=0, uuid=None, min_os=None, sdk=None, source_version=None,
+        return MachOInfo(path=path, arch="?", bits=0, file_type="?",
                          error=f"Unrecognized magic: 0x{magic_at:08X}")
 
     hdr_fmt = f"{endian}IIIIIII" + ("I" if is64 else "")
@@ -571,11 +410,9 @@ def parse(path: str, slice_index: int = 0) -> MachOInfo:
     info = MachOInfo(
         path=path, arch=arch, bits=64 if is64 else 32,
         file_type=file_type, flags=flags, ncmds=ncmds,
-        uuid=None, min_os=None, sdk=None, source_version=None,
         slice_offset=arch_offset,
     )
 
-    # Walk load commands
     lc_off  = arch_offset + hdr_sz
     symoff  = nsyms = stroff = strsize = 0
     exports_trie_off = exports_trie_size = 0
@@ -664,15 +501,12 @@ def parse(path: str, slice_index: int = 0) -> MachOInfo:
 
         lc_off += cmdsize
 
-    # Parse symbol table
     if nsyms > 0:
         info.symbols = _parse_symtab(data, symoff, nsyms, stroff, strsize, is64, endian)
 
-    # Parse exports trie
     if exports_trie_off and exports_trie_size:
         info.exports = _parse_exports_trie(data, exports_trie_off, exports_trie_size)
 
-    # Parse chained fixups
     if chained_fixups_lc_off:
         info.chained_fixups = _parse_chained_fixups(
             data, chained_fixups_lc_off, 0, info.segments, info.libraries
@@ -681,352 +515,12 @@ def parse(path: str, slice_index: int = 0) -> MachOInfo:
     return info
 
 
-@dataclass
-class BinaryString:
-    file_offset: int    # absolute file offset into the binary
-    addr: int           # virtual address (0 if not mapped)
-    section: str        # e.g. "__TEXT,__cstring"
-    value: str
-
-
-def extract_strings(info: MachOInfo, min_len: int = 4) -> list[BinaryString]:
-    """Scan all data-bearing segments for printable ASCII strings (≥ min_len chars).
-
-    Scans each segment's full raw file region (not just individual sections) so
-    that inter-section gaps are included, matching the coverage of ``strings -a``.
-    Tab (0x09) is included in the printable set, consistent with the strings(1) tool.
-    """
-    results: list[BinaryString] = []
-    # tab is included — consistent with strings(1) behaviour
-    _PRINTABLE = frozenset(range(0x20, 0x7F)) | {0x09}
-
-    with open(info.path, "rb") as fh:
-        data = fh.read()
-
-    # Build a sorted list of (file_start, file_end, "seg,sect") for annotation.
-    sec_ranges: list[tuple[int, int, str]] = []
-    for seg in info.segments:
-        for sect in seg.sections:
-            if sect.offset and sect.size:
-                sec_ranges.append((sect.offset, sect.offset + sect.size,
-                                   f"{sect.segment},{sect.name}"))
-    sec_ranges.sort()
-
-    def _section_at(abs_off: int) -> str:
-        lo, hi = 0, len(sec_ranges) - 1
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            s, e, lbl = sec_ranges[mid]
-            if abs_off < s:
-                hi = mid - 1
-            elif abs_off >= e:
-                lo = mid + 1
-            else:
-                return lbl
-        return "—"
-
-    for seg in info.segments:
-        if seg.filesize == 0:
-            continue
-        seg_data = data[seg.fileoff: seg.fileoff + seg.filesize]
-        i = 0
-        while i < len(seg_data):
-            if seg_data[i] in _PRINTABLE:
-                j = i
-                while j < len(seg_data) and seg_data[j] in _PRINTABLE:
-                    j += 1
-                if j - i >= min_len:
-                    abs_off = seg.fileoff + i
-                    vaddr = (seg.vmaddr + i) if seg.vmaddr else 0
-                    results.append(BinaryString(
-                        file_offset=abs_off,
-                        addr=vaddr,
-                        section=_section_at(abs_off),
-                        value=seg_data[i:j].decode("ascii", errors="replace"),
-                    ))
-                i = j + 1
-            else:
-                i += 1
-
-    results.sort(key=lambda s: s.file_offset)
-    return results
-
-
-@dataclass
-class DisasmInstruction:
-    addr: int
-    size: int
-    mnemonic: str
-    op_str: str
-    raw: bytes
-
-
-@dataclass
-class CallGraph:
-    addr_to_name: dict[int, str]                     # func start addr → symbol name
-    name_to_addr: dict[str, int]                     # symbol name → func start addr
-    callees: dict[str, list[tuple[str, int]]]        # name → [(callee_name, callee_addr)]
-    callers: dict[str, list[tuple[str, int]]]        # name → [(caller_name, caller_addr)]
-    _sorted_addrs: list[int] = field(default_factory=list)
-
-    def func_at(self, addr: int) -> str | None:
-        """Return the name of the function whose body contains addr."""
-        sa = self._sorted_addrs
-        if not sa:
-            return None
-        lo, hi = 0, len(sa) - 1
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            if sa[mid] <= addr:
-                lo = mid + 1
-            else:
-                hi = mid - 1
-        idx = lo - 1
-        return self.addr_to_name.get(sa[idx]) if idx >= 0 else None
-
-
-@dataclass
-class CFGBlock:
-    addr: int
-    instrs: list[DisasmInstruction]
-    succs: list[tuple[int, str]]            # (target_addr, "fall"|"jump"|"cond"|"ret"|"indirect")
-    preds: list[int] = field(default_factory=list)
-
-
-@dataclass
-class ControlFlowGraph:
-    func_name: str
-    func_addr: int
-    blocks: dict[int, "CFGBlock"]           # start_addr → block
-    entry: int
-
-
-def build_cfg(
-    instrs: list[DisasmInstruction],
-    func_name: str,
-    func_addr: int,
-) -> ControlFlowGraph:
-    """Build a control-flow graph from instructions belonging to one function.
-
-    Identifies basic blocks (leaders), then computes successor edges classified
-    as 'fall' (sequential), 'cond' (taken branch of a conditional), 'jump'
-    (unconditional), 'ret' (return), or 'indirect' (register-target branch).
-    """
-    if not instrs:
-        return ControlFlowGraph(func_name=func_name, func_addr=func_addr,
-                                blocks={}, entry=func_addr)
-
-    addr_set = {insn.addr for insn in instrs}
-
-    # Pass 1 — identify basic-block leaders
-    leaders: set[int] = {instrs[0].addr}
-    for insn in instrs:
-        m = insn.mnemonic.lower()
-        is_cond  = m in _CFG_COND or m.startswith("b.")
-        is_uncond = m in _CFG_UNCOND
-        is_ret   = m in _CFG_RET
-        if is_cond or is_uncond or is_ret:
-            fall = insn.addr + insn.size
-            if fall in addr_set:
-                leaders.add(fall)
-            tm = _CFG_TARGET_RE.search(insn.op_str)
-            if tm:
-                tgt = int(tm.group(1), 16)
-                if tgt in addr_set:
-                    leaders.add(tgt)
-
-    sorted_leaders = sorted(leaders)
-    leader_set = set(sorted_leaders)
-    addr_to_idx = {insn.addr: i for i, insn in enumerate(instrs)}
-
-    # Pass 2 — group instructions into blocks
-    blocks: dict[int, CFGBlock] = {}
-    for li, laddr in enumerate(sorted_leaders):
-        start = addr_to_idx.get(laddr)
-        if start is None:
-            continue
-        block_instrs: list[DisasmInstruction] = []
-        idx = start
-        while idx < len(instrs):
-            cur = instrs[idx]
-            if idx > start and cur.addr in leader_set:
-                break
-            block_instrs.append(cur)
-            idx += 1
-        blocks[laddr] = CFGBlock(addr=laddr, instrs=block_instrs, succs=[])
-
-    # Pass 3 — compute successor edges
-    for block in blocks.values():
-        if not block.instrs:
-            continue
-        last = block.instrs[-1]
-        m = last.mnemonic.lower()
-        is_cond  = m in _CFG_COND or m.startswith("b.")
-        is_uncond = m in _CFG_UNCOND
-        is_ret   = m in _CFG_RET
-        fall = last.addr + last.size
-        if is_ret:
-            block.succs.append((0, "ret"))
-        elif is_uncond:
-            tm = _CFG_TARGET_RE.search(last.op_str)
-            if tm:
-                block.succs.append((int(tm.group(1), 16), "jump"))
-            else:
-                block.succs.append((0, "indirect"))
-        elif is_cond:
-            tm = _CFG_TARGET_RE.search(last.op_str)
-            if tm:
-                block.succs.append((int(tm.group(1), 16), "cond"))
-            if fall in addr_set:
-                block.succs.append((fall, "fall"))
-        else:
-            if fall in addr_set:
-                block.succs.append((fall, "fall"))
-
-    # Pass 4 — back-fill predecessor lists
-    for baddr, block in blocks.items():
-        for tgt, _ in block.succs:
-            if tgt in blocks:
-                blocks[tgt].preds.append(baddr)
-
-    return ControlFlowGraph(func_name=func_name, func_addr=func_addr,
-                            blocks=blocks, entry=instrs[0].addr)
-
-
-def _cs_arch_mode(arch: str, bits: int) -> tuple[int, int]:
-    import capstone
-    if arch == "x86_64" or (bits == 64 and "x86" in arch):
-        return capstone.CS_ARCH_X86, capstone.CS_MODE_64
-    if "x86" in arch:
-        return capstone.CS_ARCH_X86, capstone.CS_MODE_32
-    if arch in ("arm64", "arm64e", "arm64_32"):
-        return capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM
-    if arch.startswith("arm"):
-        return capstone.CS_ARCH_ARM, capstone.CS_MODE_ARM
-    return capstone.CS_ARCH_X86, capstone.CS_MODE_64
-
-
-def disassemble_section(
-    info: MachOInfo, seg_name: str, sect_name: str
-) -> list[DisasmInstruction]:
-    """Disassemble one section using capstone; returns [] if capstone missing."""
-    target: Section | None = None
-    for seg in info.segments:
-        if seg.name == seg_name:
-            for s in seg.sections:
-                if s.name == sect_name:
-                    target = s
-                    break
-        if target:
-            break
-
-    if target is None or target.offset == 0 or target.size == 0:
-        return []
-
-    try:
-        import capstone
-    except ImportError:
-        return []
-
-    arch_id, mode_id = _cs_arch_mode(info.arch, info.bits)
-    md = capstone.Cs(arch_id, mode_id)
-    md.detail = False
-
-    with open(info.path, "rb") as fh:
-        fh.seek(info.slice_offset + target.offset)
-        code = fh.read(target.size)
-
-    return [
-        DisasmInstruction(
-            addr=insn.address,
-            size=insn.size,
-            mnemonic=insn.mnemonic,
-            op_str=insn.op_str,
-            raw=bytes(insn.bytes),
-        )
-        for insn in md.disasm(code, target.addr)
-    ]
-
-
-def build_call_graph(info: MachOInfo, instrs: list[DisasmInstruction]) -> CallGraph:
-    """Build a call graph from a disassembled instruction list.
-
-    Uses symbol table + exports to name functions; detects call/bl/blx/blr
-    instructions and resolves their targets.  Indirect calls (e.g. ``blr x8``)
-    are recorded as ``<indirect:operand>``.
-    """
-    addr_to_name: dict[int, str] = {}
-    for sym in info.symbols:
-        if not sym.stab and sym.addr and sym.name and (sym.sym_type & N_TYPE) == N_SECT:
-            addr_to_name.setdefault(sym.addr, sym.name)
-    for exp in info.exports:
-        a, n = exp.get("addr", 0), exp.get("name", "")
-        if a and n:
-            addr_to_name.setdefault(a, n)
-
-    sorted_addrs = sorted(addr_to_name)
-    name_to_addr = {v: k for k, v in addr_to_name.items()}
-    callees: dict[str, list[tuple[str, int]]] = {n: [] for n in addr_to_name.values()}
-    callers: dict[str, list[tuple[str, int]]] = {n: [] for n in addr_to_name.values()}
-
-    def _func_at(addr: int) -> tuple[str, int] | None:
-        if not sorted_addrs:
-            return None
-        lo, hi = 0, len(sorted_addrs) - 1
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            if sorted_addrs[mid] <= addr:
-                lo = mid + 1
-            else:
-                hi = mid - 1
-        idx = lo - 1
-        if idx < 0:
-            return None
-        a = sorted_addrs[idx]
-        return addr_to_name[a], a
-
-    seen: set[tuple[str, str]] = set()
-    for insn in instrs:
-        if insn.mnemonic not in CALL_MNEMONICS:
-            continue
-        result = _func_at(insn.addr)
-        if result is None:
-            continue
-        caller_name, caller_addr = result
-
-        m = _CALL_TARGET_RE.search(insn.op_str)
-        if m:
-            tgt = int(m.group(1), 16)
-            callee_name = addr_to_name.get(tgt, f"sub_{tgt:x}")
-            callee_addr = tgt
-        else:
-            callee_name = f"<indirect:{insn.op_str.strip()}>"
-            callee_addr = 0
-
-        edge = (caller_name, callee_name)
-        if edge in seen:
-            continue
-        seen.add(edge)
-
-        callees.setdefault(caller_name, []).append((callee_name, callee_addr))
-        callers.setdefault(callee_name, []).append((caller_name, caller_addr))
-
-    return CallGraph(
-        addr_to_name=addr_to_name,
-        name_to_addr=name_to_addr,
-        callees=callees,
-        callers=callers,
-        _sorted_addrs=sorted_addrs,
-    )
-
-
 def list_fat_slices(path: str) -> list[tuple[int, str]]:
     """Return (index, arch) pairs for a fat binary, or single entry for thin."""
     with open(path, "rb") as f:
         fat_magic = struct.unpack_from(">I", f.read(4))[0]
 
     if fat_magic not in (FAT_MAGIC, FAT_CIGAM):
-        # Thin binary — detect arch from its own magic
         with open(path, "rb") as f:
             hdr = f.read(8)
         thin_magic = struct.unpack_from("<I", hdr, 0)[0]
