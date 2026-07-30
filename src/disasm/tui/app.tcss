@@ -1,0 +1,116 @@
+Screen {
+    background: $background;
+}
+#info-bar {
+    height: auto;
+    max-height: 6;
+    background: $panel;
+    padding: 0 1;
+    border-bottom: solid $primary;
+}
+#main-tabs {
+    height: 1fr;
+}
+TabbedContent {
+    height: 1fr;
+}
+ContentSwitcher {
+    height: 1fr;
+}
+TabPane {
+    height: 1fr;
+    padding: 0;
+}
+DataTable {
+    height: 1fr;
+}
+#sym-filter-bar, #fix-filter-bar {
+    height: 1;
+    background: $panel;
+    padding: 0 1;
+    dock: top;
+}
+#sym-filter-bar Label, #fix-filter-bar Label {
+    margin-right: 2;
+}
+CallFlowScreen {
+    align: center middle;
+    background: $background 60%;
+}
+#cf-box {
+    width: 80;
+    height: 30;
+    border: round $primary;
+    background: $surface;
+    padding: 0 1;
+}
+#cf-title {
+    padding: 1;
+    text-align: center;
+}
+#cf-hint {
+    padding: 0 1 1 1;
+    text-align: center;
+}
+#cf-tree {
+    height: 1fr;
+}
+CFGScreen {
+    align: center middle;
+    background: $background 60%;
+}
+#cfg-box {
+    width: 92%;
+    height: 90%;
+    border: round $accent;
+    background: $surface;
+    padding: 0 1;
+}
+#cfg-title {
+    padding: 1;
+    text-align: center;
+}
+#cfg-hint {
+    padding: 0 1 1 1;
+    text-align: center;
+}
+#cfg-scroll {
+    height: 1fr;
+}
+#cfg-content {
+    padding: 1 1;
+}
+#disasm-body {
+    height: 1fr;
+}
+#disasm-sect-list {
+    width: 28;
+    border-right: solid $primary;
+    background: $panel;
+}
+#disasm-table {
+    width: 1fr;
+    height: 1fr;
+}
+#disasm-status, #str-status {
+    height: 1;
+    padding: 0 1;
+    background: $panel;
+    dock: bottom;
+}
+#sp-title {
+    padding: 1;
+    text-align: center;
+}
+#sp-hint {
+    padding: 1;
+    text-align: center;
+}
+SlicePicker Vertical {
+    width: 50;
+    height: auto;
+    border: round $primary;
+    background: $surface;
+    margin: 4 20;
+    padding: 1 2;
+}

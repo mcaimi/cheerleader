@@ -3,24 +3,29 @@
 from __future__ import annotations
 
 import os
-import re
 import struct
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Optional
 
 from disasm.libs.types import (
-    BinaryInfo, ChainedFixup, Library, N_EXT, N_SECT, N_STAB, N_TYPE,
-    Section, Segment, Symbol,
+    BinaryInfo,
+    ChainedFixup,
+    Library,
+    N_EXT,
+    N_STAB,
+    Section,
+    Segment,
+    Symbol,
 )
 
 # Mach-O magic values
-MH_MAGIC    = 0xFEEDFACE
-MH_CIGAM    = 0xCEFAEDFE
+MH_MAGIC = 0xFEEDFACE
+MH_CIGAM = 0xCEFAEDFE
 MH_MAGIC_64 = 0xFEEDFACF
 MH_CIGAM_64 = 0xCFFAEDFE
-FAT_MAGIC   = 0xCAFEBABE
-FAT_CIGAM   = 0xBEBAFECA
+FAT_MAGIC = 0xCAFEBABE
+FAT_CIGAM = 0xBEBAFECA
 
 CPU_TYPE = {
     0x00000007: "x86",
@@ -42,49 +47,49 @@ FILE_TYPE = {
 
 
 class LC(IntEnum):
-    SEGMENT            = 0x01
-    SYMTAB             = 0x02
-    DYSYMTAB           = 0x0B
-    LOAD_DYLIB         = 0x0C
-    ID_DYLIB           = 0x0D
-    LOAD_DYLINKER      = 0x0E
-    SEGMENT_64         = 0x19
-    UUID               = 0x1B
-    CODE_SIGNATURE     = 0x1D
-    LOAD_WEAK_DYLIB    = 0x80000018
-    RPATH              = 0x8000001C
-    REEXPORT_DYLIB     = 0x8000001F
-    LAZY_LOAD_DYLIB    = 0x20
-    DYLD_INFO          = 0x22
-    DYLD_INFO_ONLY     = 0x80000022
+    SEGMENT = 0x01
+    SYMTAB = 0x02
+    DYSYMTAB = 0x0B
+    LOAD_DYLIB = 0x0C
+    ID_DYLIB = 0x0D
+    LOAD_DYLINKER = 0x0E
+    SEGMENT_64 = 0x19
+    UUID = 0x1B
+    CODE_SIGNATURE = 0x1D
+    LOAD_WEAK_DYLIB = 0x80000018
+    RPATH = 0x8000001C
+    REEXPORT_DYLIB = 0x8000001F
+    LAZY_LOAD_DYLIB = 0x20
+    DYLD_INFO = 0x22
+    DYLD_INFO_ONLY = 0x80000022
     VERSION_MIN_MACOSX = 0x24
-    FUNCTION_STARTS    = 0x26
-    MAIN               = 0x80000028
-    DATA_IN_CODE       = 0x29
-    SOURCE_VERSION     = 0x2A
-    DYLIB_CODE_SIGN_DRS= 0x2B
-    LINKER_OPTION      = 0x2D
-    BUILD_VERSION      = 0x32
-    DYLD_EXPORTS_TRIE  = 0x80000033
-    DYLD_CHAINED_FIXUPS= 0x80000034
-    FILESET_ENTRY      = 0x80000035
+    FUNCTION_STARTS = 0x26
+    MAIN = 0x80000028
+    DATA_IN_CODE = 0x29
+    SOURCE_VERSION = 0x2A
+    DYLIB_CODE_SIGN_DRS = 0x2B
+    LINKER_OPTION = 0x2D
+    BUILD_VERSION = 0x32
+    DYLD_EXPORTS_TRIE = 0x80000033
+    DYLD_CHAINED_FIXUPS = 0x80000034
+    FILESET_ENTRY = 0x80000035
 
 
 LC_NAMES = {v.value: v.name for v in LC}
 
 # Chained fixup pointer kinds
-DYLD_CHAINED_PTR_ARM64E              = 1
-DYLD_CHAINED_PTR_64                  = 2
-DYLD_CHAINED_PTR_32                  = 3
-DYLD_CHAINED_PTR_32_CACHE            = 4
-DYLD_CHAINED_PTR_32_FIRMWARE         = 5
-DYLD_CHAINED_PTR_64_OFFSET           = 6
-DYLD_CHAINED_PTR_ARM64E_KERNEL       = 7
-DYLD_CHAINED_PTR_64_KERNEL_CACHE     = 8
-DYLD_CHAINED_PTR_ARM64E_USERLAND     = 9
-DYLD_CHAINED_PTR_ARM64E_FIRMWARE     = 10
-DYLD_CHAINED_PTR_X86_64_CACHE        = 11
-DYLD_CHAINED_PTR_ARM64E_USERLAND24   = 12
+DYLD_CHAINED_PTR_ARM64E = 1
+DYLD_CHAINED_PTR_64 = 2
+DYLD_CHAINED_PTR_32 = 3
+DYLD_CHAINED_PTR_32_CACHE = 4
+DYLD_CHAINED_PTR_32_FIRMWARE = 5
+DYLD_CHAINED_PTR_64_OFFSET = 6
+DYLD_CHAINED_PTR_ARM64E_KERNEL = 7
+DYLD_CHAINED_PTR_64_KERNEL_CACHE = 8
+DYLD_CHAINED_PTR_ARM64E_USERLAND = 9
+DYLD_CHAINED_PTR_ARM64E_FIRMWARE = 10
+DYLD_CHAINED_PTR_X86_64_CACHE = 11
+DYLD_CHAINED_PTR_ARM64E_USERLAND24 = 12
 
 CHAINED_PTR_NAMES = {
     1: "ARM64E",
@@ -105,6 +110,7 @@ CHAINED_PTR_NAMES = {
 @dataclass
 class MachOInfo(BinaryInfo):
     """Mach-O specific metadata extending the common BinaryInfo base."""
+
     flags: int = 0
     ncmds: int = 0
     uuid: Optional[str] = None
@@ -119,19 +125,38 @@ def _ver(v: int) -> str:
     return f"{(v >> 16) & 0xFFFF}.{(v >> 8) & 0xFF}.{v & 0xFF}"
 
 
-def _parse_sections(data: bytes, off: int, nsects: int, is64: bool, endian: str) -> list[Section]:
+def _parse_sections(
+    data: bytes, off: int, nsects: int, is64: bool, endian: str
+) -> list[Section]:
     sections = []
     fmt = f"{endian}16s16sQQIIIIIIII" if is64 else f"{endian}16s16sIIIIIIIII"
     sz = struct.calcsize(fmt)
     for _ in range(nsects):
         raw = struct.unpack_from(fmt, data, off)
-        name    = raw[0].rstrip(b"\x00").decode("ascii", errors="replace")
+        name = raw[0].rstrip(b"\x00").decode("ascii", errors="replace")
         segname = raw[1].rstrip(b"\x00").decode("ascii", errors="replace")
-        addr, size, fileoff, align, reloff, nreloc, flags = raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8]
-        sections.append(Section(
-            name=name, segment=segname, addr=addr, size=size,
-            offset=fileoff, align=align, flags=flags, reloff=reloff, nreloc=nreloc,
-        ))
+        addr, size, fileoff, align, reloff, nreloc, flags = (
+            raw[2],
+            raw[3],
+            raw[4],
+            raw[5],
+            raw[6],
+            raw[7],
+            raw[8],
+        )
+        sections.append(
+            Section(
+                name=name,
+                segment=segname,
+                addr=addr,
+                size=size,
+                offset=fileoff,
+                align=align,
+                flags=flags,
+                reloff=reloff,
+                nreloc=nreloc,
+            )
+        )
         off += sz
     return sections
 
@@ -140,14 +165,25 @@ def _parse_string_table(data: bytes, stroff: int, strsize: int) -> dict[int, str
     strtab: dict[int, str] = {}
     pos = 0
     while pos < strsize:
-        end = data.index(b"\x00", stroff + pos) if b"\x00" in data[stroff + pos: stroff + strsize] else stroff + strsize
-        strtab[pos] = data[stroff + pos: end].decode("utf-8", errors="replace")
+        end = (
+            data.index(b"\x00", stroff + pos)
+            if b"\x00" in data[stroff + pos : stroff + strsize]
+            else stroff + strsize
+        )
+        strtab[pos] = data[stroff + pos : end].decode("utf-8", errors="replace")
         pos = end - stroff + 1
     return strtab
 
 
-def _parse_symtab(data: bytes, symoff: int, nsyms: int, stroff: int, strsize: int,
-                  is64: bool, endian: str) -> list[Symbol]:
+def _parse_symtab(
+    data: bytes,
+    symoff: int,
+    nsyms: int,
+    stroff: int,
+    strsize: int,
+    is64: bool,
+    endian: str,
+) -> list[Symbol]:
     strtab = _parse_string_table(data, stroff, strsize)
     syms: list[Symbol] = []
     if is64:
@@ -160,18 +196,25 @@ def _parse_symtab(data: bytes, symoff: int, nsyms: int, stroff: int, strsize: in
         strx, n_type, n_sect, n_desc, n_value = struct.unpack_from(fmt, data, off)
         name = strtab.get(strx, f"<{strx}>")
         stab = bool(n_type & N_STAB)
-        ext  = bool(n_type & N_EXT)
-        syms.append(Symbol(
-            name=name, addr=n_value, sym_type=n_type, sect=n_sect,
-            desc=n_desc, external=ext, stab=stab,
-        ))
+        ext = bool(n_type & N_EXT)
+        syms.append(
+            Symbol(
+                name=name,
+                addr=n_value,
+                sym_type=n_type,
+                sect=n_sect,
+                desc=n_desc,
+                external=ext,
+                stab=stab,
+            )
+        )
     return syms
 
 
 def _parse_exports_trie(data: bytes, off: int, size: int) -> list[dict]:
     """Walk the exports trie and return exported symbol entries."""
     exports: list[dict] = []
-    trie = data[off: off + size]
+    trie = data[off : off + size]
 
     def _walk(node_off: int, prefix: str):
         if node_off >= len(trie):
@@ -181,10 +224,18 @@ def _parse_exports_trie(data: bytes, off: int, size: int) -> list[dict]:
             flags, n2 = _read_uleb128(trie, node_off + n)
             addr, _ = _read_uleb128(trie, node_off + n + n2)
             exports.append({"name": prefix, "addr": addr, "flags": flags})
-        child_count = trie[node_off + terminal_sz + n] if (node_off + terminal_sz + n) < len(trie) else 0
+        child_count = (
+            trie[node_off + terminal_sz + n]
+            if (node_off + terminal_sz + n) < len(trie)
+            else 0
+        )
         child_off = node_off + terminal_sz + n + 1
         for _ in range(child_count):
-            end = trie.index(b"\x00", child_off) if b"\x00" in trie[child_off:] else len(trie)
+            end = (
+                trie.index(b"\x00", child_off)
+                if b"\x00" in trie[child_off:]
+                else len(trie)
+            )
             label = trie[child_off:end].decode("utf-8", errors="replace")
             child_off = end + 1
             next_node, nb = _read_uleb128(trie, child_off)
@@ -210,8 +261,9 @@ def _read_uleb128(data: bytes, off: int) -> tuple[int, int]:
     return result, nb
 
 
-def _parse_chained_fixups(data: bytes, lc_off: int, lc_size: int,
-                           segments: list[Segment], libs: list[Library]) -> list[ChainedFixup]:
+def _parse_chained_fixups(
+    data: bytes, lc_off: int, lc_size: int, segments: list[Segment], libs: list[Library]
+) -> list[ChainedFixup]:
     """Parse LC_DYLD_CHAINED_FIXUPS payload."""
     fixups: list[ChainedFixup] = []
     try:
@@ -219,26 +271,35 @@ def _parse_chained_fixups(data: bytes, lc_off: int, lc_size: int,
         if dataoff == 0 or datasize == 0:
             return fixups
 
-        hdr = data[dataoff: dataoff + datasize]
+        hdr = data[dataoff : dataoff + datasize]
         if len(hdr) < 32:
             return fixups
 
-        (fixups_version, starts_offset, imports_offset, symbols_offset,
-         imports_count, imports_format, symbols_format) = struct.unpack_from("<IIIIIII", hdr, 0)
+        (
+            fixups_version,
+            starts_offset,
+            imports_offset,
+            symbols_offset,
+            imports_count,
+            imports_format,
+            symbols_format,
+        ) = struct.unpack_from("<IIIIIII", hdr, 0)
 
         entry_sz = {1: 4, 2: 8, 3: 8}.get(imports_format, 4)
         import_names: list[tuple[int, int, int]] = []
         for i in range(imports_count):
-            raw = hdr[imports_offset + i * entry_sz: imports_offset + i * entry_sz + entry_sz]
+            raw = hdr[
+                imports_offset + i * entry_sz : imports_offset + i * entry_sz + entry_sz
+            ]
             if imports_format == 1:
                 val = struct.unpack_from("<I", raw)[0]
-                lib_ord = (val & 0xFF)
-                weak    = (val >> 8) & 0x1
+                lib_ord = val & 0xFF
+                weak = (val >> 8) & 0x1
                 name_off = (val >> 9) & 0x7FFFFF
             elif imports_format == 2:
                 val = struct.unpack_from("<Q", raw)[0]
-                lib_ord  = (val & 0xFF)
-                weak     = (val >> 8) & 0x1
+                lib_ord = val & 0xFF
+                weak = (val >> 8) & 0x1
                 name_off = (val >> 9) & 0x7FFFFF
             else:
                 lib_ord, name_off = struct.unpack_from("<HI", raw)[:2]
@@ -275,8 +336,9 @@ def _parse_chained_fixups(data: bytes, lc_off: int, lc_size: int,
             if seg_info_off + 22 > len(hdr):
                 continue
 
-            (seg_sz, page_sz, ptr_format, seg_offset, max_ptr,
-             page_count) = struct.unpack_from("<IHHQII", hdr, seg_info_off)
+            (seg_sz, page_sz, ptr_format, seg_offset, max_ptr, page_count) = (
+                struct.unpack_from("<IHHQII", hdr, seg_info_off)
+            )
 
             ptr_kind = CHAINED_PTR_NAMES.get(ptr_format, str(ptr_format))
             seg = segments[si] if si < len(segments) else None
@@ -306,25 +368,28 @@ def _parse_chained_fixups(data: bytes, lc_off: int, lc_size: int,
                     if ptr_format in (DYLD_CHAINED_PTR_64, DYLD_CHAINED_PTR_64_OFFSET):
                         is_bind = bool(raw_ptr >> 63)
                         if is_bind:
-                            ordinal  = (raw_ptr >> 0)  & 0xFFFF
-                            addend   = (raw_ptr >> 16) & 0xFF
-                            name_idx = (raw_ptr >> 32) & 0x7FFFFFFF
+                            ordinal = (raw_ptr >> 0) & 0xFFFF
+                            addend = (raw_ptr >> 16) & 0xFF
+                            _name_idx = (raw_ptr >> 32) & 0x7FFFFFFF
                             if ordinal < len(import_names):
                                 lib_ord, _, noff = import_names[ordinal]
                                 sym_name_str = _sym_name(noff)
                                 ordinal = lib_ord
                         else:
-                            target   = (raw_ptr >> 0) & 0xFFFFFFFFF
-                            hi       = (raw_ptr >> 36) & 0xFFFFFF
-                            target  |= hi << 36
-                    elif ptr_format in (DYLD_CHAINED_PTR_ARM64E, DYLD_CHAINED_PTR_ARM64E_USERLAND,
-                                        DYLD_CHAINED_PTR_ARM64E_USERLAND24):
+                            target = (raw_ptr >> 0) & 0xFFFFFFFFF
+                            hi = (raw_ptr >> 36) & 0xFFFFFF
+                            target |= hi << 36
+                    elif ptr_format in (
+                        DYLD_CHAINED_PTR_ARM64E,
+                        DYLD_CHAINED_PTR_ARM64E_USERLAND,
+                        DYLD_CHAINED_PTR_ARM64E_USERLAND24,
+                    ):
                         bind_flag = (raw_ptr >> 62) & 0x1
-                        auth_flag = (raw_ptr >> 63) & 0x1
+                        _auth_flag = (raw_ptr >> 63) & 0x1
                         is_bind = bool(bind_flag)
                         if is_bind:
-                            ordinal  = raw_ptr & 0xFFFF
-                            addend   = (raw_ptr >> 32) & 0x7FFFF
+                            ordinal = raw_ptr & 0xFFFF
+                            addend = (raw_ptr >> 32) & 0x7FFFF
                             if ordinal < len(import_names):
                                 lib_ord, _, noff = import_names[ordinal]
                                 sym_name_str = _sym_name(noff)
@@ -332,27 +397,52 @@ def _parse_chained_fixups(data: bytes, lc_off: int, lc_size: int,
                         else:
                             target = raw_ptr & 0xFFFFFFFFF
 
-                    vaddr = (seg.vmaddr if seg else 0) + pi * page_sz + (chain_off - (seg.fileoff if seg else 0) - pi * page_sz)
+                    vaddr = (
+                        (seg.vmaddr if seg else 0)
+                        + pi * page_sz
+                        + (chain_off - (seg.fileoff if seg else 0) - pi * page_sz)
+                    )
 
-                    fixups.append(ChainedFixup(
-                        segment=seg_name,
-                        offset=vaddr,
-                        kind=ptr_kind,
-                        lib_ordinal=ordinal if is_bind else None,
-                        name=sym_name_str if not is_bind or sym_name_str else (_lib_name(ordinal) if is_bind else None),
-                        addend=addend,
-                        is_rebase=not is_bind,
-                        target=target,
-                    ))
+                    fixups.append(
+                        ChainedFixup(
+                            segment=seg_name,
+                            offset=vaddr,
+                            kind=ptr_kind,
+                            lib_ordinal=ordinal if is_bind else None,
+                            name=sym_name_str
+                            if not is_bind or sym_name_str
+                            else (_lib_name(ordinal) if is_bind else None),
+                            addend=addend,
+                            is_rebase=not is_bind,
+                            target=target,
+                        )
+                    )
 
-                    if ptr_format in (DYLD_CHAINED_PTR_64, DYLD_CHAINED_PTR_64_OFFSET,
-                                      DYLD_CHAINED_PTR_ARM64E, DYLD_CHAINED_PTR_ARM64E_USERLAND,
-                                      DYLD_CHAINED_PTR_ARM64E_USERLAND24):
+                    if ptr_format in (
+                        DYLD_CHAINED_PTR_64,
+                        DYLD_CHAINED_PTR_64_OFFSET,
+                        DYLD_CHAINED_PTR_ARM64E,
+                        DYLD_CHAINED_PTR_ARM64E_USERLAND,
+                        DYLD_CHAINED_PTR_ARM64E_USERLAND24,
+                    ):
                         stride = 4
-                        next_off = (raw_ptr >> 51) & 0x7FF if not ((raw_ptr >> 63) & 1 and ptr_format in
-                                   (DYLD_CHAINED_PTR_ARM64E, DYLD_CHAINED_PTR_ARM64E_USERLAND,
-                                    DYLD_CHAINED_PTR_ARM64E_USERLAND24)) else (raw_ptr >> 32) & 0x7FFFF
-                        if ptr_format in (DYLD_CHAINED_PTR_64, DYLD_CHAINED_PTR_64_OFFSET):
+                        next_off = (
+                            (raw_ptr >> 51) & 0x7FF
+                            if not (
+                                (raw_ptr >> 63) & 1
+                                and ptr_format
+                                in (
+                                    DYLD_CHAINED_PTR_ARM64E,
+                                    DYLD_CHAINED_PTR_ARM64E_USERLAND,
+                                    DYLD_CHAINED_PTR_ARM64E_USERLAND24,
+                                )
+                            )
+                            else (raw_ptr >> 32) & 0x7FFFF
+                        )
+                        if ptr_format in (
+                            DYLD_CHAINED_PTR_64,
+                            DYLD_CHAINED_PTR_64_OFFSET,
+                        ):
                             next_off = (raw_ptr >> 51) & 0x7FF
                         if next_off == 0:
                             break
@@ -372,7 +462,7 @@ def parse(path: str, slice_index: int = 0) -> MachOInfo:
 
     fat_magic = struct.unpack_from(">I", data, 0)[0]
     arch_offset = 0
-    arch_size   = len(data)
+    arch_size = len(data)
 
     if fat_magic in (FAT_MAGIC, FAT_CIGAM):
         fat_endian = ">" if fat_magic == FAT_MAGIC else "<"
@@ -380,7 +470,9 @@ def parse(path: str, slice_index: int = 0) -> MachOInfo:
         slices = []
         for i in range(nfat):
             off = 8 + i * 20
-            cputype, cpusubtype, fat_off, fat_sz, align = struct.unpack_from(f"{fat_endian}iiIII", data, off)
+            cputype, cpusubtype, fat_off, fat_sz, align = struct.unpack_from(
+                f"{fat_endian}iiIII", data, off
+            )
             slices.append((cputype, fat_off, fat_sz))
         if slice_index >= len(slices):
             slice_index = 0
@@ -396,25 +488,34 @@ def parse(path: str, slice_index: int = 0) -> MachOInfo:
     elif magic_at == MH_CIGAM_64:
         is64, endian = True, ">"
     else:
-        return MachOInfo(path=path, arch="?", bits=0, file_type="?",
-                         error=f"Unrecognized magic: 0x{magic_at:08X}")
+        return MachOInfo(
+            path=path,
+            arch="?",
+            bits=0,
+            file_type="?",
+            error=f"Unrecognized magic: 0x{magic_at:08X}",
+        )
 
     hdr_fmt = f"{endian}IIIIIII" + ("I" if is64 else "")
-    hdr_sz  = struct.calcsize(hdr_fmt)
-    hdr     = struct.unpack_from(hdr_fmt, data, arch_offset)
+    hdr_sz = struct.calcsize(hdr_fmt)
+    hdr = struct.unpack_from(hdr_fmt, data, arch_offset)
     _, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags = hdr[:7]
 
-    arch      = CPU_TYPE.get(cputype, f"0x{cputype:08X}")
+    arch = CPU_TYPE.get(cputype, f"0x{cputype:08X}")
     file_type = FILE_TYPE.get(filetype, f"0x{filetype:02X}")
 
     info = MachOInfo(
-        path=path, arch=arch, bits=64 if is64 else 32,
-        file_type=file_type, flags=flags, ncmds=ncmds,
+        path=path,
+        arch=arch,
+        bits=64 if is64 else 32,
+        file_type=file_type,
+        flags=flags,
+        ncmds=ncmds,
         slice_offset=arch_offset,
     )
 
-    lc_off  = arch_offset + hdr_sz
-    symoff  = nsyms = stroff = strsize = 0
+    lc_off = arch_offset + hdr_sz
+    symoff = nsyms = stroff = strsize = 0
     exports_trie_off = exports_trie_size = 0
     chained_fixups_lc_off = 0
 
@@ -425,63 +526,100 @@ def parse(path: str, slice_index: int = 0) -> MachOInfo:
             seg_fmt = f"{endian}16sQQQQIIII" if is64 else f"{endian}16sIIIIIIII"
             raw = struct.unpack_from(seg_fmt, data, lc_off + 8)
             segname = raw[0].rstrip(b"\x00").decode("ascii", errors="replace")
-            vmaddr, vmsize, fileoff, filesize, maxprot, initprot, nsects, segflags = raw[1:]
-            seg = Segment(name=segname, vmaddr=vmaddr, vmsize=vmsize,
-                          fileoff=fileoff, filesize=filesize,
-                          maxprot=maxprot, initprot=initprot)
+            vmaddr, vmsize, fileoff, filesize, maxprot, initprot, nsects, segflags = (
+                raw[1:]
+            )
+            seg = Segment(
+                name=segname,
+                vmaddr=vmaddr,
+                vmsize=vmsize,
+                fileoff=fileoff,
+                filesize=filesize,
+                maxprot=maxprot,
+                initprot=initprot,
+            )
             sect_off = lc_off + 8 + struct.calcsize(seg_fmt)
             seg.sections = _parse_sections(data, sect_off, nsects, is64, endian)
             info.segments.append(seg)
 
-        elif cmd in (LC.LOAD_DYLIB, LC.ID_DYLIB, LC.LOAD_WEAK_DYLIB,
-                     LC.REEXPORT_DYLIB, LC.LAZY_LOAD_DYLIB):
-            name_off, ts, cur_ver, compat_ver = struct.unpack_from(f"{endian}IIII", data, lc_off + 8)
+        elif cmd in (
+            LC.LOAD_DYLIB,
+            LC.ID_DYLIB,
+            LC.LOAD_WEAK_DYLIB,
+            LC.REEXPORT_DYLIB,
+            LC.LAZY_LOAD_DYLIB,
+        ):
+            name_off, ts, cur_ver, compat_ver = struct.unpack_from(
+                f"{endian}IIII", data, lc_off + 8
+            )
             abs_name_off = lc_off + name_off
-            end = data.index(b"\x00", abs_name_off) if b"\x00" in data[abs_name_off:abs_name_off+256] else abs_name_off
+            end = (
+                data.index(b"\x00", abs_name_off)
+                if b"\x00" in data[abs_name_off : abs_name_off + 256]
+                else abs_name_off
+            )
             lib_name = data[abs_name_off:end].decode("utf-8", errors="replace")
             load_type = LC_NAMES.get(cmd, f"0x{cmd:08X}")
-            info.libraries.append(Library(
-                name=lib_name,
-                current_version=_ver(cur_ver),
-                compat_version=_ver(compat_ver),
-                load_type=load_type,
-                offset=lc_off - arch_offset,
-            ))
+            info.libraries.append(
+                Library(
+                    name=lib_name,
+                    current_version=_ver(cur_ver),
+                    compat_version=_ver(compat_ver),
+                    load_type=load_type,
+                    offset=lc_off - arch_offset,
+                )
+            )
 
         elif cmd == LC.LOAD_DYLINKER:
             name_off = struct.unpack_from(f"{endian}I", data, lc_off + 8)[0]
-            abs_off  = lc_off + name_off
-            end = data.index(b"\x00", abs_off) if b"\x00" in data[abs_off:abs_off+256] else abs_off
+            abs_off = lc_off + name_off
+            end = (
+                data.index(b"\x00", abs_off)
+                if b"\x00" in data[abs_off : abs_off + 256]
+                else abs_off
+            )
             info.dylinker = data[abs_off:end].decode("utf-8", errors="replace")
 
         elif cmd == LC.RPATH:
             name_off = struct.unpack_from(f"{endian}I", data, lc_off + 8)[0]
-            abs_off  = lc_off + name_off
-            end = data.index(b"\x00", abs_off) if b"\x00" in data[abs_off:abs_off+256] else abs_off
+            abs_off = lc_off + name_off
+            end = (
+                data.index(b"\x00", abs_off)
+                if b"\x00" in data[abs_off : abs_off + 256]
+                else abs_off
+            )
             info.rpaths.append(data[abs_off:end].decode("utf-8", errors="replace"))
 
         elif cmd == LC.SYMTAB:
-            symoff, nsyms, stroff, strsize = struct.unpack_from(f"{endian}IIII", data, lc_off + 8)
-            symoff  += arch_offset
-            stroff  += arch_offset
+            symoff, nsyms, stroff, strsize = struct.unpack_from(
+                f"{endian}IIII", data, lc_off + 8
+            )
+            symoff += arch_offset
+            stroff += arch_offset
 
         elif cmd == LC.UUID:
-            raw_uuid = data[lc_off + 8: lc_off + 24]
-            info.uuid = "-".join([
-                raw_uuid[0:4].hex(), raw_uuid[4:6].hex(),
-                raw_uuid[6:8].hex(), raw_uuid[8:10].hex(),
-                raw_uuid[10:16].hex(),
-            ]).upper()
+            raw_uuid = data[lc_off + 8 : lc_off + 24]
+            info.uuid = "-".join(
+                [
+                    raw_uuid[0:4].hex(),
+                    raw_uuid[4:6].hex(),
+                    raw_uuid[6:8].hex(),
+                    raw_uuid[8:10].hex(),
+                    raw_uuid[10:16].hex(),
+                ]
+            ).upper()
 
         elif cmd in (LC.VERSION_MIN_MACOSX,):
             ver, sdk = struct.unpack_from(f"{endian}II", data, lc_off + 8)
             info.min_os = _ver(ver)
-            info.sdk    = _ver(sdk)
+            info.sdk = _ver(sdk)
 
         elif cmd == LC.BUILD_VERSION:
-            platform, minos, sdk, ntools = struct.unpack_from(f"{endian}IIII", data, lc_off + 8)
+            platform, minos, sdk, ntools = struct.unpack_from(
+                f"{endian}IIII", data, lc_off + 8
+            )
             info.min_os = _ver(minos)
-            info.sdk    = _ver(sdk)
+            info.sdk = _ver(sdk)
 
         elif cmd == LC.SOURCE_VERSION:
             val = struct.unpack_from(f"{endian}Q", data, lc_off + 8)[0]
@@ -493,7 +631,9 @@ def parse(path: str, slice_index: int = 0) -> MachOInfo:
             info.source_version = f"{a}.{b}.{c}.{d}.{e}"
 
         elif cmd in (LC.DYLD_EXPORTS_TRIE,):
-            exports_trie_off, exports_trie_size = struct.unpack_from(f"{endian}II", data, lc_off + 8)
+            exports_trie_off, exports_trie_size = struct.unpack_from(
+                f"{endian}II", data, lc_off + 8
+            )
             exports_trie_off += arch_offset
 
         elif cmd == LC.DYLD_CHAINED_FIXUPS:
