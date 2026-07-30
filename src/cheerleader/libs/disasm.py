@@ -11,10 +11,12 @@ def _cs_arch_mode(arch: str, bits: int) -> tuple[int, int]:
         return capstone.CS_ARCH_X86, capstone.CS_MODE_64
     if "x86" in arch:
         return capstone.CS_ARCH_X86, capstone.CS_MODE_32
-    if arch in ("arm64", "arm64e", "arm64_32"):
+    if arch in ("arm64", "arm64e", "arm64_32", "aarch64"):
         return capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM
     if arch.startswith("arm"):
         return capstone.CS_ARCH_ARM, capstone.CS_MODE_ARM
+    if arch in ("riscv", "riscv64"):
+        return capstone.CS_ARCH_RISCV, capstone.CS_MODE_RISCV64 if bits == 64 else capstone.CS_MODE_RISCV32
     return capstone.CS_ARCH_X86, capstone.CS_MODE_64
 
 
