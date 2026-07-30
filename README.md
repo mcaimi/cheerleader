@@ -1,6 +1,6 @@
 # disasm
 
-A terminal-based Mach-O binary inspector for macOS. Opens executables, dylibs, and object files and presents their internal structure — segments, sections, dynamic libraries, symbol tables, export tries, dyld chained fixups, and **disassembled code** — in an interactive text UI.
+A terminal-based Mach-O binary inspector for macOS. Opens executables, dylibs, and object files and presents their internal structure — segments, sections, dynamic libraries, symbol tables, export tries, dyld chained fixups, **disassembled code**, **interactive call-flow graphs**, and **control flow graphs (CFG)** — in an interactive text UI.
 
 ---
 
@@ -106,7 +106,23 @@ The **Disasm tab** uses a split layout:
 | `b` | Binds     |
 | `r` | Rebases   |
 
-**Disasm tab** — click or navigate the section list on the left to switch sections; disassembly loads in the background.
+**Disasm tab** — click or navigate the section list on the left to switch sections; disassembly loads in the background. Press `c` to open the call-flow panel or `f` to open the control flow graph for the enclosing function.
+
+**Call flow panel** (`c` from Disasm tab):
+
+| Key    | Action                                           |
+|--------|--------------------------------------------------|
+| `↑↓`   | Move through the tree                            |
+| `Enter`| Drill into the selected function's call flow     |
+| `b`    | Go back to the previous function                 |
+| `Esc`  | Close the panel                                  |
+
+**Control flow graph** (`f` from Disasm tab):
+
+| Key               | Action                         |
+|-------------------|--------------------------------|
+| `↑↓` / `PgUp/PgDn` | Scroll through the graph     |
+| `Esc`             | Close the panel                |
 
 ---
 
@@ -208,16 +224,106 @@ Interactive disassembler powered by [capstone](https://www.capstone-engine.org/)
 | Mnemonic | Instruction mnemonic (e.g. `push`, `mov`, `bl`)           |
 | Operands | Decoded operands in AT&T / Intel / ARM syntax             |
 
-A status bar at the bottom shows the active section name and instruction count once disassembly completes.
+The status bar at the bottom shows the section name, instruction count, and the `c → call flow   f → cfg` hints once disassembly completes.
 
 Capstone architecture mapping:
 
-| Mach-O arch            | Capstone arch / mode          |
-|------------------------|-------------------------------|
-| `x86_64`               | `CS_ARCH_X86 / CS_MODE_64`    |
-| `x86`                  | `CS_ARCH_X86 / CS_MODE_32`    |
-| `arm64`, `arm64e`, `arm64_32` | `CS_ARCH_ARM64 / CS_MODE_ARM` |
-| `arm`                  | `CS_ARCH_ARM / CS_MODE_ARM`   |
+| Mach-O arch                    | Capstone arch / mode          |
+|--------------------------------|-------------------------------|
+| `x86_64`                       | `CS_ARCH_X86 / CS_MODE_64`    |
+| `x86`                          | `CS_ARCH_X86 / CS_MODE_32`    |
+| `arm64`, `arm64e`, `arm64_32`  | `CS_ARCH_ARM64 / CS_MODE_ARM` |
+| `arm`                          | `CS_ARCH_ARM / CS_MODE_ARM`   |
+
+#### Call flow panel
+
+Press `c` while an instruction row is selected to open the **call flow panel** — a centred modal overlay showing the call graph for the function that contains the selected instruction.
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                    _uv_fs_poll_init  0xf40                               │
+├──────────────────────────────────────────────────────────────────────────┤
+│  Call Graph                                                              │
+│  ▼ ▶ Calls (4)                                                           │
+│  │   _uv__handle_init   0x56e4                                           │
+│  │   _uv__fs_poll_cb    0x1234                                           │
+│  │   _uv_fs_poll_stop   0x5a10                                           │
+│  │   <indirect:x8>                                                       │
+│  ▼ ▶ Called by (2)                                                       │
+│      _uv_fs_poll_start  0x1000                                           │
+│      sub_3a90           0x3a90                                           │
+├──────────────────────────────────────────────────────────────────────────┤
+│          ↑↓ navigate  Enter drill in  b back  Esc close                  │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+- **▶ Calls** (green) — functions directly called by the current function. Indirect calls (e.g. `blr x8`, `call rax`) appear as `<indirect:operand>`.
+- **▶ Called by** (yellow) — functions that call the current function within the disassembled section.
+- Selecting a leaf and pressing **Enter** navigates to that function's call flow.
+- **b** steps back through the navigation history.
+- Functions not in the symbol table are named `sub_ADDR` using their hex address. Stripped binaries will show fewer named functions.
+
+> **Note:** the call graph is built from the currently disassembled section only. For the most complete graph, use `__TEXT,__text`.
+
+#### Control flow graph
+
+Press `f` while an instruction row is selected to open the **control flow graph (CFG)** — a scrollable modal showing the function's basic blocks and the branches between them.
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                  CFG:  _process_args  ·  0x100003f44  ·  4 blocks        │
+├──────────────────────────────────────────────────────────────────────────┤
+│ Block #1  0x100003f44  ⬤ entry                                           │
+│ ┌──────────────────────────────────────────────────────────────────────┐ │
+│ │  0x100003f44  55             push    rbp                             │ │
+│ │  0x100003f45  48 89 e5       mov     rbp, rsp                        │ │
+│ │  0x100003f48  48 85 ff       test    rdi, rdi                        │ │
+│ │  0x100003f4b  74 10          je      0x100003f5d                     │ │
+│ └──────────────────────────────────────────────────────────────────────┘ │
+│    ├── cond  →  Block #3  0x100003f5d                                    │
+│    └── fall  →  Block #2  0x100003f4d                                    │
+│                                                                          │
+│ Block #2  0x100003f4d  ← from #1                                         │
+│ ┌──────────────────────────────────────────────────────────────────────┐ │
+│ │  0x100003f4d  48 8b 07       mov     rax, qword ptr [rdi]            │ │
+│ │  0x100003f50  ff d0          call    rax                             │ │
+│ │  0x100003f52  eb 06          jmp     0x100003f5a                     │ │
+│ └──────────────────────────────────────────────────────────────────────┘ │
+│    └── jump  →  Block #4  0x100003f5a                                    │
+│                                                                          │
+│ Block #3  0x100003f5d  ← from #1                                         │
+│ ┌──────────────────────────────────────────────────────────────────────┐ │
+│ │  0x100003f5d  5d             pop     rbp                             │ │
+│ │  0x100003f5e  c3             ret                                     │ │
+│ └──────────────────────────────────────────────────────────────────────┘ │
+│    └── ret                                                               │
+│                                                                          │
+│ Block #4  0x100003f5a  ← from #2                                         │
+│ ┌──────────────────────────────────────────────────────────────────────┐ │
+│ │  0x100003f5a  5d             pop     rbp                             │ │
+│ │  0x100003f5b  c3             ret                                     │ │
+│ └──────────────────────────────────────────────────────────────────────┘ │
+│    └── ret                                                               │
+├──────────────────────────────────────────────────────────────────────────┤
+│              ↑↓ / PgUp / PgDn  scroll    Esc  close                      │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+Edge types and their colours:
+
+| Edge     | Colour | Meaning                                               |
+|----------|--------|-------------------------------------------------------|
+| `fall`   | green  | Sequential execution after a conditional branch       |
+| `cond`   | yellow | Taken branch of a conditional (`je`, `cbz`, …)        |
+| `jump`   | blue   | Unconditional jump (`jmp`, `b`)                       |
+| `ret`    | red    | Return instruction — no successor                     |
+| `indirect` | dim  | Branch through a register (`br x8`, `jmp rax`)       |
+
+Back-edges (jumps to a block with a lower address — typical of loops) are annotated with `(back-edge)`.
+
+Each block header lists its predecessor block numbers (`← from #N, #M, …`) so you can trace how control arrives without scrolling.
+
+> **Note:** the CFG is built for the function that contains the selected instruction. Function boundaries are derived from the symbol table, so stripped binaries will show the entire section as one large function.
 
 ---
 
@@ -330,6 +436,41 @@ disasm.macho
    │ raw: bytes         raw instruction bytes                       │
    └────────────────────────────────────────────────────────────────┘
 
+   ┌────────────────────────────────────────────────────────────────┐
+   │ CallGraph                                                      │
+   │────────────────────────────────────────────────────────────────│
+   │ addr_to_name: dict[int, str]   func start addr → symbol name  │
+   │ name_to_addr: dict[str, int]   symbol name → func start addr  │
+   │ callees: dict[str,             name → [(callee_name,          │
+   │            list[tuple[str,int]]]         callee_addr)]        │
+   │ callers: dict[str,             name → [(caller_name,          │
+   │            list[tuple[str,int]]]         caller_addr)]        │
+   │ _sorted_addrs: list[int]       sorted func addrs for search   │
+   │────────────────────────────────────────────────────────────────│
+   │ func_at(addr) ─────────────method: binary-search the sorted   │
+   │                             address list; returns the name of  │
+   │                             the function whose body contains   │
+   │                             addr, or None if no symbol found   │
+   └────────────────────────────────────────────────────────────────┘
+
+   ┌────────────────────────────────────────────────────────────────┐
+   │ CFGBlock                                                       │
+   │────────────────────────────────────────────────────────────────│
+   │ addr: int          virtual address of the block's first instr  │
+   │ instrs: list[DisasmInstruction]                                │
+   │ succs: list[tuple[int, str]]   (target_addr, edge_type) pairs  │
+   │ preds: list[int]               start addrs of predecessor blocks│
+   └────────────────────────────────────────────────────────────────┘
+
+   ┌────────────────────────────────────────────────────────────────┐
+   │ ControlFlowGraph                                               │
+   │────────────────────────────────────────────────────────────────│
+   │ func_name: str                                                 │
+   │ func_addr: int                                                 │
+   │ blocks: dict[int, CFGBlock]    start_addr → block              │
+   │ entry: int                     address of the entry block      │
+   └────────────────────────────────────────────────────────────────┘
+
   Public functions
   ────────────────
   parse(path, slice_index=0) → MachOInfo
@@ -346,6 +487,26 @@ disasm.macho
       info.slice_offset + section.offset) and runs them through
       capstone. Returns [] if capstone is not installed or the section
       is not found / has no file content.
+
+  build_call_graph(info, instrs) → CallGraph
+      Builds a call graph from a list of DisasmInstructions.
+      Seeds the function address map from SECT-type symbols and the
+      exports trie. Walks every call/bl/blx/blr instruction; resolves
+      direct targets via the address map (falling back to sub_ADDR for
+      unlabelled addresses) and records indirect calls as
+      <indirect:operand>. Deduplicates edges. Returns a CallGraph with
+      both forward (callees) and reverse (callers) adjacency lists.
+
+  build_cfg(instrs, func_name, func_addr) → ControlFlowGraph
+      Builds a control flow graph from the instructions of a single
+      function. Uses a four-pass algorithm:
+        1. Identify leaders (entry, branch targets, post-branch instrs).
+        2. Group instructions into CFGBlocks between consecutive leaders.
+        3. Compute successor edges: fall (sequential after a conditional),
+           cond (taken branch), jump (unconditional), ret (return),
+           indirect (register-target branch).
+        4. Back-fill predecessor lists from the successor edges.
+      Returns a ControlFlowGraph with all blocks and the entry address.
 
 
 disasm.tui
@@ -367,14 +528,30 @@ disasm.tui
         │     ├── ExportsTab(TabPane)     DataTable
         │     ├── ChainedFixupsTab(TabPane) filter bar + DataTable + on_key
         │     └── DisasmTab(TabPane)      section ListView + DataTable
-        │           @work(thread=True) _disassemble() runs capstone off-thread
-        │           _populate() marshals results back via call_from_thread()
+        │           _instrs / _call_graph built together in background thread
+        │           c key → push CallFlowScreen for the selected instruction
+        │           f key → push CFGScreen for the selected instruction
         └── Footer                        textual built-in, shows bindings
 
   textual.Screen
-  └── SlicePicker                modal pushed by DisasmApp.action_slice()
-        └── ListView              one ListItem per fat binary slice;
-                                  dismisses with the chosen slice index
+  ├── SlicePicker                modal pushed by DisasmApp.action_slice()
+  │     └── ListView              one ListItem per fat binary slice;
+  │                               dismisses with the chosen slice index
+  ├── CallFlowScreen             modal pushed by DisasmTab on c key press
+  │     │  state: _graph: CallGraph, _func_name: str, _history: list[str]
+  │     │  b → action_back() pops history; Esc → dismiss
+  │     └── Tree (#cf-tree)       two branch nodes under root:
+  │           ▶ Calls (N)         one leaf per callee; data=("nav", name)
+  │           ▶ Called by (N)     one leaf per caller; data=("nav", name)
+  │           NodeSelected on leaf → push _func_name to history, repopulate
+  └── CFGScreen                  modal pushed by DisasmTab on f key press
+        │  state: _cfg: ControlFlowGraph
+        │  Esc → dismiss
+        └── VerticalScroll (#cfg-scroll)
+              └── Static (#cfg-content)   Rich markup rendered by _render_cfg()
+                    blocks in BFS order from entry; each block in a box-drawing
+                    frame with address, hex bytes, mnemonic, and operands;
+                    successor edges listed below each block with coloured labels
 ```
 
 ---
@@ -502,9 +679,56 @@ The next slot's offset is packed into otherwise-unused bits of the pointer value
 4. Iterate `md.disasm(code, section.addr)` — capstone advances through the byte stream, decoding one instruction at a time. The start virtual address (`section.addr`) is passed so that decoded `insn.address` values are correct VM addresses, not file offsets.
 5. Return a `list[DisasmInstruction]` with `addr`, `size`, `mnemonic`, `op_str`, and raw `bytes` for each decoded instruction.
 
-The function returns an empty list gracefully if capstone is not importable (e.g. the package was removed from the venv after installation) or if the section has no on-disk content (`offset == 0` or `size == 0`).
+The function returns an empty list gracefully if capstone is not importable or if the section has no on-disk content (`offset == 0` or `size == 0`).
 
-In the TUI, disassembly runs in a worker thread (`@work(thread=True)`) to avoid blocking the event loop for large sections. Results are marshalled back to the main thread via `call_from_thread()` before populating the `DataTable`.
+In the TUI, `DisasmTab._disassemble()` runs in a `@work(thread=True)` worker. It calls `disassemble_section()` first, then immediately calls `build_call_graph()` on the result — both happen in the same background thread. Both results are marshalled back to the main thread together via `app.call_from_thread(_populate)`.
+
+### Call graph
+
+`build_call_graph(info, instrs)` constructs a static call graph from a disassembled instruction list in O(N) time:
+
+1. **Seed the function map** — collect all `N_SECT`-typed, non-stab symbols plus all export-trie entries into `addr_to_name: dict[int, str]`. Sort the addresses into `_sorted_addrs` for O(log N) lookup.
+
+2. **Walk instructions** — for each instruction whose mnemonic is in `CALL_MNEMONICS = {"call", "bl", "blx", "blr"}`:
+   - **Find the caller** — binary-search `_sorted_addrs` for the largest address ≤ `insn.addr`; that is the enclosing function.
+   - **Resolve the target** — search `insn.op_str` with `_CALL_TARGET_RE = r"#?(0x[0-9a-fA-F]+)"`. If a hex literal is found, look it up in `addr_to_name` (falling back to `sub_ADDR` for unlabelled addresses). If no hex literal is found (indirect call: `blr x8`, `call rax`), label it `<indirect:operand>`.
+   - **Record the edge** — add `(callee_name, callee_addr)` to `callees[caller_name]` and `(caller_name, caller_addr)` to `callers[callee_name]`, deduplicating with a `seen` set.
+
+3. **Return** a `CallGraph` holding both adjacency dicts plus the address maps.
+
+`CallGraph.func_at(addr)` performs the same binary search used during construction to map any instruction address to its enclosing function name, enabling the TUI to look up the function for whichever row the cursor is on.
+
+### Control flow graph
+
+`build_cfg(instrs, func_name, func_addr)` constructs a basic-block CFG from the instruction list of a single function:
+
+1. **Identify leaders** — a *leader* is the first instruction of a basic block. Three rules produce leaders:
+   - The very first instruction.
+   - Any instruction that is the explicit target of a branch (resolved via `_CFG_TARGET_RE = r"#?(0x[0-9a-fA-F]+)"`).
+   - Any instruction immediately following a branch (the fall-through path).
+
+   Branch classification uses three disjoint sets of mnemonics:
+
+   | Set | Mnemonics |
+   |-----|-----------|
+   | `_CFG_RET` | `ret`, `retq`, `retn`, `eret`, `iret`, `iretq` |
+   | `_CFG_UNCOND` | `jmp`, `b`, `br` (ARM64 indirect branch) |
+   | `_CFG_COND` | all `j*` conditional jumps, `cbz`/`cbnz`, `tbz`/`tbnz`, `loop*` |
+
+   ARM64 condition-code branches (`b.eq`, `b.ne`, …) are detected by the `mnemonic.startswith("b.")` predicate. `bl`/`blr`/`blx` (call instructions) are intentionally excluded — they do not terminate a basic block.
+
+2. **Build blocks** — sort leaders by address. Each block spans from its leader up to (but not including) the next leader. Instructions are grouped in a single linear pass over the instruction list using a pre-built `addr → index` dict.
+
+3. **Compute successor edges** — examine the last instruction of each block:
+   - `_CFG_RET` → one `ret` edge (addr=0, no successor).
+   - `_CFG_UNCOND` with a resolved hex target → one `jump` edge.
+   - `_CFG_UNCOND` without a resolved target → one `indirect` edge.
+   - `_CFG_COND` → up to two edges: a `cond` edge to the branch target (if resolved) and a `fall` edge to the next instruction address (if it is within the function).
+   - All other instructions → a single `fall` edge to the next instruction (if within the function).
+
+4. **Back-fill predecessors** — for each successor edge `(block, target)` where `target` is a known block, append `block.addr` to `target.preds`.
+
+The CFG screen renders blocks in **BFS order** from the entry block so that the natural top-to-bottom reading order follows the most common execution path. Blocks unreachable from the entry (e.g. dead code or jump-table targets not resolved statically) are appended after the BFS frontier, sorted by address.
 
 ---
 

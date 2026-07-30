@@ -11,7 +11,7 @@ from rich.text import Text
 from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.reactive import reactive
 from textual.screen import Screen
 from textual.widgets import (
@@ -551,6 +551,132 @@ class CallFlowScreen(Screen):
             self.dismiss(None)
 
 
+def _esc_markup(s: str) -> str:
+    return s.replace("[", r"\[")
+
+
+_EDGE_STYLE = {
+    "fall":     ("green",   "fall"),
+    "cond":     ("yellow",  "cond"),
+    "jump":     ("blue",    "jump"),
+    "indirect": ("dim",     "indirect"),
+    "ret":      ("red",     "ret"),
+}
+
+
+def _render_cfg(cfg: macho.ControlFlowGraph) -> str:
+    """Render a ControlFlowGraph as a Rich markup string."""
+    if not cfg.blocks:
+        return "[dim]No blocks found.[/dim]"
+
+    # BFS order starting from the entry block
+    visited: list[int] = []
+    seen: set[int] = set()
+    queue = [cfg.entry]
+    while queue:
+        addr = queue.pop(0)
+        if addr in seen or addr not in cfg.blocks:
+            continue
+        seen.add(addr)
+        visited.append(addr)
+        for tgt, _ in cfg.blocks[addr].succs:
+            if tgt not in seen and tgt in cfg.blocks:
+                queue.append(tgt)
+    for addr in sorted(cfg.blocks):
+        if addr not in seen:
+            visited.append(addr)
+
+    block_idx = {addr: i + 1 for i, addr in enumerate(visited)}
+    BOX_W = 62
+    inner = BOX_W - 2
+    lines: list[str] = []
+
+    for addr in visited:
+        block = cfg.blocks[addr]
+        idx = block_idx[addr]
+        entry_tag = " [bold yellow]⬤ entry[/bold yellow]" if addr == cfg.entry else ""
+        preds = block.preds
+        pred_s = (
+            "  [dim]← from " + ", ".join(f"#{block_idx[p]}" for p in preds if p in block_idx) + "[/dim]"
+            if preds else ""
+        )
+
+        lines.append(f" [bold cyan]Block #{idx}[/bold cyan]  [dim]0x{addr:x}[/dim]{entry_tag}{pred_s}")
+        lines.append(f" ┌{'─' * inner}┐")
+
+        for insn in block.instrs:
+            raw_hex = " ".join(f"{b:02x}" for b in insn.raw[:6])
+            if len(insn.raw) > 6:
+                raw_hex += "…"
+            row = f"  [dim]0x{insn.addr:x}[/dim]  {raw_hex:<20}  {_esc_markup(insn.mnemonic):<8}  {_esc_markup(insn.op_str)}"
+            # strip rich tags for length estimation (rough)
+            plain_len = len(f"  0x{insn.addr:x}  {raw_hex:<20}  {insn.mnemonic:<8}  {insn.op_str}")
+            if plain_len > inner:
+                # truncate op_str
+                budget = inner - (plain_len - len(insn.op_str)) - 1
+                row = (
+                    f"  [dim]0x{insn.addr:x}[/dim]  {raw_hex:<20}  "
+                    f"{_esc_markup(insn.mnemonic):<8}  "
+                    f"{_esc_markup(insn.op_str[:max(0, budget)])}…"
+                )
+            lines.append(f" │{row}")
+            # pad — count visible chars excluding tags
+            lines[-1] = lines[-1]  # padding handled by terminal
+
+        lines.append(f" └{'─' * inner}┘")
+
+        succs = block.succs
+        for i, (tgt, etype) in enumerate(succs):
+            prefix = "   └──" if i == len(succs) - 1 else "   ├──"
+            color, label = _EDGE_STYLE.get(etype, ("dim", etype))
+            if etype == "ret":
+                lines.append(f"{prefix} [{color}]{label}[/{color}]")
+            elif etype == "indirect":
+                lines.append(f"{prefix} [{color}]{label}[/{color}]")
+            else:
+                tgt_num = block_idx.get(tgt)
+                tgt_s = f"Block #{tgt_num}" if tgt_num else f"0x{tgt:x} (external)"
+                back = " [dim](back-edge)[/dim]" if tgt <= addr and tgt in cfg.blocks else ""
+                lines.append(
+                    f"{prefix} [{color}]{label}[/{color}]"
+                    f"  →  {tgt_s}  [dim]0x{tgt:x}[/dim]{back}"
+                )
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+class CFGScreen(Screen):
+    """Modal showing a Control Flow Graph for a single function."""
+
+    BINDINGS = [Binding("escape", "dismiss(None)", "Close")]
+
+    def __init__(self, cfg: macho.ControlFlowGraph) -> None:
+        super().__init__()
+        self._cfg = cfg
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="cfg-box"):
+            yield Label("", id="cfg-title")
+            yield Rule()
+            with VerticalScroll(id="cfg-scroll"):
+                yield Static("", id="cfg-content", markup=True)
+            yield Rule()
+            yield Label(
+                "[dim]↑↓ / PgUp / PgDn  scroll    Esc  close[/dim]",
+                id="cfg-hint",
+            )
+
+    def on_mount(self) -> None:
+        cfg = self._cfg
+        n = len(cfg.blocks)
+        self.query_one("#cfg-title", Label).update(
+            f"[bold]CFG:[/bold]  [cyan]{_esc_markup(cfg.func_name)}[/cyan]"
+            f"  [dim]0x{cfg.func_addr:x}  ·  {n} block{'s' if n != 1 else ''}[/dim]"
+        )
+        self.query_one("#cfg-content", Static).update(_render_cfg(cfg))
+
+
 class StringsTab(TabPane):
     def __init__(self) -> None:
         super().__init__("Strings", id="tab-strings")
@@ -682,7 +808,7 @@ class DisasmTab(TabPane):
             )
         self._set_status(
             f"[dim]{seg},{sect}[/dim]  {len(instrs):,} instructions"
-            "  [dim]c → call flow[/dim]"
+            "  [dim]c → call flow   f → cfg[/dim]"
         )
 
     def on_key(self, event) -> None:
@@ -691,6 +817,52 @@ class DisasmTab(TabPane):
         if event.key == "c":
             self._open_call_flow()
             event.stop()
+        elif event.key == "f":
+            self._open_cfg()
+            event.stop()
+
+    def _open_cfg(self) -> None:
+        if self._call_graph is None or self._table is None:
+            self.app.notify("Disassemble a section first", timeout=3)
+            return
+        row = self._table.cursor_row
+        if row < 0 or row >= len(self._instrs):
+            self.app.notify("Select an instruction row", timeout=2)
+            return
+        addr = self._instrs[row].addr
+        func_name = self._call_graph.func_at(addr)
+        if func_name is None:
+            self.app.notify(
+                f"No function symbol at 0x{addr:x} — binary may be stripped",
+                timeout=4,
+            )
+            return
+        func_addr = self._call_graph.name_to_addr.get(func_name, addr)
+
+        # Find the next function's start to bound this function's instructions
+        sa = self._call_graph._sorted_addrs
+        lo, hi, pos = 0, len(sa) - 1, -1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if sa[mid] == func_addr:
+                pos = mid
+                break
+            elif sa[mid] < func_addr:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        next_func_addr = sa[pos + 1] if pos >= 0 and pos + 1 < len(sa) else None
+
+        func_instrs = [
+            i for i in self._instrs
+            if i.addr >= func_addr and (next_func_addr is None or i.addr < next_func_addr)
+        ]
+        if not func_instrs:
+            self.app.notify("No instructions found for this function", timeout=3)
+            return
+
+        cfg = macho.build_cfg(func_instrs, func_name, func_addr)
+        self.app.push_screen(CFGScreen(cfg))
 
     def _open_call_flow(self) -> None:
         if self._call_graph is None or self._table is None:
@@ -772,6 +944,31 @@ CallFlowScreen {
 }
 #cf-tree {
     height: 1fr;
+}
+CFGScreen {
+    align: center middle;
+    background: $background 60%;
+}
+#cfg-box {
+    width: 92%;
+    height: 90%;
+    border: round $accent;
+    background: $surface;
+    padding: 0 1;
+}
+#cfg-title {
+    padding: 1;
+    text-align: center;
+}
+#cfg-hint {
+    padding: 0 1 1 1;
+    text-align: center;
+}
+#cfg-scroll {
+    height: 1fr;
+}
+#cfg-content {
+    padding: 1 1;
 }
 #disasm-body {
     height: 1fr;
