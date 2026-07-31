@@ -2,6 +2,8 @@
 
 A terminal-based binary inspector for macOS and Linux. Opens Mach-O executables, dylibs, and object files as well as ELF executables and shared libraries, and presents their internal structure — segments, sections, dynamic libraries, symbol tables, exports, dynamic relocations / dyld chained fixups, **disassembled code**, **interactive call-flow graphs**, and **control flow graphs (CFG)** — in an interactive text UI.
 
+![cheerleader.png](assets/cheerleader.png)
+
 ---
 
 ## Requirements
