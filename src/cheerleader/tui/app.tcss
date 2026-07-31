@@ -88,9 +88,22 @@ CFGScreen {
     border-right: solid $primary;
     background: $panel;
 }
+#disasm-right {
+    width: 1fr;
+    height: 1fr;
+}
 #disasm-table {
     width: 1fr;
     height: 1fr;
+}
+#disasm-hex-pane {
+    width: 1fr;
+    height: 1fr;
+    border-left: solid $primary;
+    background: $panel;
+}
+#disasm-hex-content {
+    padding: 0 1;
 }
 #disasm-status, #str-status {
     height: 1;

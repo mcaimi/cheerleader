@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from textual import on, work
 from textual.app import ComposeResult
-from textual.containers import Horizontal
+from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import DataTable, Label, ListItem, ListView, Static, TabPane
 from rich.text import Text
 
@@ -320,11 +320,17 @@ class DisasmTab(TabPane):
         self._list: ListView | None = None
         self._instrs: list[DisasmInstruction] = []
         self._call_graph: CallGraph | None = None
+        self._hex_visible: bool = False
+        self._hex_bytes: bytes | None = None
+        self._hex_addr: int = 0
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="disasm-body"):
             yield ListView(id="disasm-sect-list")
-            yield DataTable(id="disasm-table", cursor_type="row")
+            with Horizontal(id="disasm-right"):
+                yield DataTable(id="disasm-table", cursor_type="row")
+                with VerticalScroll(id="disasm-hex-pane"):
+                    yield Static("", id="disasm-hex-content", markup=False)
         yield Static("Select a section to disassemble", id="disasm-status")
 
     def on_mount(self) -> None:
@@ -332,6 +338,7 @@ class DisasmTab(TabPane):
         t.add_columns("Address", "Bytes", "Mnemonic", "Operands")
         self._table = t
         self._list = self.query_one("#disasm-sect-list", ListView)
+        self.query_one("#disasm-hex-pane").display = False
 
     def load(self, info: BinaryInfo) -> None:
         self._info = info
@@ -396,9 +403,13 @@ class DisasmTab(TabPane):
                 _colorize_mnemonic(insn.mnemonic),
                 _colorize_operands(insn.op_str, arch),
             )
+        self._hex_bytes = b"".join(insn.raw for insn in instrs)
+        self._hex_addr = instrs[0].addr if instrs else 0
+        if self._hex_visible:
+            self._refresh_hex_content()
         self._set_status(
             f"[dim]{seg},{sect}[/dim]  {len(instrs):,} instructions"
-            "  [dim]c → call flow   f → cfg[/dim]"
+            "  [dim]c → call flow   f → cfg   h → hex view[/dim]"
         )
 
     def on_key(self, event) -> None:
@@ -410,6 +421,38 @@ class DisasmTab(TabPane):
         elif event.key == "f":
             self._open_cfg()
             event.stop()
+        elif event.key == "h":
+            self._toggle_hex()
+            event.stop()
+
+    def _toggle_hex(self) -> None:
+        self._hex_visible = not self._hex_visible
+        pane = self.query_one("#disasm-hex-pane")
+        pane.display = self._hex_visible
+        if self._hex_visible and self._hex_bytes:
+            self._refresh_hex_content()
+        elif self._hex_visible:
+            self.app.notify("Disassemble a section first", timeout=3)
+            self._hex_visible = False
+            pane.display = False
+
+    def _refresh_hex_content(self) -> None:
+        if self._hex_bytes is None:
+            return
+        content = self.query_one("#disasm-hex-content", Static)
+        content.update(self._build_hex_dump(self._hex_bytes, self._hex_addr))
+
+    def _build_hex_dump(self, data: bytes, base_addr: int) -> str:
+        lines = []
+        for i in range(0, len(data), 16):
+            chunk = data[i:i + 16]
+            addr = base_addr + i
+            hex_left = " ".join(f"{b:02x}" for b in chunk[:8])
+            hex_right = " ".join(f"{b:02x}" for b in chunk[8:])
+            hex_part = f"{hex_left:<23}  {hex_right:<23}"
+            ascii_part = "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in chunk)
+            lines.append(f"{addr:08x}  {hex_part}  |{ascii_part}|")
+        return "\n".join(lines)
 
     def _open_cfg(self) -> None:
         if self._call_graph is None or self._table is None:
