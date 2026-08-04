@@ -4,15 +4,25 @@ from __future__ import annotations
 
 from textual import on, work
 from textual.app import ComposeResult
-from textual.containers import Horizontal, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import DataTable, Label, ListItem, ListView, Static, TabPane
 from rich.text import Text
 
 from cheerleader.libs.cfg import CallGraph, build_call_graph, build_cfg
 from cheerleader.libs.disasm import disassemble_section, extract_strings
-from cheerleader.libs.types import BinaryInfo, ChainedFixup, DisasmInstruction, N_TYPE, N_UNDF, Symbol
+from cheerleader.libs.types import (
+    BinaryInfo,
+    ChainedFixup,
+    DisasmInstruction,
+    N_TYPE,
+    N_UNDF,
+    Symbol,
+)
 from cheerleader.tui.highlight import (
-    _colorize_mnemonic, _colorize_operands, _fmt_addr, _fmt_size,
+    _colorize_mnemonic,
+    _colorize_operands,
+    _fmt_addr,
+    _fmt_size,
 )
 from cheerleader.tui.screens import CallFlowScreen, CFGScreen
 
@@ -27,7 +37,15 @@ class SegmentsTab(TabPane):
 
     def on_mount(self) -> None:
         t = self.query_one("#seg-table", DataTable)
-        t.add_columns("Segment", "VM Addr", "VM Size", "File Off", "File Size", "Prot init/max", "Sections")
+        t.add_columns(
+            "Segment",
+            "VM Addr",
+            "VM Size",
+            "File Off",
+            "File Size",
+            "Prot init/max",
+            "Sections",
+        )
         self._table = t
 
     def load(self, info: BinaryInfo) -> None:
@@ -57,7 +75,9 @@ class SectionsTab(TabPane):
 
     def on_mount(self) -> None:
         t = self.query_one("#sect-table", DataTable)
-        t.add_columns("Segment", "Section", "Addr", "Size", "File Off", "Align", "Type", "Relocs")
+        t.add_columns(
+            "Segment", "Section", "Addr", "Size", "File Off", "Align", "Type", "Relocs"
+        )
         self._table = t
 
     def load(self, info: BinaryInfo) -> None:
@@ -89,7 +109,9 @@ class LibrariesTab(TabPane):
 
     def on_mount(self) -> None:
         t = self.query_one("#lib-table", DataTable)
-        t.add_columns("#", "Name", "Current Ver", "Compat Ver", "Load Type", "LC Offset")
+        t.add_columns(
+            "#", "Name", "Current Ver", "Compat Ver", "Load Type", "LC Offset"
+        )
         self._table = t
 
     def load(self, info: BinaryInfo) -> None:
@@ -109,10 +131,10 @@ class LibrariesTab(TabPane):
 
 
 class SymbolsTab(TabPane):
-    FILTER_ALL    = "all"
-    FILTER_EXT    = "external"
-    FILTER_UNDEF  = "undefined"
-    FILTER_NOSYM  = "no-stabs"
+    FILTER_ALL = "all"
+    FILTER_EXT = "external"
+    FILTER_UNDEF = "undefined"
+    FILTER_NOSYM = "no-stabs"
 
     DEFAULT_CSS = """
     SymbolsTab #sym-filter-bar {
@@ -172,8 +194,12 @@ class SymbolsTab(TabPane):
     def on_key(self, event) -> None:
         if not self.has_focus_within:
             return
-        mapping = {"a": self.FILTER_ALL, "e": self.FILTER_EXT,
-                   "u": self.FILTER_UNDEF, "n": self.FILTER_NOSYM}
+        mapping = {
+            "a": self.FILTER_ALL,
+            "e": self.FILTER_EXT,
+            "u": self.FILTER_UNDEF,
+            "n": self.FILTER_NOSYM,
+        }
         if event.character in mapping:
             self._filter = mapping[event.character]
             self._apply_filter()
@@ -207,8 +233,8 @@ class ExportsTab(TabPane):
 
 
 class ChainedFixupsTab(TabPane):
-    FILTER_ALL    = "all"
-    FILTER_BIND   = "binds"
+    FILTER_ALL = "all"
+    FILTER_BIND = "binds"
     FILTER_REBASE = "rebases"
 
     def __init__(self) -> None:
@@ -227,7 +253,9 @@ class ChainedFixupsTab(TabPane):
 
     def on_mount(self) -> None:
         t = self.query_one("#fix-table", DataTable)
-        t.add_columns("Segment", "Address", "Kind", "Type", "Library", "Symbol / Target", "Addend")
+        t.add_columns(
+            "Segment", "Address", "Kind", "Type", "Library", "Symbol / Target", "Addend"
+        )
         self._table = t
 
     def load(self, info: BinaryInfo) -> None:
@@ -244,9 +272,9 @@ class ChainedFixupsTab(TabPane):
                 continue
             if self._filter == self.FILTER_REBASE and not fx.is_rebase:
                 continue
-            kind    = "rebase" if fx.is_rebase else "bind"
-            lib     = fx.name if fx.is_rebase else (fx.name or f"lib#{fx.lib_ordinal}")
-            target  = _fmt_addr(fx.target) if fx.is_rebase else (fx.name or "")
+            kind = "rebase" if fx.is_rebase else "bind"
+            lib = fx.name if fx.is_rebase else (fx.name or f"lib#{fx.lib_ordinal}")
+            target = _fmt_addr(fx.target) if fx.is_rebase else (fx.name or "")
             t.add_row(
                 fx.segment,
                 _fmt_addr(fx.offset),
@@ -327,7 +355,7 @@ class DisasmTab(TabPane):
     def compose(self) -> ComposeResult:
         with Horizontal(id="disasm-body"):
             yield ListView(id="disasm-sect-list")
-            with Horizontal(id="disasm-right"):
+            with Vertical(id="disasm-bottom"):
                 yield DataTable(id="disasm-table", cursor_type="row")
                 with VerticalScroll(id="disasm-hex-pane"):
                     yield Static("", id="disasm-hex-content", markup=False)
@@ -392,7 +420,9 @@ class DisasmTab(TabPane):
             return
         t.clear()
         if not instrs:
-            self._set_status("[red]No output — capstone not installed or section unreadable[/red]")
+            self._set_status(
+                "[red]No output — capstone not installed or section unreadable[/red]"
+            )
             return
         arch = self._info.arch if self._info else ""
         for insn in instrs:
@@ -445,7 +475,7 @@ class DisasmTab(TabPane):
     def _build_hex_dump(self, data: bytes, base_addr: int) -> str:
         lines = []
         for i in range(0, len(data), 16):
-            chunk = data[i:i + 16]
+            chunk = data[i : i + 16]
             addr = base_addr + i
             hex_left = " ".join(f"{b:02x}" for b in chunk[:8])
             hex_right = " ".join(f"{b:02x}" for b in chunk[8:])
@@ -486,8 +516,10 @@ class DisasmTab(TabPane):
         next_func_addr = sa[pos + 1] if pos >= 0 and pos + 1 < len(sa) else None
 
         func_instrs = [
-            i for i in self._instrs
-            if i.addr >= func_addr and (next_func_addr is None or i.addr < next_func_addr)
+            i
+            for i in self._instrs
+            if i.addr >= func_addr
+            and (next_func_addr is None or i.addr < next_func_addr)
         ]
         if not func_instrs:
             self.app.notify("No instructions found for this function", timeout=3)

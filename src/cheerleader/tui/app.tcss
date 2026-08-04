@@ -88,7 +88,7 @@ CFGScreen {
     border-right: solid $primary;
     background: $panel;
 }
-#disasm-right {
+#disasm-bottom {
     width: 1fr;
     height: 1fr;
 }
@@ -98,8 +98,8 @@ CFGScreen {
 }
 #disasm-hex-pane {
     width: 1fr;
-    height: 1fr;
-    border-left: solid $primary;
+    height: 40%;
+    border-top: solid $primary;
     background: $panel;
 }
 #disasm-hex-content {
