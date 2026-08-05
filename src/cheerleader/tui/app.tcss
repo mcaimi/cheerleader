@@ -105,6 +105,37 @@ CFGScreen {
 #disasm-hex-content {
     padding: 0 1;
 }
+#funcrev-body {
+    height: 1fr;
+}
+#funcrev-func-list {
+    width: 28;
+    border-right: solid $primary;
+    background: $panel;
+}
+#funcrev-right {
+    width: 1fr;
+    height: 1fr;
+}
+#funcrev-table {
+    width: 1fr;
+    height: 1fr;
+}
+#funcrev-hex-pane {
+    width: 1fr;
+    height: 40%;
+    border-top: solid $primary;
+    background: $panel;
+}
+#funcrev-hex-content {
+    padding: 0 1;
+}
+#funcrev-status {
+    height: 1;
+    padding: 0 1;
+    background: $panel;
+    dock: bottom;
+}
 #sym-search, #str-search {
     dock: top;
 }

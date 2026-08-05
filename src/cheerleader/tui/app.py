@@ -18,6 +18,7 @@ from cheerleader.tui.tabs import (
     ChainedFixupsTab,
     DisasmTab,
     ExportsTab,
+    FuncReversingTab,
     LibrariesTab,
     SectionsTab,
     SegmentsTab,
@@ -47,6 +48,7 @@ class DisasmApp(App):
         Binding("6", "tab('tab-exports')", "Exports"),
         Binding("7", "tab('tab-fixups')", "Fixups"),
         Binding("8", "tab('tab-disasm')", "Disasm"),
+        Binding("9", "tab('tab-funcrev')", "Func Rev"),
     ]
 
     _path: reactive[str] = reactive("", recompose=False)
@@ -71,6 +73,7 @@ class DisasmApp(App):
             yield ExportsTab()
             yield ChainedFixupsTab()
             yield DisasmTab()
+            yield FuncReversingTab()
         yield Footer()
 
     def on_mount(self) -> None:
@@ -94,6 +97,7 @@ class DisasmApp(App):
         self.query_one(ExportsTab).load(info)
         self.query_one(ChainedFixupsTab).load(info)
         self.query_one(DisasmTab).load(info)
+        self.query_one(FuncReversingTab).load(info)
 
         arch = info.arch
         self.sub_title = f"{os.path.basename(self._path)}  [{arch}]"
