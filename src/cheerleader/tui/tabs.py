@@ -582,27 +582,18 @@ class DisasmTab(TabPane):
             self.app.notify("Select an instruction row", timeout=2)
             return
         addr = self._instrs[row].addr
-        func_name = self._call_graph.func_at(addr)
-        if func_name is None:
+        result = self._call_graph.func_at(addr)
+        if result is None:
             self.app.notify(
                 f"No function symbol at 0x{addr:x} — binary may be stripped",
                 timeout=4,
             )
             return
-        func_addr = self._call_graph.name_to_addr.get(func_name, addr)
+        func_name, func_addr = result
 
         sa = self._call_graph._sorted_addrs
-        lo, hi, pos = 0, len(sa) - 1, -1
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            if sa[mid] == func_addr:
-                pos = mid
-                break
-            elif sa[mid] < func_addr:
-                lo = mid + 1
-            else:
-                hi = mid - 1
-        next_func_addr = sa[pos + 1] if pos >= 0 and pos + 1 < len(sa) else None
+        pos = sa.index(func_addr)
+        next_func_addr = sa[pos + 1] if pos + 1 < len(sa) else None
 
         func_instrs = [
             i
@@ -626,11 +617,12 @@ class DisasmTab(TabPane):
             self.app.notify("Select an instruction row", timeout=2)
             return
         addr = self._instrs[row].addr
-        func_name = self._call_graph.func_at(addr)
-        if func_name is None:
+        result = self._call_graph.func_at(addr)
+        if result is None:
             self.app.notify(
                 f"No function symbol found at 0x{addr:x} — binary may be stripped",
                 timeout=4,
             )
             return
+        func_name, _ = result
         self.app.push_screen(CallFlowScreen(self._call_graph, func_name))

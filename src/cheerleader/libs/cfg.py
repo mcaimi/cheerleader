@@ -30,8 +30,8 @@ class CallGraph:
     callers: dict[str, list[tuple[str, int]]]        # name → [(caller_name, caller_addr)]
     _sorted_addrs: list[int] = field(default_factory=list)
 
-    def func_at(self, addr: int) -> str | None:
-        """Return the name of the function whose body contains addr."""
+    def func_at(self, addr: int) -> tuple[str, int] | None:
+        """Return (name, start_addr) of the function whose body contains *addr*."""
         sa = self._sorted_addrs
         if not sa:
             return None
@@ -43,7 +43,11 @@ class CallGraph:
             else:
                 hi = mid - 1
         idx = lo - 1
-        return self.addr_to_name.get(sa[idx]) if idx >= 0 else None
+        if idx < 0:
+            return None
+        a = sa[idx]
+        name = self.addr_to_name.get(a)
+        return (name, a) if name is not None else None
 
 
 @dataclass
@@ -160,38 +164,25 @@ def build_call_graph(info: BinaryInfo, instrs: list[DisasmInstruction]) -> CallG
         if a and n:
             addr_to_name.setdefault(a, n)
 
-    sorted_addrs = sorted(addr_to_name)
-    name_to_addr = {v: k for k, v in addr_to_name.items()}
-    callees: dict[str, list[tuple[str, int]]] = {n: [] for n in addr_to_name.values()}
-    callers: dict[str, list[tuple[str, int]]] = {n: [] for n in addr_to_name.values()}
-
-    def _func_at(addr: int) -> tuple[str, int] | None:
-        if not sorted_addrs:
-            return None
-        lo, hi = 0, len(sorted_addrs) - 1
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            if sorted_addrs[mid] <= addr:
-                lo = mid + 1
-            else:
-                hi = mid - 1
-        idx = lo - 1
-        if idx < 0:
-            return None
-        a = sorted_addrs[idx]
-        return addr_to_name[a], a
+    graph = CallGraph(
+        addr_to_name=addr_to_name,
+        name_to_addr={v: k for k, v in addr_to_name.items()},
+        callees={n: [] for n in addr_to_name.values()},
+        callers={n: [] for n in addr_to_name.values()},
+        _sorted_addrs=sorted(addr_to_name),
+    )
 
     seen: set[tuple[str, str]] = set()
     for insn in instrs:
         if insn.mnemonic not in CALL_MNEMONICS:
             continue
-        result = _func_at(insn.addr)
+        result = graph.func_at(insn.addr)
         if result is None:
             continue
         caller_name, caller_addr = result
 
         m = _CALL_TARGET_RE.search(insn.op_str)
-        if m:
+        if m and "[" not in insn.op_str:
             tgt = int(m.group(1), 16)
             callee_name = addr_to_name.get(tgt, f"sub_{tgt:x}")
             callee_addr = tgt
@@ -204,13 +195,7 @@ def build_call_graph(info: BinaryInfo, instrs: list[DisasmInstruction]) -> CallG
             continue
         seen.add(edge)
 
-        callees.setdefault(caller_name, []).append((callee_name, callee_addr))
-        callers.setdefault(callee_name, []).append((caller_name, caller_addr))
+        graph.callees.setdefault(caller_name, []).append((callee_name, callee_addr))
+        graph.callers.setdefault(callee_name, []).append((caller_name, caller_addr))
 
-    return CallGraph(
-        addr_to_name=addr_to_name,
-        name_to_addr=name_to_addr,
-        callees=callees,
-        callers=callers,
-        _sorted_addrs=sorted_addrs,
-    )
+    return graph
