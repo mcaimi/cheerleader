@@ -428,6 +428,194 @@ class StringsTab(TabPane):
             event.stop()
 
 
+class FuncReversingTab(TabPane):
+    def __init__(self) -> None:
+        super().__init__("Function Reversing", id="tab-funcrev")
+        self._info: BinaryInfo | None = None
+        self._table: DataTable | None = None
+        self._list: ListView | None = None
+        self._instrs: list[DisasmInstruction] = []
+        self._call_graph: CallGraph | None = None
+        self._functions: list[tuple[str, int]] = []
+        self._sorted_func_addrs: list[int] = []
+        self._hex_visible: bool = False
+        self._hex_bytes: bytes | None = None
+        self._hex_addr: int = 0
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(id="funcrev-body"):
+            yield ListView(id="funcrev-func-list")
+            with Vertical(id="funcrev-right"):
+                yield DataTable(id="funcrev-table", cursor_type="row")
+                with VerticalScroll(id="funcrev-hex-pane"):
+                    yield Static("", id="funcrev-hex-content", markup=False)
+        yield Static("Select a function to disassemble", id="funcrev-status")
+
+    def on_mount(self) -> None:
+        t = self.query_one("#funcrev-table", DataTable)
+        t.add_columns("Address", "Bytes", "Mnemonic", "Operands")
+        self._table = t
+        self._list = self.query_one("#funcrev-func-list", ListView)
+        self.query_one("#funcrev-hex-pane").display = False
+
+    def load(self, info: BinaryInfo) -> None:
+        self._info = info
+        self._functions = []
+        self._sorted_func_addrs = []
+        lv = self._list
+        if lv is None:
+            return
+        lv.clear()
+        t = self._table
+        if t is not None:
+            t.clear()
+        self._build_function_list(info)
+
+    @work(thread=True)
+    def _build_function_list(self, info: BinaryInfo) -> None:
+        self.app.call_from_thread(self._set_status, "Disassembling…")
+        instrs: list[DisasmInstruction] = []
+        exec_segs = {seg.name for seg in info.segments if seg.initprot & 0x4}
+        for seg in info.segments:
+            if seg.name not in exec_segs:
+                continue
+            for s in seg.sections:
+                if s.size == 0 or s.offset == 0:
+                    continue
+                instrs.extend(disassemble_section(info, s.segment, s.name))
+        if not instrs:
+            self.app.call_from_thread(
+                self._set_status, "[red]No executable sections found[/red]"
+            )
+            return
+        instrs.sort(key=lambda i: i.addr)
+        graph = build_call_graph(info, instrs)
+        self.app.call_from_thread(self._populate_functions, instrs, graph)
+
+    def _populate_functions(
+        self,
+        instrs: list[DisasmInstruction],
+        graph: CallGraph,
+    ) -> None:
+        self._instrs = instrs
+        self._call_graph = graph
+
+        func_map: dict[int, str] = dict(graph.addr_to_name)
+        min_addr = instrs[0].addr
+        max_addr = instrs[-1].addr
+        for callee_list in graph.callees.values():
+            for callee_name, callee_addr in callee_list:
+                if callee_name.startswith("sub_") and callee_addr not in func_map:
+                    if min_addr <= callee_addr <= max_addr:
+                        func_map[callee_addr] = callee_name
+        for caller_list in graph.callers.values():
+            for caller_name, caller_addr in caller_list:
+                if caller_name.startswith("sub_") and caller_addr not in func_map:
+                    if min_addr <= caller_addr <= max_addr:
+                        func_map[caller_addr] = caller_name
+
+        sorted_funcs = sorted(func_map.items(), key=lambda x: x[0])
+        self._functions = [(name, addr) for addr, name in sorted_funcs]
+        self._sorted_func_addrs = [addr for addr, _ in sorted_funcs]
+
+        lv = self._list
+        if lv is None:
+            return
+        lv.clear()
+        for addr, name in sorted_funcs:
+            lv.append(ListItem(Label(f" {name}")))
+
+        self._set_status(f"{len(self._functions)} functions identified")
+
+    @on(ListView.Selected, "#funcrev-func-list")
+    def _func_picked(self, event: ListView.Selected) -> None:
+        idx = event.list_view.index
+        if 0 <= idx < len(self._functions):
+            name, addr = self._functions[idx]
+            self._show_function(name, addr)
+
+    def _show_function(self, name: str, addr: int) -> None:
+        try:
+            pos = self._sorted_func_addrs.index(addr)
+        except ValueError:
+            return
+        next_addr = (
+            self._sorted_func_addrs[pos + 1]
+            if pos + 1 < len(self._sorted_func_addrs)
+            else None
+        )
+        func_instrs = [
+            i
+            for i in self._instrs
+            if i.addr >= addr
+            and (next_addr is None or i.addr < next_addr)
+        ]
+        t = self._table
+        if t is None:
+            return
+        t.clear()
+        arch = self._info.arch if self._info else ""
+        for insn in func_instrs:
+            raw_hex = " ".join(f"{b:02x}" for b in insn.raw)
+            t.add_row(
+                Text(f"0x{insn.addr:016x}", style="cyan"),
+                Text(raw_hex, style="dim"),
+                _colorize_mnemonic(insn.mnemonic),
+                _colorize_operands(insn.op_str, arch),
+            )
+        self._hex_bytes = b"".join(insn.raw for insn in func_instrs)
+        self._hex_addr = func_instrs[0].addr if func_instrs else 0
+        if self._hex_visible:
+            self._refresh_hex_content()
+        self._set_status(
+            f"[dim]{name}[/dim] @ 0x{addr:x}  —  {len(func_instrs):,} instructions"
+            "  [dim]h → hex view[/dim]"
+        )
+
+    def on_key(self, event) -> None:
+        if not self.has_focus_within:
+            return
+        if event.key == "h":
+            self._toggle_hex()
+            event.stop()
+
+    def _toggle_hex(self) -> None:
+        self._hex_visible = not self._hex_visible
+        pane = self.query_one("#funcrev-hex-pane")
+        pane.display = self._hex_visible
+        if self._hex_visible and self._hex_bytes:
+            self._refresh_hex_content()
+        elif self._hex_visible:
+            self.app.notify("Select a function first", timeout=3)
+            self._hex_visible = False
+            pane.display = False
+
+    def _refresh_hex_content(self) -> None:
+        if self._hex_bytes is None:
+            return
+        content = self.query_one("#funcrev-hex-content", Static)
+        content.update(self._build_hex_dump(self._hex_bytes, self._hex_addr))
+
+    @staticmethod
+    def _build_hex_dump(data: bytes, base_addr: int) -> str:
+        lines = []
+        for i in range(0, len(data), 16):
+            chunk = data[i : i + 16]
+            addr = base_addr + i
+            hex_left = " ".join(f"{b:02x}" for b in chunk[:8])
+            hex_right = " ".join(f"{b:02x}" for b in chunk[8:])
+            hex_part = f"{hex_left:<23}  {hex_right:<23}"
+            ascii_part = "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in chunk)
+            lines.append(f"{addr:08x}  {hex_part}  |{ascii_part}|")
+        return "\n".join(lines)
+
+    def _set_status(self, msg: str) -> None:
+        try:
+            self.query_one("#funcrev-status", Static).update(msg)
+        except Exception:
+            pass
+
+
 class DisasmTab(TabPane):
     def __init__(self) -> None:
         super().__init__("Disasm", id="tab-disasm")
