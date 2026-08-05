@@ -5,7 +5,7 @@ from __future__ import annotations
 from textual import on, work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import DataTable, Label, ListItem, ListView, Static, TabPane
+from textual.widgets import DataTable, Input, Label, ListItem, ListView, Static, TabPane
 from rich.text import Text
 
 from cheerleader.libs.cfg import CallGraph, build_call_graph, build_cfg
@@ -136,52 +136,58 @@ class SymbolsTab(TabPane):
     FILTER_UNDEF = "undefined"
     FILTER_NOSYM = "no-stabs"
 
-    DEFAULT_CSS = """
-    SymbolsTab #sym-filter-bar {
-        height: 1;
-        padding: 0 1;
-        background: $panel;
-    }
-    SymbolsTab #sym-filter-bar Label {
-        margin-right: 1;
-    }
-    """
-
     def __init__(self) -> None:
         super().__init__("Symbols", id="tab-symbols")
         self._all: list[Symbol] = []
         self._table: DataTable | None = None
         self._filter = self.FILTER_NOSYM
+        self._search_query: str = ""
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="sym-filter-bar"):
             yield Label("[bold]Filter:[/bold]")
-            yield Label(f"[underline]a[/underline]ll", id="sf-all")
-            yield Label(f"[underline]e[/underline]xternal", id="sf-ext")
-            yield Label(f"[underline]u[/underline]ndefined", id="sf-undef")
-            yield Label(f"[underline]n[/underline]o-stabs", id="sf-nosym")
+            yield Label("[underline]a[/underline]ll", id="sf-all")
+            yield Label("[underline]e[/underline]xternal", id="sf-ext")
+            yield Label("[underline]u[/underline]ndefined", id="sf-undef")
+            yield Label("[underline]n[/underline]o-stabs", id="sf-nosym")
+        yield Input(placeholder="Search symbols… (Esc to close)", id="sym-search")
         yield DataTable(id="sym-table", cursor_type="row")
+        yield Static("", id="sym-status")
 
     def on_mount(self) -> None:
         t = self.query_one("#sym-table", DataTable)
         t.add_columns("Address", "Type", "Sect", "Binding", "Name")
         self._table = t
+        self.query_one("#sym-search", Input).display = False
 
     def load(self, info: BinaryInfo) -> None:
         self._all = info.symbols
+        self._search_query = ""
+        search = self.query_one("#sym-search", Input)
+        search.value = ""
+        search.display = False
         self._apply_filter()
+
+    def _set_status(self, msg: str) -> None:
+        try:
+            self.query_one("#sym-status", Static).update(msg)
+        except Exception:
+            pass
 
     def _apply_filter(self) -> None:
         t = self._table
         if t is None:
             return
         t.clear()
+        query = self._search_query.lower()
         for sym in self._all:
             if self._filter == self.FILTER_EXT and not sym.external:
                 continue
             if self._filter == self.FILTER_UNDEF and (sym.sym_type & N_TYPE) != N_UNDF:
                 continue
             if self._filter == self.FILTER_NOSYM and sym.stab:
+                continue
+            if query and query not in sym.name.lower():
                 continue
             t.add_row(
                 _fmt_addr(sym.addr),
@@ -191,9 +197,39 @@ class SymbolsTab(TabPane):
                 sym.name,
             )
 
+        self._set_status(
+            f"{len(self._all):,} symbols found [dim] s,/ -> search symbol [/dim]"
+        )
+
+    @on(Input.Changed, "#sym-search")
+    def _on_search_changed(self, event: Input.Changed) -> None:
+        self._search_query = event.value
+        self._apply_filter()
+
     def on_key(self, event) -> None:
         if not self.has_focus_within:
             return
+
+        search_input = self.query_one("#sym-search", Input)
+
+        if event.key == "escape" and search_input.display:
+            search_input.value = ""
+            search_input.display = False
+            self._search_query = ""
+            self._apply_filter()
+            self.query_one("#sym-table", DataTable).focus()
+            event.stop()
+            return
+
+        if search_input.has_focus:
+            return
+
+        if event.character in ("S", "/"):
+            search_input.display = True
+            search_input.focus()
+            event.stop()
+            return
+
         mapping = {
             "a": self.FILTER_ALL,
             "e": self.FILTER_EXT,
@@ -246,9 +282,9 @@ class ChainedFixupsTab(TabPane):
     def compose(self) -> ComposeResult:
         with Horizontal(id="fix-filter-bar"):
             yield Label("[bold]Filter:[/bold]")
-            yield Label(f"[underline]a[/underline]ll")
-            yield Label(f"[underline]b[/underline]inds")
-            yield Label(f"[underline]r[/underline]ebases")
+            yield Label("[underline]a[/underline]ll")
+            yield Label("[underline]b[/underline]inds")
+            yield Label("[underline]r[/underline]ebases")
         yield DataTable(id="fix-table", cursor_type="row")
 
     def on_mount(self) -> None:
@@ -299,8 +335,11 @@ class StringsTab(TabPane):
     def __init__(self) -> None:
         super().__init__("Strings", id="tab-strings")
         self._table: DataTable | None = None
+        self._all: list = []
+        self._search_query: str = ""
 
     def compose(self) -> ComposeResult:
+        yield Input(placeholder="Search strings… (Esc to close)", id="str-search")
         yield DataTable(id="str-table", cursor_type="row")
         yield Static("", id="str-status")
 
@@ -308,8 +347,13 @@ class StringsTab(TabPane):
         t = self.query_one("#str-table", DataTable)
         t.add_columns("File Offset", "Address", "Section", "String")
         self._table = t
+        self.query_one("#str-search", Input).display = False
 
     def load(self, info: BinaryInfo) -> None:
+        self._search_query = ""
+        search = self.query_one("#str-search", Input)
+        search.value = ""
+        search.display = False
         self._load_strings(info)
 
     @work(thread=True)
@@ -325,18 +369,63 @@ class StringsTab(TabPane):
             pass
 
     def _populate(self, strings: list) -> None:
+        self._all = strings
+        self._rebuild_table()
+
+    def _rebuild_table(self) -> None:
         t = self._table
         if t is None:
             return
         t.clear()
-        for s in strings:
+        query = self._search_query.lower()
+        count = 0
+        for s in self._all:
+            if query and query not in s.value.lower():
+                continue
             t.add_row(
                 f"0x{s.file_offset:08x}",
                 f"0x{s.addr:016x}" if s.addr else "—",
                 s.section,
                 s.value,
             )
-        self._set_status(f"{len(strings):,} strings found")
+            count += 1
+        if query:
+            self._set_status(
+                f"{count:,} / {len(self._all):,} strings matching '{self._search_query}'"
+                "[dim] escape -> close search [/dim]"
+            )
+        else:
+            self._set_status(
+                f"{len(self._all):,} strings found [dim] s,/ -> search string [/dim]"
+            )
+
+    @on(Input.Changed, "#str-search")
+    def _on_search_changed(self, event: Input.Changed) -> None:
+        self._search_query = event.value
+        self._rebuild_table()
+
+    def on_key(self, event) -> None:
+        if not self.has_focus_within:
+            return
+
+        search_input = self.query_one("#str-search", Input)
+
+        if event.key == "escape" and search_input.display:
+            search_input.value = ""
+            search_input.display = False
+            self._search_query = ""
+            self._rebuild_table()
+            self.query_one("#str-table", DataTable).focus()
+            event.stop()
+            return
+
+        if search_input.has_focus:
+            return
+
+        if event.character in ("S", "/"):
+            search_input.display = True
+            search_input.focus()
+            event.stop()
 
 
 class DisasmTab(TabPane):

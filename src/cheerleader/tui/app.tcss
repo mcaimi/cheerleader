@@ -105,7 +105,10 @@ CFGScreen {
 #disasm-hex-content {
     padding: 0 1;
 }
-#disasm-status, #str-status {
+#sym-search, #str-search {
+    dock: top;
+}
+#disasm-status, #str-status, #sym-status {
     height: 1;
     padding: 0 1;
     background: $panel;
@@ -126,4 +129,13 @@ SlicePicker Vertical {
     background: $surface;
     margin: 4 20;
     padding: 1 2;
+}
+
+SymbolsTab #sym-filter-bar {
+    height: 1;
+    padding: 0 1;
+    background: $panel;
+}
+SymbolsTab #sym-filter-bar Label {
+    margin-right: 1;
 }
