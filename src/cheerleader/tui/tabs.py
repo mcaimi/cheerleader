@@ -24,7 +24,7 @@ from cheerleader.tui.highlight import (
     _fmt_addr,
     _fmt_size,
 )
-from cheerleader.tui.screens import CallFlowScreen, CFGScreen
+from cheerleader.tui.screens import AIResponseScreen, CallFlowScreen, CFGScreen
 
 
 class SegmentsTab(TabPane):
@@ -429,7 +429,7 @@ class StringsTab(TabPane):
 
 
 class FuncReversingTab(TabPane):
-    def __init__(self) -> None:
+    def __init__(self, env_file: str | None = None) -> None:
         super().__init__("Function Reversing", id="tab-funcrev")
         self._info: BinaryInfo | None = None
         self._table: DataTable | None = None
@@ -441,6 +441,10 @@ class FuncReversingTab(TabPane):
         self._hex_visible: bool = False
         self._hex_bytes: bytes | None = None
         self._hex_addr: int = 0
+        self._env_file: str = env_file or ".env"
+        self._agent = None
+        self._current_func_name: str | None = None
+        self._current_func_instrs: list[DisasmInstruction] = []
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="funcrev-body"):
@@ -550,6 +554,8 @@ class FuncReversingTab(TabPane):
             if i.addr >= addr
             and (next_addr is None or i.addr < next_addr)
         ]
+        self._current_func_name = name
+        self._current_func_instrs = func_instrs
         t = self._table
         if t is None:
             return
@@ -569,7 +575,7 @@ class FuncReversingTab(TabPane):
             self._refresh_hex_content()
         self._set_status(
             f"[dim]{name}[/dim] @ 0x{addr:x}  —  {len(func_instrs):,} instructions"
-            "  [dim]h → hex view[/dim]"
+            "  [dim]h → hex view  a → ai analysis[/dim]"
         )
 
     def on_key(self, event) -> None:
@@ -578,6 +584,63 @@ class FuncReversingTab(TabPane):
         if event.key == "h":
             self._toggle_hex()
             event.stop()
+        elif event.key == "a":
+            self._ask_ai()
+            event.stop()
+
+    def _ask_ai(self) -> None:
+        if not self._current_func_name or not self._current_func_instrs:
+            self.app.notify("Select a function first", timeout=3)
+            return
+        arch = self._info.arch if self._info else "unknown"
+        func_name = self._current_func_name
+        func_addr = self._current_func_instrs[0].addr
+        lines = [f"Function: {func_name} @ 0x{func_addr:x}", f"Architecture: {arch}", ""]
+        for insn in self._current_func_instrs:
+            lines.append(f"0x{insn.addr:x}  {insn.mnemonic} {insn.op_str}")
+        self._invoke_agent(func_name, "\n".join(lines))
+
+    @work(thread=True)
+    def _invoke_agent(self, func_name: str, prompt: str) -> None:
+        self.app.call_from_thread(self._set_status, "Querying AI model…")
+        if self._agent is None:
+            try:
+                from cheerleader.agent import CheerleaderAIAgent, load_agent_settings
+
+                config = load_agent_settings(self._env_file)
+                self._agent = CheerleaderAIAgent(config)
+            except Exception as exc:
+                self.app.call_from_thread(
+                    self.app.notify,
+                    f"AI agent init failed: {exc}",
+                    severity="error",
+                    timeout=6,
+                )
+                self.app.call_from_thread(self._set_status, "AI agent unavailable")
+                return
+
+        try:
+            result = self._agent.invoke(prompt)
+            messages = result.get("messages", [])
+            response = messages[-1].content if messages else "No response from model"
+        except Exception as exc:
+            self.app.call_from_thread(
+                self.app.notify,
+                f"AI query failed: {exc}",
+                severity="error",
+                timeout=6,
+            )
+            self.app.call_from_thread(self._set_status, "AI query failed")
+            return
+
+        self.app.call_from_thread(self._show_ai_response, func_name, response)
+
+    def _show_ai_response(self, func_name: str, response: str) -> None:
+        self._set_status(
+            f"[dim]{func_name}[/dim]  —  AI analysis complete"
+            "  [dim]h → hex view  a → ai analysis[/dim]"
+        )
+        self.app.push_screen(AIResponseScreen(func_name, response))
 
     def _toggle_hex(self) -> None:
         self._hex_visible = not self._hex_visible

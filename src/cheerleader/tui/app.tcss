@@ -162,6 +162,31 @@ SlicePicker Vertical {
     padding: 1 2;
 }
 
+AIResponseScreen {
+    align: center middle;
+    background: $background 60%;
+}
+#ai-box {
+    width: 92%;
+    height: 90%;
+    border: round $accent;
+    background: $surface;
+    padding: 0 1;
+}
+#ai-title {
+    padding: 1;
+    text-align: center;
+}
+#ai-hint {
+    padding: 0 1 1 1;
+    text-align: center;
+}
+#ai-scroll {
+    height: 1fr;
+}
+#ai-content {
+    padding: 1 1;
+}
 SymbolsTab #sym-filter-bar {
     height: 1;
     padding: 0 1;

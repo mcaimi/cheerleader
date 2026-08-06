@@ -54,12 +54,13 @@ class DisasmApp(App):
     _path: reactive[str] = reactive("", recompose=False)
     _slice: reactive[int] = reactive(0, recompose=False)
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, env_file: str | None = None) -> None:
         super().__init__()
         self._path = path
         self._slice = 0
         self._info: BinaryInfo | None = None
         self._slices: list[tuple[int, str]] = []
+        self._env_file = env_file
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -73,7 +74,7 @@ class DisasmApp(App):
             yield ExportsTab()
             yield ChainedFixupsTab()
             yield DisasmTab()
-            yield FuncReversingTab()
+            yield FuncReversingTab(env_file=self._env_file)
         yield Footer()
 
     def on_mount(self) -> None:
