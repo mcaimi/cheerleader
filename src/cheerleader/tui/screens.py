@@ -144,3 +144,32 @@ class CFGScreen(Screen):
             f"  [dim]0x{cfg.func_addr:x}  ·  {n} block{'s' if n != 1 else ''}[/dim]"
         )
         self.query_one("#cfg-content", Static).update(_render_cfg(cfg))
+
+
+class AIResponseScreen(Screen):
+    """Modal showing an AI-generated analysis of a disassembled function."""
+
+    BINDINGS = [Binding("escape", "dismiss(None)", "Close")]
+
+    def __init__(self, func_name: str, response: str) -> None:
+        super().__init__()
+        self._func_name = func_name
+        self._response = response
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="ai-box"):
+            yield Label("", id="ai-title")
+            yield Rule()
+            with VerticalScroll(id="ai-scroll"):
+                yield Static("", id="ai-content", markup=False)
+            yield Rule()
+            yield Label(
+                "[dim]↑↓ / PgUp / PgDn  scroll    Esc  close[/dim]",
+                id="ai-hint",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#ai-title", Label).update(
+            f"[bold]AI Analysis:[/bold]  [cyan]{_esc_markup(self._func_name)}[/cyan]"
+        )
+        self.query_one("#ai-content", Static).update(self._response)
