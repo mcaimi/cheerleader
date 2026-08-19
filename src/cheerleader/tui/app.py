@@ -19,6 +19,7 @@ from cheerleader.tui.tabs import (
     DisasmTab,
     ExportsTab,
     FuncReversingTab,
+    HexEditorTab,
     LibrariesTab,
     SectionsTab,
     SegmentsTab,
@@ -54,30 +55,45 @@ class DisasmApp(App):
     _path: reactive[str] = reactive("", recompose=False)
     _slice: reactive[int] = reactive(0, recompose=False)
 
-    def __init__(self, path: str, env_file: str | None = None) -> None:
+    def __init__(
+        self,
+        path: str,
+        env_file: str | None = None,
+        hex_mode: bool = False,
+    ) -> None:
         super().__init__()
         self._path = path
         self._slice = 0
         self._info: BinaryInfo | None = None
         self._slices: list[tuple[int, str]] = []
         self._env_file = env_file
+        self._hex_mode = hex_mode
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        yield InfoBar(id="info-bar")
-        with TabbedContent(id="main-tabs"):
-            yield SegmentsTab()
-            yield StringsTab()
-            yield SectionsTab()
-            yield LibrariesTab()
-            yield SymbolsTab()
-            yield ExportsTab()
-            yield ChainedFixupsTab()
-            yield DisasmTab()
-            yield FuncReversingTab(env_file=self._env_file)
+        if self._hex_mode:
+            with TabbedContent(id="main-tabs"):
+                yield HexEditorTab()
+        else:
+            yield InfoBar(id="info-bar")
+            with TabbedContent(id="main-tabs"):
+                yield SegmentsTab()
+                yield StringsTab()
+                yield SectionsTab()
+                yield LibrariesTab()
+                yield SymbolsTab()
+                yield ExportsTab()
+                yield ChainedFixupsTab()
+                yield DisasmTab()
+                yield FuncReversingTab(env_file=self._env_file)
         yield Footer()
 
     def on_mount(self) -> None:
+        if self._hex_mode:
+            self.title = "CHEERLEADER — hex editor"
+            self.sub_title = os.path.basename(self._path)
+            self.query_one(HexEditorTab).load(self._path)
+            return
         fmt = detect_format(self._path)
         if fmt == "macho":
             self._slices = list_fat_slices(self._path)
@@ -86,6 +102,9 @@ class DisasmApp(App):
         self._load()
 
     def _load(self) -> None:
+        if self._hex_mode:
+            self.query_one(HexEditorTab).load(self._path)
+            return
         info = parse(self._path, slice_index=self._slice)
         self._info = info
 

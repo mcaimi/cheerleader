@@ -25,6 +25,7 @@ from cheerleader.tui.highlight import (
     _fmt_size,
 )
 from cheerleader.tui.screens import AIResponseScreen, CallFlowScreen, CFGScreen
+from cheerleader.tui.widgets import HexPane, build_hex_dump
 
 
 class SegmentsTab(TabPane):
@@ -438,9 +439,6 @@ class FuncReversingTab(TabPane):
         self._call_graph: CallGraph | None = None
         self._functions: list[tuple[str, int]] = []
         self._sorted_func_addrs: list[int] = []
-        self._hex_visible: bool = False
-        self._hex_bytes: bytes | None = None
-        self._hex_addr: int = 0
         self._env_file: str = env_file or ".env"
         self._agent = None
         self._current_func_name: str | None = None
@@ -451,8 +449,7 @@ class FuncReversingTab(TabPane):
             yield ListView(id="funcrev-func-list")
             with Vertical(id="funcrev-right"):
                 yield DataTable(id="funcrev-table", cursor_type="row")
-                with VerticalScroll(id="funcrev-hex-pane"):
-                    yield Static("", id="funcrev-hex-content", markup=False)
+                yield HexPane(no_data_message="Select a function first")
         yield Static("Select a function to disassemble", id="funcrev-status")
 
     def on_mount(self) -> None:
@@ -460,7 +457,7 @@ class FuncReversingTab(TabPane):
         t.add_columns("Address", "Bytes", "Mnemonic", "Operands")
         self._table = t
         self._list = self.query_one("#funcrev-func-list", ListView)
-        self.query_one("#funcrev-hex-pane").display = False
+        self._hex_pane = self.query_one(HexPane)
 
     def load(self, info: BinaryInfo) -> None:
         self._info = info
@@ -569,10 +566,10 @@ class FuncReversingTab(TabPane):
                 _colorize_mnemonic(insn.mnemonic),
                 _colorize_operands(insn.op_str, arch),
             )
-        self._hex_bytes = b"".join(insn.raw for insn in func_instrs)
-        self._hex_addr = func_instrs[0].addr if func_instrs else 0
-        if self._hex_visible:
-            self._refresh_hex_content()
+        self._hex_pane.set_data(
+            b"".join(insn.raw for insn in func_instrs),
+            func_instrs[0].addr if func_instrs else 0,
+        )
         self._set_status(
             f"[dim]{name}[/dim] @ 0x{addr:x}  —  {len(func_instrs):,} instructions"
             "  [dim]h → hex view  a → ai analysis[/dim]"
@@ -643,34 +640,7 @@ class FuncReversingTab(TabPane):
         self.app.push_screen(AIResponseScreen(func_name, response))
 
     def _toggle_hex(self) -> None:
-        self._hex_visible = not self._hex_visible
-        pane = self.query_one("#funcrev-hex-pane")
-        pane.display = self._hex_visible
-        if self._hex_visible and self._hex_bytes:
-            self._refresh_hex_content()
-        elif self._hex_visible:
-            self.app.notify("Select a function first", timeout=3)
-            self._hex_visible = False
-            pane.display = False
-
-    def _refresh_hex_content(self) -> None:
-        if self._hex_bytes is None:
-            return
-        content = self.query_one("#funcrev-hex-content", Static)
-        content.update(self._build_hex_dump(self._hex_bytes, self._hex_addr))
-
-    @staticmethod
-    def _build_hex_dump(data: bytes, base_addr: int) -> str:
-        lines = []
-        for i in range(0, len(data), 16):
-            chunk = data[i : i + 16]
-            addr = base_addr + i
-            hex_left = " ".join(f"{b:02x}" for b in chunk[:8])
-            hex_right = " ".join(f"{b:02x}" for b in chunk[8:])
-            hex_part = f"{hex_left:<23}  {hex_right:<23}"
-            ascii_part = "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in chunk)
-            lines.append(f"{addr:08x}  {hex_part}  |{ascii_part}|")
-        return "\n".join(lines)
+        self._hex_pane.toggle()
 
     def _set_status(self, msg: str) -> None:
         try:
@@ -688,17 +658,13 @@ class DisasmTab(TabPane):
         self._list: ListView | None = None
         self._instrs: list[DisasmInstruction] = []
         self._call_graph: CallGraph | None = None
-        self._hex_visible: bool = False
-        self._hex_bytes: bytes | None = None
-        self._hex_addr: int = 0
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="disasm-body"):
             yield ListView(id="disasm-sect-list")
             with Vertical(id="disasm-bottom"):
                 yield DataTable(id="disasm-table", cursor_type="row")
-                with VerticalScroll(id="disasm-hex-pane"):
-                    yield Static("", id="disasm-hex-content", markup=False)
+                yield HexPane(no_data_message="Disassemble a section first")
         yield Static("Select a section to disassemble", id="disasm-status")
 
     def on_mount(self) -> None:
@@ -706,7 +672,7 @@ class DisasmTab(TabPane):
         t.add_columns("Address", "Bytes", "Mnemonic", "Operands")
         self._table = t
         self._list = self.query_one("#disasm-sect-list", ListView)
-        self.query_one("#disasm-hex-pane").display = False
+        self._hex_pane = self.query_one(HexPane)
 
     def load(self, info: BinaryInfo) -> None:
         self._info = info
@@ -773,10 +739,10 @@ class DisasmTab(TabPane):
                 _colorize_mnemonic(insn.mnemonic),
                 _colorize_operands(insn.op_str, arch),
             )
-        self._hex_bytes = b"".join(insn.raw for insn in instrs)
-        self._hex_addr = instrs[0].addr if instrs else 0
-        if self._hex_visible:
-            self._refresh_hex_content()
+        self._hex_pane.set_data(
+            b"".join(insn.raw for insn in instrs),
+            instrs[0].addr if instrs else 0,
+        )
         self._set_status(
             f"[dim]{seg},{sect}[/dim]  {len(instrs):,} instructions"
             "  [dim]c → call flow   f → cfg   h → hex view[/dim]"
@@ -796,33 +762,7 @@ class DisasmTab(TabPane):
             event.stop()
 
     def _toggle_hex(self) -> None:
-        self._hex_visible = not self._hex_visible
-        pane = self.query_one("#disasm-hex-pane")
-        pane.display = self._hex_visible
-        if self._hex_visible and self._hex_bytes:
-            self._refresh_hex_content()
-        elif self._hex_visible:
-            self.app.notify("Disassemble a section first", timeout=3)
-            self._hex_visible = False
-            pane.display = False
-
-    def _refresh_hex_content(self) -> None:
-        if self._hex_bytes is None:
-            return
-        content = self.query_one("#disasm-hex-content", Static)
-        content.update(self._build_hex_dump(self._hex_bytes, self._hex_addr))
-
-    def _build_hex_dump(self, data: bytes, base_addr: int) -> str:
-        lines = []
-        for i in range(0, len(data), 16):
-            chunk = data[i : i + 16]
-            addr = base_addr + i
-            hex_left = " ".join(f"{b:02x}" for b in chunk[:8])
-            hex_right = " ".join(f"{b:02x}" for b in chunk[8:])
-            hex_part = f"{hex_left:<23}  {hex_right:<23}"
-            ascii_part = "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in chunk)
-            lines.append(f"{addr:08x}  {hex_part}  |{ascii_part}|")
-        return "\n".join(lines)
+        self._hex_pane.toggle()
 
     def _open_cfg(self) -> None:
         if self._call_graph is None or self._table is None:
@@ -877,3 +817,45 @@ class DisasmTab(TabPane):
             return
         func_name, _ = result
         self.app.push_screen(CallFlowScreen(self._call_graph, func_name))
+
+
+class HexEditorTab(TabPane):
+    def __init__(self) -> None:
+        super().__init__("Hex Editor", id="tab-hexedit")
+        self._path: str | None = None
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="hexedit-scroll"):
+            yield Static("", id="hexedit-content", markup=False)
+        yield Static("", id="hexedit-status")
+
+    def load(self, path: str) -> None:
+        self._path = path
+        self._load_file(path)
+
+    @work(thread=True)
+    def _load_file(self, path: str) -> None:
+        self.app.call_from_thread(self._set_status, "Loading…")
+        with open(path, "rb") as f:
+            data = f.read()
+        dump = build_hex_dump(data, 0)
+        self.app.call_from_thread(self._display, data, dump)
+
+    def _display(self, data: bytes, dump: str) -> None:
+        self.query_one("#hexedit-content", Static).update(dump)
+        size = len(data)
+        if size >= 1024 * 1024:
+            size_str = f"{size / (1024 * 1024):.1f} MiB"
+        elif size >= 1024:
+            size_str = f"{size / 1024:.1f} KiB"
+        else:
+            size_str = f"{size} bytes"
+        self._set_status(
+            f"[dim]{self._path}[/dim]  {size_str}  ({size:,} bytes)"
+        )
+
+    def _set_status(self, msg: str) -> None:
+        try:
+            self.query_one("#hexedit-status", Static).update(msg)
+        except Exception:
+            pass

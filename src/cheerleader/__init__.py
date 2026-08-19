@@ -13,6 +13,12 @@ def main() -> None:
     )
     parser.add_argument("binary", help="path to the binary to inspect")
     parser.add_argument(
+        "--hex",
+        action="store_true",
+        default=False,
+        help="open in hex editor mode (raw file hex dump only)",
+    )
+    parser.add_argument(
         "--env",
         default=".env",
         metavar="FILE",
@@ -34,5 +40,5 @@ def main() -> None:
 
     from cheerleader.tui import DisasmApp
 
-    app = DisasmApp(args.binary, env_file=args.env)
+    app = DisasmApp(args.binary, env_file=args.env, hex_mode=args.hex)
     app.run()

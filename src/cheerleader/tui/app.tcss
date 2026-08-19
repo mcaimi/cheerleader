@@ -80,6 +80,18 @@ CFGScreen {
 #cfg-content {
     padding: 1 1;
 }
+#hexedit-scroll {
+    height: 1fr;
+}
+#hexedit-content {
+    padding: 0 1;
+}
+#hexedit-status {
+    height: 1;
+    padding: 0 1;
+    background: $panel;
+    dock: bottom;
+}
 #disasm-body {
     height: 1fr;
 }
@@ -96,15 +108,6 @@ CFGScreen {
     width: 1fr;
     height: 1fr;
 }
-#disasm-hex-pane {
-    width: 1fr;
-    height: 40%;
-    border-top: solid $primary;
-    background: $panel;
-}
-#disasm-hex-content {
-    padding: 0 1;
-}
 #funcrev-body {
     height: 1fr;
 }
@@ -120,15 +123,6 @@ CFGScreen {
 #funcrev-table {
     width: 1fr;
     height: 1fr;
-}
-#funcrev-hex-pane {
-    width: 1fr;
-    height: 40%;
-    border-top: solid $primary;
-    background: $panel;
-}
-#funcrev-hex-content {
-    padding: 0 1;
 }
 #funcrev-status {
     height: 1;
