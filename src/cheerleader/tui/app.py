@@ -145,5 +145,12 @@ class DisasmApp(App):
 
         self.push_screen(SlicePicker(self._slices), _on_pick)
 
+    def check_action(
+        self, action: str, parameters: tuple[object, ...]
+    ) -> bool | None:
+        if self._hex_mode and action in ("tab", "slice"):
+            return False
+        return True
+
     def action_quit(self) -> None:
         self.exit()
