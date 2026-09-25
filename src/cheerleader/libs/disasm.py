@@ -21,9 +21,13 @@ def _cs_arch_mode(arch: str, bits: int) -> tuple[int, int]:
 
 
 def disassemble_section(
-    info: BinaryInfo, seg_name: str, sect_name: str
+    info: BinaryInfo, seg_name: str, sect_name: str, *, engine: str = "capstone"
 ) -> list[DisasmInstruction]:
-    """Disassemble one section using capstone; returns [] if capstone missing."""
+    """Disassemble one section using the chosen engine; returns [] if unavailable."""
+    if engine == "objdump":
+        from cheerleader.libs.objdump import disassemble_section_objdump
+        return disassemble_section_objdump(info, seg_name, sect_name)
+
     target: Section | None = None
     for seg in info.segments:
         if seg.name == seg_name:
@@ -60,6 +64,36 @@ def disassemble_section(
         )
         for insn in md.disasm(code, target.addr)
     ]
+
+
+def disassemble_all_sections(
+    info: BinaryInfo, *, engine: str = "capstone"
+) -> tuple[list[DisasmInstruction], dict[int, str]]:
+    """Disassemble every executable section.
+
+    Returns ``(instructions, func_labels)`` sorted by address.
+    *func_labels* is populated only when the engine is ``"objdump"``
+    (the label lines that objdump emits between instruction blocks);
+    for Capstone it is always an empty dict.
+    """
+    if engine == "objdump":
+        from cheerleader.libs.objdump import disassemble_full_objdump
+        instrs, labels = disassemble_full_objdump(info)
+        instrs.sort(key=lambda i: i.addr)
+        return instrs, labels
+
+    # Capstone path — per-section loop, no extra labels
+    instrs: list[DisasmInstruction] = []
+    exec_segs = {seg.name for seg in info.segments if seg.initprot & 0x4}
+    for seg in info.segments:
+        if seg.name not in exec_segs:
+            continue
+        for s in seg.sections:
+            if s.size == 0 or s.offset == 0:
+                continue
+            instrs.extend(disassemble_section(info, s.segment, s.name, engine="capstone"))
+    instrs.sort(key=lambda i: i.addr)
+    return instrs, {}
 
 
 def extract_strings(info: BinaryInfo, min_len: int = 4) -> list[BinaryString]:

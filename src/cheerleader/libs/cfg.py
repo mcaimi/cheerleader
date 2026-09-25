@@ -153,8 +153,18 @@ def build_cfg(
                             blocks=blocks, entry=instrs[0].addr)
 
 
-def build_call_graph(info: BinaryInfo, instrs: list[DisasmInstruction]) -> CallGraph:
-    """Build a call graph from a disassembled instruction list."""
+def build_call_graph(
+    info: BinaryInfo,
+    instrs: list[DisasmInstruction],
+    extra_func_labels: dict[int, str] | None = None,
+) -> CallGraph:
+    """Build a call graph from a disassembled instruction list.
+
+    *extra_func_labels*, when provided, supplies additional
+    address → function-name mappings (e.g. from objdump label lines).
+    They are merged after symbols and exports so they don't override
+    names already known from the symbol table.
+    """
     addr_to_name: dict[int, str] = {}
     for sym in info.symbols:
         if not sym.stab and sym.addr and sym.name and (sym.sym_type & N_TYPE) == N_SECT:
@@ -162,6 +172,9 @@ def build_call_graph(info: BinaryInfo, instrs: list[DisasmInstruction]) -> CallG
     for exp in info.exports:
         a, n = exp.get("addr", 0), exp.get("name", "")
         if a and n:
+            addr_to_name.setdefault(a, n)
+    if extra_func_labels:
+        for a, n in extra_func_labels.items():
             addr_to_name.setdefault(a, n)
 
     graph = CallGraph(

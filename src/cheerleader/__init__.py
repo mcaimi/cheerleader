@@ -24,6 +24,13 @@ def main() -> None:
         metavar="FILE",
         help="path to .env file for AI agent config (default: .env)",
     )
+    parser.add_argument(
+        "--disasm-engine",
+        choices=("capstone", "objdump"),
+        default="capstone",
+        dest="disasm_engine",
+        help="disassembly backend (default: capstone)",
+    )
     args = parser.parse_args()
 
     try:
@@ -40,5 +47,10 @@ def main() -> None:
 
     from cheerleader.tui import DisasmApp
 
-    app = DisasmApp(args.binary, env_file=args.env, hex_mode=args.hex)
+    app = DisasmApp(
+        args.binary,
+        env_file=args.env,
+        hex_mode=args.hex,
+        disasm_engine=args.disasm_engine,
+    )
     app.run()
