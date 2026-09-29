@@ -269,7 +269,6 @@ name = "cheerleader"
 version = "0.2.0"
 source = { editable = "." }
 dependencies = [
-    { name = "capstone" },
     { name = "deepagents" },
     { name = "langchain", extra = ["openai"] },
     { name = "macholib" },
@@ -277,15 +276,21 @@ dependencies = [
     { name = "textual" },
 ]
 
+[package.optional-dependencies]
+capstone = [
+    { name = "capstone" },
+]
+
 [package.metadata]
 requires-dist = [
-    { name = "capstone", specifier = ">=5.0" },
+    { name = "capstone", marker = "extra == 'capstone'", specifier = ">=5.0" },
     { name = "deepagents", specifier = ">=0.7.4" },
     { name = "langchain", extras = ["openai"], specifier = ">=1.3.14" },
     { name = "macholib", specifier = ">=1.16.4" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
     { name = "textual", specifier = ">=8.2.8" },
 ]
+provides-extras = ["capstone"]
 
 [[package]]
 name = "colorama"

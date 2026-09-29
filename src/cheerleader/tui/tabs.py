@@ -430,7 +430,7 @@ class StringsTab(TabPane):
 
 
 class FuncReversingTab(TabPane):
-    def __init__(self, env_file: str | None = None, disasm_engine: str = "capstone") -> None:
+    def __init__(self, env_file: str | None = None, disasm_engine: str = "objdump") -> None:
         super().__init__("Function Reversing", id="tab-funcrev")
         self._info: BinaryInfo | None = None
         self._table: DataTable | None = None
@@ -642,7 +642,7 @@ class FuncReversingTab(TabPane):
 
 
 class DisasmTab(TabPane):
-    def __init__(self, disasm_engine: str = "capstone") -> None:
+    def __init__(self, disasm_engine: str = "objdump") -> None:
         super().__init__("Disasm", id="tab-disasm")
         self._info: BinaryInfo | None = None
         self._sections: list[tuple[str, str]] = []

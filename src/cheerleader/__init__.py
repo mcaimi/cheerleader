@@ -27,11 +27,22 @@ def main() -> None:
     parser.add_argument(
         "--disasm-engine",
         choices=("capstone", "objdump"),
-        default="capstone",
+        default="objdump",
         dest="disasm_engine",
-        help="disassembly backend (default: capstone)",
+        help="disassembly backend (default: objdump)",
     )
     args = parser.parse_args()
+
+    if args.disasm_engine == "capstone":
+        try:
+            import capstone  # noqa: F401
+        except ImportError:
+            print(
+                "Error: capstone is not installed.\n"
+                "Install it with:  uv pip install 'cheerleader[capstone]'\n"
+                "Or use the default objdump backend:  --disasm-engine=objdump"
+            )
+            sys.exit(1)
 
     try:
         open(args.binary, "rb").close()

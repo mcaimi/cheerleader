@@ -60,7 +60,7 @@ class DisasmApp(App):
         path: str,
         env_file: str | None = None,
         hex_mode: bool = False,
-        disasm_engine: str = "capstone",
+        disasm_engine: str = "objdump",
     ) -> None:
         super().__init__()
         self._path = path
