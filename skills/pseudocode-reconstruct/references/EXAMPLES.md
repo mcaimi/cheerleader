@@ -37,5 +37,5 @@ When the user provides a disassembly dump and asks for pseudocode reconstruction
 
 ### Example Files
 
-- **[`x86_64_examples.md`](./x86_64_examples.md)** — 4 examples covering simple arithmetic, loops with conditional branches, function calls, and SSE vector operations.
-- **[`arm64_examples.md`](./arm64_examples.md)** — 5 examples covering simple register moves, conditional branches with stack frames, function calls with callee-saved registers, array traversal loops, and NEON vector operations.
+- **[`x86_64_examples.md`](./x86_64_examples.md)** — 14 examples covering simple arithmetic, loops with conditional branches, function calls, SSE vector operations, switch/case with jump tables, struct field access, conditional move (cmov) ternary, nested loops, do-while loops, tail call optimization, recursive functions, division-by-constant (magic number multiply), indirect call / vtable dispatch, and error-path with multiple early returns.
+- **[`arm64_examples.md`](./arm64_examples.md)** — 15 examples covering simple register moves, conditional branches with stack frames, function calls with callee-saved registers, array traversal loops, NEON vector operations, switch/case with branch tables, struct field access, conditional select (csel) ternary, nested loops, do-while loops, tail call optimization, recursive functions, division-by-constant (magic number multiply), indirect call / vtable dispatch, and error-path with multiple early returns.
