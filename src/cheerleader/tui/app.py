@@ -60,6 +60,7 @@ class DisasmApp(App):
         path: str,
         env_file: str | None = None,
         hex_mode: bool = False,
+        disasm_engine: str = "objdump",
     ) -> None:
         super().__init__()
         self._path = path
@@ -68,6 +69,7 @@ class DisasmApp(App):
         self._slices: list[tuple[int, str]] = []
         self._env_file = env_file
         self._hex_mode = hex_mode
+        self._disasm_engine = disasm_engine
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -84,8 +86,8 @@ class DisasmApp(App):
                 yield SymbolsTab()
                 yield ExportsTab()
                 yield ChainedFixupsTab()
-                yield DisasmTab()
-                yield FuncReversingTab(env_file=self._env_file)
+                yield DisasmTab(disasm_engine=self._disasm_engine)
+                yield FuncReversingTab(env_file=self._env_file, disasm_engine=self._disasm_engine)
         yield Footer()
 
     def on_mount(self) -> None:

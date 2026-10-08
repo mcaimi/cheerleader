@@ -9,7 +9,7 @@ from textual.widgets import DataTable, Input, Label, ListItem, ListView, Static,
 from rich.text import Text
 
 from cheerleader.libs.cfg import CallGraph, build_call_graph, build_cfg
-from cheerleader.libs.disasm import disassemble_section, extract_strings
+from cheerleader.libs.disasm import disassemble_all_sections, disassemble_section, extract_strings
 from cheerleader.libs.types import (
     BinaryInfo,
     ChainedFixup,
@@ -430,7 +430,7 @@ class StringsTab(TabPane):
 
 
 class FuncReversingTab(TabPane):
-    def __init__(self, env_file: str | None = None) -> None:
+    def __init__(self, env_file: str | None = None, disasm_engine: str = "objdump") -> None:
         super().__init__("Function Reversing", id="tab-funcrev")
         self._info: BinaryInfo | None = None
         self._table: DataTable | None = None
@@ -440,6 +440,7 @@ class FuncReversingTab(TabPane):
         self._functions: list[tuple[str, int]] = []
         self._sorted_func_addrs: list[int] = []
         self._env_file: str = env_file or ".env"
+        self._disasm_engine = disasm_engine
         self._agent = None
         self._current_func_name: str | None = None
         self._current_func_instrs: list[DisasmInstruction] = []
@@ -475,22 +476,13 @@ class FuncReversingTab(TabPane):
     @work(thread=True)
     def _build_function_list(self, info: BinaryInfo) -> None:
         self.app.call_from_thread(self._set_status, "Disassembling…")
-        instrs: list[DisasmInstruction] = []
-        exec_segs = {seg.name for seg in info.segments if seg.initprot & 0x4}
-        for seg in info.segments:
-            if seg.name not in exec_segs:
-                continue
-            for s in seg.sections:
-                if s.size == 0 or s.offset == 0:
-                    continue
-                instrs.extend(disassemble_section(info, s.segment, s.name))
+        instrs, func_labels = disassemble_all_sections(info, engine=self._disasm_engine)
         if not instrs:
             self.app.call_from_thread(
                 self._set_status, "[red]No executable sections found[/red]"
             )
             return
-        instrs.sort(key=lambda i: i.addr)
-        graph = build_call_graph(info, instrs)
+        graph = build_call_graph(info, instrs, extra_func_labels=func_labels)
         self.app.call_from_thread(self._populate_functions, instrs, graph)
 
     def _populate_functions(
@@ -650,7 +642,7 @@ class FuncReversingTab(TabPane):
 
 
 class DisasmTab(TabPane):
-    def __init__(self) -> None:
+    def __init__(self, disasm_engine: str = "objdump") -> None:
         super().__init__("Disasm", id="tab-disasm")
         self._info: BinaryInfo | None = None
         self._sections: list[tuple[str, str]] = []
@@ -658,6 +650,7 @@ class DisasmTab(TabPane):
         self._list: ListView | None = None
         self._instrs: list[DisasmInstruction] = []
         self._call_graph: CallGraph | None = None
+        self._disasm_engine = disasm_engine
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="disasm-body"):
@@ -708,7 +701,7 @@ class DisasmTab(TabPane):
         if self._info is None:
             return
         self.app.call_from_thread(self._set_status, f"Disassembling {seg},{sect}…")
-        instrs = disassemble_section(self._info, seg, sect)
+        instrs = disassemble_section(self._info, seg, sect, engine=self._disasm_engine)
         graph = build_call_graph(self._info, instrs) if instrs else None
         self.app.call_from_thread(self._populate, seg, sect, instrs, graph)
 
@@ -727,7 +720,7 @@ class DisasmTab(TabPane):
         t.clear()
         if not instrs:
             self._set_status(
-                "[red]No output — capstone not installed or section unreadable[/red]"
+                f"[red]No output — {self._disasm_engine} unavailable or section unreadable[/red]"
             )
             return
         arch = self._info.arch if self._info else ""
