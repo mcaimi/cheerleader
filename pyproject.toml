@@ -1,6 +1,6 @@
 [project]
 name = "cheerleader"
-version = "0.2.0"
+version = "0.3.0"
 description = "A simple but effective binary analyzer with optional AI"
 readme = "README.md"
 authors = [{ name = "Marco Caimi", email = "mcaimi@redhat.com" }]
