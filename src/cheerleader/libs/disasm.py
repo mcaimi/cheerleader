@@ -49,6 +49,7 @@ def disassemble_section(
     arch_id, mode_id = _cs_arch_mode(info.arch, info.bits)
     md = capstone.Cs(arch_id, mode_id)
     md.detail = False
+    md.skipdata = True
 
     with open(info.path, "rb") as fh:
         fh.seek(info.slice_offset + target.offset)
