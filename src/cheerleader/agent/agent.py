@@ -79,3 +79,13 @@ class CheerleaderAIAgent(object):
             "messages": [HumanMessage(content=user_prompt)]
         }
         return self.agent.invoke(payload)
+
+    # stream the model/tool-calling loop as it happens
+    # yields (mode, chunk) pairs: mode "updates" carries per-step state
+    # deltas (model/tool steps), mode "messages" carries token-level
+    # (message_chunk, metadata) pairs for whatever is being generated
+    def stream(self, user_prompt: str):
+        payload = {
+            "messages": [HumanMessage(content=user_prompt)]
+        }
+        yield from self.agent.stream(payload, stream_mode=["updates", "messages"])
