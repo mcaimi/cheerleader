@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from typing import ClassVar
 
+from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.reactive import reactive
@@ -70,6 +71,7 @@ class DisasmApp(App):
         self._env_file = env_file
         self._hex_mode = hex_mode
         self._disasm_engine = disasm_engine
+        self._pending_reload_notify = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -107,10 +109,20 @@ class DisasmApp(App):
         if self._hex_mode:
             self.query_one(HexEditorTab).load(self._path)
             return
+        self.query_one(InfoBar).set_analyzing(True)
+        self._parse_binary()
+
+    @work(thread=True)
+    def _parse_binary(self) -> None:
         info = parse(self._path, slice_index=self._slice)
+        self.call_from_thread(self._apply_info, info)
+
+    def _apply_info(self, info: BinaryInfo) -> None:
         self._info = info
 
-        self.query_one(InfoBar).update_info(info)
+        info_bar = self.query_one(InfoBar)
+        info_bar.update_info(info)
+        info_bar.set_analyzing(False)
         self.query_one(SegmentsTab).load(info)
         self.query_one(StringsTab).load(info)
         self.query_one(SectionsTab).load(info)
@@ -126,10 +138,13 @@ class DisasmApp(App):
 
         if info.error:
             self.notify(info.error, severity="error", timeout=8)
+        if self._pending_reload_notify:
+            self._pending_reload_notify = False
+            self.notify("Reloaded", timeout=2)
 
     def action_reload(self) -> None:
+        self._pending_reload_notify = True
         self._load()
-        self.notify("Reloaded", timeout=2)
 
     def action_tab(self, tab_id: str) -> None:
         tabs = self.query_one(TabbedContent)

@@ -5,8 +5,8 @@ from __future__ import annotations
 import os
 
 from textual.app import ComposeResult
-from textual.containers import VerticalScroll
-from textual.widgets import Static
+from textual.containers import Horizontal, VerticalScroll
+from textual.widgets import LoadingIndicator, Static
 
 from cheerleader.libs.types import BinaryInfo
 
@@ -71,8 +71,8 @@ class HexPane(VerticalScroll):
         self.query_one(Static).update(build_hex_dump(self._hex_bytes, self._hex_addr))
 
 
-class InfoBar(Static):
-    """Top banner showing high-level binary metadata."""
+class InfoBar(Horizontal):
+    """Top banner showing high-level binary metadata, plus an analysis spinner."""
 
     DEFAULT_CSS = """
     InfoBar {
@@ -81,7 +81,23 @@ class InfoBar(Static):
         background: $surface;
         color: $text;
     }
+    InfoBar > #info-bar-text {
+        width: 4fr;
+        height: auto;
+    }
+    InfoBar > #info-bar-loading {
+        width: 1fr;
+        height: 1;
+    }
     """
+
+    def compose(self) -> ComposeResult:
+        yield Static("", id="info-bar-text")
+        yield LoadingIndicator(id="info-bar-loading")
+
+    def set_analyzing(self, analyzing: bool) -> None:
+        """Show or hide the spinner while background analysis is running."""
+        self.query_one("#info-bar-loading", LoadingIndicator).display = analyzing
 
     def update_info(self, info: BinaryInfo) -> None:
         lines = [
@@ -108,4 +124,4 @@ class InfoBar(Static):
                 lines.append(f"Linker: [dim]{info.dylinker}[/dim]")
             if info.rpaths:
                 lines.append("RPATHs: " + "  ".join(f"[dim]{r}[/dim]" for r in info.rpaths))
-        self.update("\n".join(lines))
+        self.query_one("#info-bar-text", Static).update("\n".join(lines))
