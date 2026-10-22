@@ -175,11 +175,25 @@ AIResponseScreen {
     padding: 0 1 1 1;
     text-align: center;
 }
+#ai-spinner {
+    height: 3;
+    color: $accent;
+}
+#ai-body {
+    height: 1fr;
+}
 #ai-scroll {
+    width: 70%;
     height: 1fr;
 }
 #ai-content {
     padding: 1 1;
+}
+#ai-activity {
+    width: 30%;
+    height: 1fr;
+    border-left: solid $primary;
+    background: $panel;
 }
 SymbolsTab #sym-filter-bar {
     height: 1;

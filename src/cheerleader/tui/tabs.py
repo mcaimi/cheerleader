@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from textual import on, work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -429,6 +431,32 @@ class StringsTab(TabPane):
             event.stop()
 
 
+def _format_update(node_name: str, data: Any) -> list[str]:
+    """Turn one LangGraph "updates"-mode step into human-readable activity lines."""
+    if not isinstance(data, dict):
+        return [f"→ [{node_name}] updated"]
+    messages = data.get("messages", [])
+    if not messages:
+        return [f"→ [{node_name}] updated"]
+
+    lines: list[str] = []
+    for msg in messages:
+        tool_calls = getattr(msg, "tool_calls", None)
+        if tool_calls:
+            for call in tool_calls:
+                name = call.get("name", "?") if isinstance(call, dict) else getattr(call, "name", "?")
+                args = call.get("args", {}) if isinstance(call, dict) else getattr(call, "args", {})
+                lines.append(f"→ [{node_name}] calling {name}({args})")
+            continue
+        content = getattr(msg, "content", "")
+        if isinstance(content, str) and content.strip():
+            snippet = content.strip().replace("\n", " ")[:200]
+            lines.append(f"→ [{node_name}] {snippet}")
+        else:
+            lines.append(f"→ [{node_name}] updated")
+    return lines
+
+
 class FuncReversingTab(TabPane):
     def __init__(self, env_file: str | None = None, disasm_engine: str = "objdump") -> None:
         super().__init__("Function Reversing", id="tab-funcrev")
@@ -587,10 +615,12 @@ class FuncReversingTab(TabPane):
         lines = [f"Function: {func_name} @ 0x{func_addr:x}", f"Architecture: {arch}", ""]
         for insn in self._current_func_instrs:
             lines.append(f"0x{insn.addr:x}  {insn.mnemonic} {insn.op_str}")
-        self._invoke_agent(func_name, "\n".join(lines))
+        screen = AIResponseScreen(func_name)
+        self.app.push_screen(screen)
+        self._invoke_agent(func_name, "\n".join(lines), screen)
 
     @work(thread=True)
-    def _invoke_agent(self, func_name: str, prompt: str) -> None:
+    def _invoke_agent(self, func_name: str, prompt: str, screen: AIResponseScreen) -> None:
         self.app.call_from_thread(self._set_status, "Querying AI model…")
         if self._agent is None:
             try:
@@ -606,12 +636,22 @@ class FuncReversingTab(TabPane):
                     timeout=6,
                 )
                 self.app.call_from_thread(self._set_status, "AI agent unavailable")
+                self.app.call_from_thread(screen.mark_error, str(exc))
                 return
 
+        answer: list[str] = []
         try:
-            result = self._agent.invoke(prompt)
-            messages = result.get("messages", [])
-            response = messages[-1].content if messages else "No response from model"
+            for mode, chunk in self._agent.stream(prompt):
+                if mode == "updates":
+                    for node_name, data in chunk.items():
+                        for line in _format_update(node_name, data):
+                            self.app.call_from_thread(screen.add_activity, line)
+                elif mode == "messages":
+                    msg_chunk, _meta = chunk
+                    delta = getattr(msg_chunk, "content", "")
+                    if isinstance(delta, str) and delta:
+                        answer.append(delta)
+                        self.app.call_from_thread(screen.update_answer, "".join(answer))
         except Exception as exc:
             self.app.call_from_thread(
                 self.app.notify,
@@ -620,16 +660,17 @@ class FuncReversingTab(TabPane):
                 timeout=6,
             )
             self.app.call_from_thread(self._set_status, "AI query failed")
+            self.app.call_from_thread(screen.mark_error, str(exc))
             return
 
-        self.app.call_from_thread(self._show_ai_response, func_name, response)
+        self.app.call_from_thread(self._show_ai_response, func_name, screen)
 
-    def _show_ai_response(self, func_name: str, response: str) -> None:
+    def _show_ai_response(self, func_name: str, screen: AIResponseScreen) -> None:
         self._set_status(
             f"[dim]{func_name}[/dim]  —  AI analysis complete"
             "  [dim]h → hex view  a → ai analysis[/dim]"
         )
-        self.app.push_screen(AIResponseScreen(func_name, response))
+        screen.mark_complete()
 
     def _toggle_hex(self) -> None:
         self._hex_pane.toggle()

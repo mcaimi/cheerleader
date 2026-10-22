@@ -5,9 +5,9 @@ from __future__ import annotations
 from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
-from textual.widgets import Label, ListItem, ListView, Rule, Static, Tree
+from textual.widgets import Label, ListItem, ListView, LoadingIndicator, RichLog, Rule, Static, Tree
 
 from cheerleader.libs.cfg import CallGraph, ControlFlowGraph
 from cheerleader.tui.highlight import _esc_markup, _render_cfg
@@ -147,21 +147,28 @@ class CFGScreen(Screen):
 
 
 class AIResponseScreen(Screen):
-    """Modal showing an AI-generated analysis of a disassembled function."""
+    """Modal showing a live AI analysis of a disassembled function.
+
+    Pushed as soon as the analysis starts; callers stream progress into it
+    via ``add_activity``/``update_answer`` and finish with ``mark_complete``
+    or ``mark_error``.
+    """
 
     BINDINGS = [Binding("escape", "dismiss(None)", "Close")]
 
-    def __init__(self, func_name: str, response: str) -> None:
+    def __init__(self, func_name: str) -> None:
         super().__init__()
         self._func_name = func_name
-        self._response = response
 
     def compose(self) -> ComposeResult:
         with Vertical(id="ai-box"):
             yield Label("", id="ai-title")
             yield Rule()
-            with VerticalScroll(id="ai-scroll"):
-                yield Static("", id="ai-content", markup=False)
+            yield LoadingIndicator(id="ai-spinner")
+            with Horizontal(id="ai-body"):
+                with VerticalScroll(id="ai-scroll"):
+                    yield Static("", id="ai-content", markup=False)
+                yield RichLog(id="ai-activity", markup=True, wrap=True, auto_scroll=True)
             yield Rule()
             yield Label(
                 "[dim]↑↓ / PgUp / PgDn  scroll    Esc  close[/dim]",
@@ -171,5 +178,45 @@ class AIResponseScreen(Screen):
     def on_mount(self) -> None:
         self.query_one("#ai-title", Label).update(
             f"[bold]AI Analysis:[/bold]  [cyan]{_esc_markup(self._func_name)}[/cyan]"
+            "  [dim](running…)[/dim]"
         )
-        self.query_one("#ai-content", Static).update(self._response)
+        self.add_activity("Starting analysis…")
+
+    def add_activity(self, line: str) -> None:
+        try:
+            self.query_one("#ai-activity", RichLog).write(line)
+        except Exception:
+            pass
+
+    def update_answer(self, text: str) -> None:
+        try:
+            self.query_one("#ai-content", Static).update(text)
+            self.query_one("#ai-scroll", VerticalScroll).scroll_end(animate=False)
+        except Exception:
+            pass
+
+    def mark_complete(self) -> None:
+        try:
+            self.query_one("#ai-title", Label).update(
+                f"[bold]AI Analysis:[/bold]  [cyan]{_esc_markup(self._func_name)}[/cyan]"
+            )
+        except Exception:
+            pass
+        self._stop_spinner()
+
+    def mark_error(self, message: str) -> None:
+        self.add_activity(f"[red]Error: {_esc_markup(message)}[/red]")
+        try:
+            self.query_one("#ai-title", Label).update(
+                f"[bold]AI Analysis:[/bold]  [cyan]{_esc_markup(self._func_name)}[/cyan]"
+                "  [red](failed)[/red]"
+            )
+        except Exception:
+            pass
+        self._stop_spinner()
+
+    def _stop_spinner(self) -> None:
+        try:
+            self.query_one("#ai-spinner", LoadingIndicator).display = False
+        except Exception:
+            pass
