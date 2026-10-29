@@ -298,3 +298,19 @@ def test_load_cancels_search_and_clears_busy(tmp_path, monkeypatch):
             await pilot_ctx.__aexit__(None, None, None)
 
     _drive(scenario)
+
+
+def test_status_mixin_updates_status_widget(tmp_path):
+    async def scenario():
+        app, pilot_ctx, pilot, tab = await _boot(tmp_path)
+        try:
+            # StatusMixin._set_status routes through the tab's STATUS_ID
+            assert tab.STATUS_ID == "hexedit-status"
+            tab._set_status("hello status")
+            await pilot.pause()
+            text = pilot.app.query_one("#hexedit-status").content
+            assert text == "hello status"
+        finally:
+            await pilot_ctx.__aexit__(None, None, None)
+
+    _drive(scenario)
