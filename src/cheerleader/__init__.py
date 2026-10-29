@@ -17,7 +17,7 @@ def main() -> None:
         "--hex",
         action="store_true",
         default=False,
-        help="open in hex editor mode (raw file hex dump only)",
+        help="open in hex editor mode (edit, search, save raw bytes)",
     )
     hex_group.add_argument(
         "--hex-compare",

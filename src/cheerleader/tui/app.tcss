@@ -80,12 +80,6 @@ CFGScreen {
 #cfg-content {
     padding: 1 1;
 }
-#hexedit-scroll {
-    height: 1fr;
-}
-#hexedit-content {
-    padding: 0 1;
-}
 #hexedit-status {
     height: 1;
     padding: 0 1;
@@ -208,4 +202,31 @@ SymbolsTab #sym-filter-bar {
 }
 SymbolsTab #sym-filter-bar Label {
     margin-right: 1;
+}
+
+ConfirmPrompt, ByteEditPrompt, SavePrompt, SearchPrompt {
+    align: center middle;
+    background: $background 60%;
+}
+.prompt-box {
+    width: 72;
+    height: auto;
+    border: round $primary;
+    background: $surface;
+    padding: 1 2;
+}
+.prompt-title {
+    width: 1fr;
+    padding: 0 0 1 0;
+}
+.prompt-error {
+    height: auto;
+    padding: 0 1;
+}
+.prompt-hint {
+    width: 1fr;
+    padding: 1 0 0 0;
+}
+#hexedit-view {
+    height: 1fr;
 }

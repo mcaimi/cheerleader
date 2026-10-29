@@ -6,12 +6,17 @@ from typing import Any
 
 from textual import on, work
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.message import Message
 from textual.widgets import DataTable, Input, Label, ListItem, ListView, Static, TabPane
+from textual.worker import get_current_worker
+from rich.markup import escape
 from rich.text import Text
 
 from cheerleader.libs.cfg import CallGraph, build_call_graph, build_cfg
 from cheerleader.libs.disasm import disassemble_all_sections, disassemble_section, extract_strings
+from cheerleader.libs.hexdoc import HexDocument
 from cheerleader.libs.types import (
     BinaryInfo,
     ChainedFixup,
@@ -26,11 +31,18 @@ from cheerleader.tui.highlight import (
     _fmt_addr,
     _fmt_size,
 )
-from cheerleader.tui.screens import AIResponseScreen, CallFlowScreen, CFGScreen
+from cheerleader.tui.screens import (
+    AIResponseScreen,
+    ByteEditPrompt,
+    CallFlowScreen,
+    CFGScreen,
+    SavePrompt,
+    SearchPrompt,
+)
 from cheerleader.tui.widgets import (
     HexCompareView,
+    HexEditorView,
     HexPane,
-    build_hex_dump,
     compute_diff_blocks,
 )
 
@@ -867,40 +879,266 @@ def _human_size(size: int) -> str:
 
 
 class HexEditorTab(TabPane):
+    """Overwrite-only hex editor; the file is read on demand, edits kept in memory until saved."""
+
+    BINDINGS = [
+        Binding("enter", "edit", "Edit"),
+        Binding("u", "undo", "Undo"),
+        Binding("s", "save", "Save"),
+        Binding("slash", "search", "Go to / Search"),
+        Binding("n", "search_next(1)", "Next match"),
+        Binding("N", "search_next(0)", "Prev match"),
+        Binding("escape", "cancel_search", "Cancel search", show=False),
+    ]
+
+    class Saved(Message):
+        def __init__(self, path: str) -> None:
+            super().__init__()
+            self.path = path
+
     def __init__(self) -> None:
         super().__init__("Hex Editor", id="tab-hexedit")
-        self._path: str | None = None
+        self._doc: HexDocument | None = None
+        self._busy: str | None = None
+        self._search_mode = "offset"
+        self._search_raw = ""
+        self._pattern: bytes | None = None
+        self._search_gen = 0
+        # Status note shown while the cursor stays on the given offset.
+        self._note: tuple[int, str] | None = None
 
     def compose(self) -> ComposeResult:
-        with VerticalScroll(id="hexedit-scroll"):
-            yield Static("", id="hexedit-content", markup=False)
+        yield HexEditorView(id="hexedit-view")
         yield Static("", id="hexedit-status")
 
+    @property
+    def modified(self) -> bool:
+        return self._doc is not None and self._doc.modified
+
     def load(self, path: str) -> None:
-        self._path = path
-        self._load_file(path)
+        self.workers.cancel_group(self, "hexsearch")
+        self._busy = None
+        try:
+            doc = HexDocument(path)
+        except OSError as e:
+            self.app.notify(f"Cannot open {path}: {e}", severity="error", timeout=6)
+            return
+        if self._doc is not None:
+            self._doc.close()
+        self._doc = doc
+        self._note = None
+        view = self.query_one(HexEditorView)
+        view.set_document(doc)
+        view.focus()
 
-    @work(thread=True)
-    def _load_file(self, path: str) -> None:
-        self.app.call_from_thread(self._set_status, "Loading…")
-        with open(path, "rb") as f:
-            data = f.read()
-        dump = build_hex_dump(data, 0)
-        self.app.call_from_thread(self._display, data, dump)
+    def _view(self) -> HexEditorView:
+        return self.query_one(HexEditorView)
 
-    def _display(self, data: bytes, dump: str) -> None:
-        self.query_one("#hexedit-content", Static).update(dump)
-        size = len(data)
-        size_str = _human_size(size)
-        self._set_status(
-            f"[dim]{self._path}[/dim]  {size_str}  ({size:,} bytes)"
-        )
+    def _refuse_if_busy(self) -> bool:
+        if self._doc is None:
+            return True
+        if self._busy:
+            self.app.notify(f"Busy {self._busy}…", timeout=2)
+            return True
+        return False
+
+    # ── status ────────────────────────────────────────────────────────────────
+
+    @on(HexEditorView.CursorMoved)
+    def _cursor_moved(self) -> None:
+        self._update_status()
+
+    def _update_status(self, extra: str = "") -> None:
+        doc = self._doc
+        if doc is None:
+            return
+        parts = [f"[dim]{doc.path}[/dim]  {_human_size(doc.size)}"]
+        cur = self._view().cursor
+        if not extra and self._note and self._note[0] == cur:
+            extra = self._note[1]
+        if doc.size:
+            b = doc.read(cur, 1)[0]
+            ch = chr(b) if 0x20 <= b < 0x7F else "."
+            parts.append(f"0x{cur:08x} ({cur:,})  = 0x{b:02x} {b:3d} '{escape(ch)}'")
+        else:
+            parts.append("empty file")
+        if doc.modified:
+            parts.append(f"[yellow]{doc.edit_count:,} unsaved \\[modified][/yellow]")
+        if extra:
+            parts.append(extra)
+        self._set_status("  │  ".join(parts))
 
     def _set_status(self, msg: str) -> None:
         try:
             self.query_one("#hexedit-status", Static).update(msg)
         except Exception:
             pass
+
+    # ── editing ───────────────────────────────────────────────────────────────
+
+    def action_edit(self) -> None:
+        if self._refuse_if_busy():
+            return
+        doc = self._doc
+        if doc.size == 0:
+            self.app.notify("Empty file — nothing to edit", timeout=2)
+            return
+        offset = self._view().cursor
+
+        def _apply(data: bytes | None) -> None:
+            if not data or self._doc is not doc:
+                return
+            doc.write(offset, data)
+            self._view().move_to(offset + len(data))
+            self._view().refresh()
+            self._update_status()
+
+        self.app.push_screen(ByteEditPrompt(offset, doc.read(offset, 1), doc.size - offset), _apply)
+
+    def action_undo(self) -> None:
+        if self._refuse_if_busy():
+            return
+        offset = self._doc.undo()
+        if offset is None:
+            self.app.notify("Nothing to undo", timeout=2)
+            return
+        self._view().move_to(offset)
+        self._view().refresh()
+        self._update_status()
+
+    # ── saving ────────────────────────────────────────────────────────────────
+
+    def action_save(self) -> None:
+        if self._refuse_if_busy():
+            return
+
+        def _chosen(path: str | None) -> None:
+            if path:
+                self._busy = "saving"
+                self._run_save(path)
+
+        self.app.push_screen(SavePrompt(f"{self._doc.path}.patched"), _chosen)
+
+    @work(thread=True, group="hexsave")
+    def _run_save(self, path: str) -> None:
+        last = [-1]
+
+        def _progress(frac: float) -> None:
+            pct = int(frac * 100)
+            if pct // 5 != last[0] // 5:
+                last[0] = pct
+                self.app.call_from_thread(self._update_status, f"Saving… {pct}%")
+
+        try:
+            self._doc.save_to(path, _progress)
+        except OSError as e:
+            self.app.call_from_thread(self._save_done, path, str(e))
+            return
+        self.app.call_from_thread(self._save_done, path, None)
+
+    def _save_done(self, path: str, error: str | None) -> None:
+        self._busy = None
+        if error:
+            self.app.notify(f"Save failed: {error}", severity="error", timeout=8)
+            self._update_status()
+            return
+        self._doc.reopen(path)
+        self._note = None
+        self._view().set_document(self._doc)
+        self.post_message(self.Saved(path))
+        self.app.notify(f"Saved {path}", timeout=3)
+
+    # ── go to / search ────────────────────────────────────────────────────────
+
+    def action_search(self) -> None:
+        if self._doc is None:
+            return
+
+        def _chosen(result: tuple[str, Any, str] | None) -> None:
+            if result is None:
+                return
+            mode, value, raw = result
+            self._search_mode, self._search_raw = mode, raw
+            if mode == "offset":
+                self._view().set_match(None)
+                self._view().move_to(value, top=True)
+                return
+            self._pattern = value
+            self._start_search(forward=True)
+
+        self.app.push_screen(
+            SearchPrompt(self._doc.size, self._search_mode, self._search_raw), _chosen
+        )
+
+    def action_search_next(self, forward: int) -> None:
+        if self._pattern is None:
+            self.app.notify("No search pattern — press / first", timeout=2)
+            return
+        self._start_search(forward=bool(forward))
+
+    def action_cancel_search(self) -> None:
+        if self._busy == "searching":
+            self.workers.cancel_group(self, "hexsearch")
+            self._busy = None
+            self._note = (self._view().cursor, "search cancelled")
+            self._update_status()
+
+    def _start_search(self, forward: bool) -> None:
+        if self._doc is None or self._busy == "saving":
+            self._refuse_if_busy()
+            return
+        self._busy = "searching"
+        self._search_gen += 1
+        self._run_search(self._pattern, self._view().cursor, forward, self._search_gen)
+
+    @work(thread=True, exclusive=True, group="hexsearch")
+    def _run_search(self, pattern: bytes, cur: int, forward: bool, gen: int) -> None:
+        worker = get_current_worker()
+        doc = self._doc
+        last = [-1]
+
+        def _cancelled() -> bool:
+            return worker.is_cancelled
+
+        def _progress(frac: float) -> None:
+            pct = int(frac * 100)
+            if pct // 5 != last[0] // 5:
+                last[0] = pct
+                self.app.call_from_thread(self._update_status, f"Searching… {pct}%  (Esc cancels)")
+
+        n = len(pattern)
+        wrapped = False
+        if forward:
+            hit = doc.find(pattern, cur + 1, cancelled=_cancelled, progress=_progress)
+            if hit is None and not worker.is_cancelled:
+                wrapped = True
+                hit = doc.find(pattern, 0, cur + n, cancelled=_cancelled, progress=_progress)
+        else:
+            hit = doc.rfind(pattern, 0, cur + n - 1, cancelled=_cancelled, progress=_progress)
+            if hit is None and not worker.is_cancelled:
+                wrapped = True
+                hit = doc.rfind(pattern, cur, doc.size, cancelled=_cancelled, progress=_progress)
+        if not worker.is_cancelled:
+            self.app.call_from_thread(self._search_done, gen, hit, n, wrapped)
+
+    def _search_done(self, gen: int, hit: int | None, n: int, wrapped: bool) -> None:
+        if gen != self._search_gen:
+            return
+        self._busy = None
+        view = self._view()
+        if hit is None:
+            view.set_match(None)
+            self._note = (view.cursor, "[red]pattern not found[/red]")
+            self._update_status()
+            return
+        self._note = (
+            hit,
+            f"match at 0x{hit:08x}" + ("  [dim](wrapped)[/dim]" if wrapped else "")
+            + "  [dim]n/N → next/prev[/dim]",
+        )
+        view.set_match((hit, n))
+        view.move_to(hit)
+        self._update_status()
 
 
 class HexCompareTab(TabPane):

@@ -43,7 +43,31 @@ uv run cheerleader ./MyApp.app/Contents/MacOS/MyApp
 uv run cheerleader /usr/bin/ls
 uv run cheerleader /lib/x86_64-linux-gnu/libc.so.6
 uv run cheerleader ./myprogram
+
+# Hex modes
+uv run cheerleader ./myprogram --hex                            # hex editor
+uv run cheerleader ./myprogram --hex-compare ./myprogram.patched
 ```
+
+`--hex` opens an overwrite-only hex editor. The file is read on demand, so
+multi-GB files open instantly; edits stay in memory until saved.
+
+| Key | Action |
+| --- | --- |
+| ←→↑↓ · PgUp/PgDn · Home/End · Ctrl+Home/End | Move the cursor (selected byte is blue); clicking a byte selects it |
+| `Enter` | Edit at the cursor: `de ad be ef`, `deadbeef`, `0x7f`, `#127` (decimal) or `"text` — sequences overwrite forward from the cursor |
+| `u` | Undo the last edit |
+| `s` | Save to a file (asks for a name, confirms before overwriting) |
+| `/` | Go to an offset (`1a2b`, `0x1a2b`, `#6699`) or search hex bytes / text |
+| `n` / `N` | Next / previous search match (wraps around); `Esc` cancels a running search |
+
+Unsaved bytes are shown in yellow; `q` and `r` ask before discarding them.
+
+`--hex-compare <target>` opens a side-by-side hex diff: the binary on the left,
+`<target>` on the right, both scrolling together. Matching bytes are green,
+differing bytes red (bytes past the end of the shorter file count as
+differing). Files are compared offset by offset. Press `n` / `p` to jump to
+the next / previous difference.
 
 ---
 

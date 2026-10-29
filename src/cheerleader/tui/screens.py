@@ -1,15 +1,19 @@
-"""Modal screen widgets: slice picker, call flow, CFG."""
+"""Modal screen widgets: slice picker, call flow, CFG, hex editor prompts."""
 
 from __future__ import annotations
+
+import os
+from typing import Any
 
 from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import Screen
-from textual.widgets import Label, ListItem, ListView, LoadingIndicator, RichLog, Rule, Static, Tree
+from textual.screen import ModalScreen, Screen
+from textual.widgets import Input, Label, ListItem, ListView, LoadingIndicator, RichLog, Rule, Select, Static, Tree
 
 from cheerleader.libs.cfg import CallGraph, ControlFlowGraph
+from cheerleader.libs.hexdoc import parse_byte_sequence, parse_offset
 from cheerleader.tui.highlight import _esc_markup, _render_cfg
 
 
@@ -220,3 +224,178 @@ class AIResponseScreen(Screen):
             self.query_one("#ai-spinner", LoadingIndicator).display = False
         except Exception:
             pass
+
+
+class ConfirmPrompt(ModalScreen[bool]):
+    """Yes/no confirmation dialog."""
+
+    BINDINGS = [
+        Binding("y", "dismiss(True)", "Yes"),
+        Binding("n,escape", "dismiss(False)", "No"),
+    ]
+
+    def __init__(self, message: str) -> None:
+        super().__init__()
+        self._message = message
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="prompt-box"):
+            yield Label(self._message, classes="prompt-title")
+            yield Label("[dim]y  yes    n / Esc  no[/dim]", classes="prompt-hint")
+
+
+class _InputPrompt(ModalScreen[Any]):
+    """Base for single-input dialogs with inline validation.
+
+    Subclasses implement ``validate_value`` returning the dismiss result or
+    raising ValueError with a message shown under the input.
+    """
+
+    BINDINGS = [Binding("escape", "dismiss(None)", "Cancel")]
+
+    title_text = ""
+    hint_text = ""
+
+    def __init__(self, value: str = "", placeholder: str = "") -> None:
+        super().__init__()
+        self._initial = value
+        self._placeholder = placeholder
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="prompt-box"):
+            yield Label(self.title_text, classes="prompt-title")
+            yield from self.compose_extra()
+            yield Input(self._initial, placeholder=self._placeholder, id="prompt-input")
+            yield Label("", classes="prompt-error")
+            yield Label(f"[dim]{self.hint_text}  ·  Enter accept  ·  Esc cancel[/dim]",
+                        classes="prompt-hint")
+
+    def compose_extra(self) -> ComposeResult:
+        yield from ()
+
+    def on_mount(self) -> None:
+        self.query_one("#prompt-input", Input).focus()
+
+    def show_error(self, message: str) -> None:
+        self.query_one(".prompt-error", Label).update(f"[red]{_esc_markup(message)}[/red]")
+
+    @on(Input.Changed, "#prompt-input")
+    def _clear_error(self) -> None:
+        self.query_one(".prompt-error", Label).update("")
+
+    @on(Input.Submitted, "#prompt-input")
+    def _submitted(self, event: Input.Submitted) -> None:
+        try:
+            result = self.validate_value(event.value)
+        except ValueError as e:
+            self.show_error(str(e))
+            return
+        self.accept(result)
+
+    def accept(self, result: Any) -> None:
+        self.dismiss(result)
+
+    def validate_value(self, value: str) -> Any:
+        raise NotImplementedError
+
+
+class ByteEditPrompt(_InputPrompt):
+    """Ask for replacement bytes at an offset; dismisses with ``bytes``."""
+
+    hint_text = "de ad be ef · 0x7f · #127 · \"text"
+
+    def __init__(self, offset: int, current: bytes, available: int) -> None:
+        super().__init__(f"{current[0]:02x}" if current else "")
+        self._offset = offset
+        self._available = available
+        c = current[0] if current else 0
+        ch = chr(c) if 0x20 <= c < 0x7F else "."
+        self.title_text = (
+            f"[bold]Edit at 0x{offset:08x}[/bold]  "
+            f"[dim]current: 0x{c:02x}  {c}  '{_esc_markup(ch)}'[/dim]"
+        )
+
+    def validate_value(self, value: str) -> bytes:
+        data = parse_byte_sequence(value)
+        if len(data) > self._available:
+            raise ValueError(
+                f"{len(data)} bytes would run past end of file "
+                f"(only {self._available} left from this offset)"
+            )
+        return data
+
+
+class SavePrompt(_InputPrompt):
+    """Ask for a destination path; dismisses with an absolute path."""
+
+    title_text = "[bold]Save as[/bold]"
+    hint_text = "existing files ask before overwrite"
+
+    def validate_value(self, value: str) -> str:
+        path = os.path.abspath(os.path.expanduser(value.strip()))
+        if not value.strip():
+            raise ValueError("enter a file name")
+        if os.path.isdir(path):
+            raise ValueError("path is a directory")
+        directory = os.path.dirname(path)
+        if not os.path.isdir(directory):
+            raise ValueError(f"directory does not exist: {directory}")
+        if not os.access(directory, os.W_OK):
+            raise ValueError(f"directory is not writable: {directory}")
+        return path
+
+    def accept(self, result: str) -> None:
+        if not os.path.exists(result):
+            self.dismiss(result)
+            return
+
+        def _confirmed(ok: bool | None) -> None:
+            if ok:
+                self.dismiss(result)
+
+        self.app.push_screen(
+            ConfirmPrompt(f"[bold]{_esc_markup(result)}[/bold] exists. Overwrite?"), _confirmed
+        )
+
+
+SEARCH_MODES = [("Offset", "offset"), ("Hex bytes", "hex"), ("Text", "text")]
+
+
+class SearchPrompt(_InputPrompt):
+    """Go to offset or search a byte/text pattern.
+
+    Dismisses with ``("offset", int, raw)`` or ``(mode, bytes, raw)`` for hex/text,
+    where ``raw`` is the text as typed.
+    """
+
+    title_text = "[bold]Go to offset / search[/bold]"
+    hint_text = "offset: 1a2b · 0x1a2b · #6699   hex: de ad be ef   Tab → mode"
+
+    def __init__(self, size: int, mode: str = "offset", value: str = "") -> None:
+        super().__init__(value)
+        self._file_size = size
+        self._mode = mode
+
+    def compose_extra(self) -> ComposeResult:
+        yield Select(SEARCH_MODES, value=self._mode, allow_blank=False, id="prompt-mode")
+
+    @on(Select.Changed, "#prompt-mode")
+    def _mode_changed(self, event: Select.Changed) -> None:
+        self._mode = str(event.value)
+        self.query_one(".prompt-error", Label).update("")
+
+    @property
+    def mode(self) -> str:
+        return self._mode
+
+    def validate_value(self, value: str) -> tuple[str, Any]:
+        if self._mode == "offset":
+            offset = parse_offset(value)
+            if not 0 <= offset < self._file_size:
+                raise ValueError(f"offset out of range (file is 0x{self._file_size:x} bytes)")
+            return ("offset", offset, value)
+        if self._mode == "hex":
+            return ("hex", parse_byte_sequence(value), value)
+        if not value:
+            raise ValueError("enter text to search for")
+        return ("text", value.encode("utf-8"), value)

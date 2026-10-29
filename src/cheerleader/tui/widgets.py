@@ -11,11 +11,14 @@ from rich.style import Style
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, VerticalScroll
+from textual.events import Click
 from textual.geometry import Size
+from textual.message import Message
 from textual.scroll_view import ScrollView
 from textual.strip import Strip
 from textual.widgets import LoadingIndicator, Static
 
+from cheerleader.libs.hexdoc import HexDocument
 from cheerleader.libs.types import BinaryInfo
 
 
@@ -249,6 +252,158 @@ class HexCompareView(ScrollView, can_focus=True):
             self.app.notify("No previous differences", timeout=2)
             return
         self.scroll_to(y=self._diff_rows[idx], animate=False)
+
+
+class HexEditorView(ScrollView, can_focus=True):
+    """Keyboard-driven hex editor grid over a lazily-loaded HexDocument.
+
+    Only visible rows are read and rendered. The selected byte is blue, bytes
+    with unsaved edits are yellow, and the last search match is magenta.
+    """
+
+    BPL = 16
+    _HEX_X = 10  # column where the first hex byte starts
+    _ASCII_X = _HEX_X + BPL * 3 + 3  # after hex block (47 + group gap) and "  |"
+
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("left", "move(-1)", "←", show=False),
+        Binding("right", "move(1)", "→", show=False),
+        Binding("up", "move(-16)", "↑", show=False),
+        Binding("down", "move(16)", "↓", show=False),
+        Binding("pageup", "page(-1)", "PgUp", show=False),
+        Binding("pagedown", "page(1)", "PgDn", show=False),
+        Binding("home", "line_edge(0)", "Home", show=False),
+        Binding("end", "line_edge(1)", "End", show=False),
+        Binding("ctrl+home", "file_edge(0)", "Start", show=False),
+        Binding("ctrl+end", "file_edge(1)", "End", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    HexEditorView {
+        height: 1fr;
+        padding: 0 1;
+    }
+    """
+
+    _ST_ADDR = Style(dim=True)
+    _ST_CURSOR_ADDR = Style(bold=True)
+    _ST_CURSOR = Style(color="white", bgcolor="blue", bold=True)
+    _ST_EDITED = Style(color="yellow", bold=True)
+    _ST_MATCH = Style(color="black", bgcolor="magenta")
+
+    class CursorMoved(Message):
+        def __init__(self, offset: int) -> None:
+            super().__init__()
+            self.offset = offset
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._doc: HexDocument | None = None
+        self.cursor = 0
+        self._match: tuple[int, int] | None = None
+
+    def set_document(self, doc: HexDocument) -> None:
+        self._doc = doc
+        self.cursor = min(self.cursor, max(doc.size - 1, 0))
+        self._match = None
+        self.virtual_size = Size(self._ASCII_X + self.BPL + 1, self._rows())
+        self.refresh()
+        self.post_message(self.CursorMoved(self.cursor))
+
+    def _rows(self) -> int:
+        size = self._doc.size if self._doc else 0
+        return (size + self.BPL - 1) // self.BPL
+
+    # ── cursor ────────────────────────────────────────────────────────────────
+
+    def move_to(self, offset: int, top: bool = False) -> None:
+        """Move the cursor, keeping it on screen (or placing its row at the top)."""
+        if self._doc is None or self._doc.size == 0:
+            return
+        self.cursor = max(0, min(offset, self._doc.size - 1))
+        row = self.cursor // self.BPL
+        height = self.scrollable_content_region.height
+        if top:
+            self.scroll_to(y=row, animate=False)
+        elif row < self.scroll_y:
+            self.scroll_to(y=row, animate=False)
+        elif row >= self.scroll_y + height:
+            self.scroll_to(y=row - height + 1, animate=False)
+        self.refresh()
+        self.post_message(self.CursorMoved(self.cursor))
+
+    def set_match(self, match: tuple[int, int] | None) -> None:
+        self._match = match
+        self.refresh()
+
+    def action_move(self, delta: int) -> None:
+        self.move_to(self.cursor + delta)
+
+    def action_page(self, direction: int) -> None:
+        height = max(self.scrollable_content_region.height, 1)
+        self.move_to(self.cursor + direction * height * self.BPL)
+
+    def action_line_edge(self, end: int) -> None:
+        start = self.cursor - self.cursor % self.BPL
+        self.move_to(start + (self.BPL - 1 if end else 0))
+
+    def action_file_edge(self, end: int) -> None:
+        self.move_to(self._doc.size - 1 if end and self._doc else 0)
+
+    def on_click(self, event: Click) -> None:
+        offset = event.get_content_offset(self)
+        if offset is None or self._doc is None:
+            return
+        x = offset.x + int(self.scroll_x)
+        row = offset.y + int(self.scroll_y)
+        col: int | None = None
+        if self._HEX_X <= x < self._HEX_X + self.BPL * 3:
+            rel = x - self._HEX_X
+            if rel >= 8 * 3:  # skip the extra gap between the two 8-byte groups
+                rel -= 1
+            if rel % 3 != 2:
+                col = rel // 3
+        elif self._ASCII_X <= x < self._ASCII_X + self.BPL:
+            col = x - self._ASCII_X
+        if col is not None and row * self.BPL + col < self._doc.size:
+            self.move_to(row * self.BPL + col)
+
+    # ── rendering ─────────────────────────────────────────────────────────────
+
+    def render_line(self, y: int) -> Strip:
+        row = int(self.scroll_y) + y
+        if self._doc is None or row >= self._rows():
+            return Strip.blank(self.size.width, self.rich_style)
+        offset = row * self.BPL
+        data = self._doc.read(offset, self.BPL)
+        styles = [self._byte_style(offset + i) for i in range(len(data))]
+        cursor_row = offset <= self.cursor < offset + self.BPL
+        segs = [
+            Segment(f"{offset:08x}", self._ST_CURSOR_ADDR if cursor_row else self._ST_ADDR),
+            Segment("  "),
+        ]
+        for i in range(self.BPL):
+            if i:
+                segs.append(Segment("  " if i % 8 == 0 else " "))
+            segs.append(Segment(f"{data[i]:02x}", styles[i]) if i < len(data) else Segment("  "))
+        segs.append(Segment("  |"))
+        for i in range(self.BPL):
+            if i < len(data):
+                c = data[i]
+                segs.append(Segment(chr(c) if 0x20 <= c < 0x7F else ".", styles[i]))
+            else:
+                segs.append(Segment(" "))
+        segs.append(Segment("|"))
+        return Strip(segs).crop(int(self.scroll_x), int(self.scroll_x) + self.size.width)
+
+    def _byte_style(self, offset: int) -> Style | None:
+        if offset == self.cursor:
+            return self._ST_CURSOR
+        if self._match and self._match[0] <= offset < self._match[0] + self._match[1]:
+            return self._ST_MATCH
+        if self._doc is not None and self._doc.is_edited(offset):
+            return self._ST_EDITED
+        return None
 
 
 class InfoBar(Horizontal):

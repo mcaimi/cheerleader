@@ -14,7 +14,7 @@ from textual.widgets import Footer, Header, TabbedContent
 from cheerleader.formats import detect_format, parse
 from cheerleader.formats.macho import MachOInfo, list_fat_slices
 from cheerleader.libs.types import BinaryInfo
-from cheerleader.tui.screens import SlicePicker
+from cheerleader.tui.screens import ConfirmPrompt, SlicePicker
 from cheerleader.tui.tabs import (
     ChainedFixupsTab,
     DisasmTab,
@@ -158,9 +158,29 @@ class DisasmApp(App):
             self._pending_reload_notify = False
             self.notify("Reloaded", timeout=2)
 
+    def _confirm_discard(self, action: str, then) -> None:
+        """Run *then* directly, or after confirmation if the hex editor has unsaved edits."""
+        if not (self._hex_mode and self.query_one(HexEditorTab).modified):
+            then()
+            return
+
+        def _answer(ok: bool | None) -> None:
+            if ok:
+                then()
+
+        self.push_screen(ConfirmPrompt(f"Discard unsaved edits and {action}?"), _answer)
+
     def action_reload(self) -> None:
-        self._pending_reload_notify = True
-        self._load()
+        def _reload() -> None:
+            self._pending_reload_notify = True
+            self._load()
+
+        self._confirm_discard("reload", _reload)
+
+    def on_hex_editor_tab_saved(self, event: HexEditorTab.Saved) -> None:
+        # Save-as switches the editor to the new file; reload should follow it.
+        self._path = event.path
+        self.sub_title = os.path.basename(event.path)
 
     def action_tab(self, tab_id: str) -> None:
         tabs = self.query_one(TabbedContent)
@@ -186,4 +206,4 @@ class DisasmApp(App):
         return True
 
     def action_quit(self) -> None:
-        self.exit()
+        self._confirm_discard("quit", self.exit)
