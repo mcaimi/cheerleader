@@ -47,6 +47,50 @@ uv run cheerleader ./myprogram
 
 ---
 
+## Standalone build
+
+Build a single-file CLI that bundles the application **and** every dependency
+(including the optional [capstone](https://pypi.org/project/capstone) backend):
+
+```sh
+make standalone
+```
+
+This produces:
+
+| Artifact | Description |
+| --- | --- |
+| `dist/cheerleader` | Standalone CLI ([shiv](https://pypi.org/project/shiv) zipapp) |
+| `dist/skills/` | AI agent skills, auto-discovered next to the binary |
+| `dist/env.template` | Template for the optional AI configuration (`.env`) |
+| `dist/cheerleader-<version>-<platform>.tar.gz` | All of the above, tarred for distribution |
+
+**Host requirement:** `python3 >= 3.11` on `PATH` — no `uv`, `pip`, or
+virtualenv needed. On first run the zipapp unpacks itself into `~/.shiv`
+(a writable `$HOME` is required).
+
+```sh
+./dist/cheerleader /usr/bin/ls
+./dist/cheerleader /usr/bin/ls --disasm-engine=capstone   # fully self-contained
+```
+
+Notes:
+
+- The default disassembly backend uses the system `objdump` (binutils / OS X
+  tools). capstone is bundled, so `--disasm-engine=capstone` needs no system
+  disassembler.
+- AI features are optional: copy `env.template` to `.env` (or pass
+  `--env FILE`) and fill in the LLM settings. Without it the TUI works
+  normally and the AI tab reports the missing configuration.
+- The skills directory is resolved from `SKILLS_PATH` (default `./skills`);
+  with the standalone binary it automatically falls back to the `skills/`
+  directory next to the executable.
+
+Smoke-test the artifact with `make standalone-test`, or launch the full TUI
+in a pty with `make standalone-tui-test`.
+
+---
+
 ## TUI layout
 
 ```
