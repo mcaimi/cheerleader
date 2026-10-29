@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import platform
 import re
 import shutil
@@ -19,18 +20,16 @@ from cheerleader.libs.types import BinaryInfo, DisasmInstruction
 # before the mnemonic is always a tab or 2+ consecutive spaces — this
 # disambiguates mnemonics whose characters are valid hex (add, dec, fabs…).
 _INSN_RE = re.compile(
-    r"^\s*([0-9a-fA-F]+):\s+"                         # address
-    r"((?:[0-9a-fA-F]{2} )*[0-9a-fA-F]{2,})"          # hex bytes (space-only separators)
-    r"[ ]*(?:\t|  )[ \t]*"                              # boundary: tab or 2+ spaces
-    r"([a-zA-Z_\.]\S*)"                                 # mnemonic
-    r"(?:\s+(.*\S))?\s*$"                               # operands (optional)
+    r"^\s*([0-9a-fA-F]+):\s+"  # address
+    r"((?:[0-9a-fA-F]{2} )*[0-9a-fA-F]{2,})"  # hex bytes (space-only separators)
+    r"[ ]*(?:\t|  )[ \t]*"  # boundary: tab or 2+ spaces
+    r"([a-zA-Z_\.]\S*)"  # mnemonic
+    r"(?:\s+(.*\S))?\s*$"  # operands (optional)
 )
 
 # Match function label lines emitted by objdump between instruction blocks.
 # "0000000100000460 <_helper>:"  or  "0000000000004ad0 <main>:"
-_FUNC_LABEL_RE = re.compile(
-    r"^([0-9a-fA-F]+)\s+<([^>]+)>:\s*$"
-)
+_FUNC_LABEL_RE = re.compile(r"^([0-9a-fA-F]+)\s+<([^>]+)>:\s*$")
 
 # Cached objdump path and type (populated once per process)
 _objdump_info: Optional[tuple[str, bool]] = None
@@ -40,12 +39,22 @@ def _detect_objdump() -> Optional[tuple[str, bool]]:
     """Locate objdump on PATH and detect whether it is LLVM-based.
 
     Returns ``(path, is_llvm)`` or ``None`` if not found.
+
+    On macOS llvm-objdump is tried first (it handles Mach-O slices well);
+    elsewhere GNU objdump is preferred for stable output — llvm-objdump 23
+    replaces stripped binaries with content-less debuginfod copies when
+    DEBUGINFOD_URLS is set, emitting ``...`` instead of instructions.
     """
     global _objdump_info
     if _objdump_info is not None:
         return _objdump_info
 
-    for name in ("llvm-objdump", "objdump"):
+    if platform.system() == "Darwin":
+        candidates = ("llvm-objdump", "objdump")
+    else:
+        candidates = ("objdump", "llvm-objdump")
+
+    for name in candidates:
         path = shutil.which(name)
         if path is None:
             continue
@@ -59,7 +68,9 @@ def _check_llvm(path: str) -> bool:
     try:
         out = subprocess.run(
             [path, "--version"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         ).stdout
         return "LLVM" in out or "llvm" in out.lower()
     except Exception:
@@ -70,18 +81,19 @@ def _check_llvm(path: str) -> bool:
 
 _LLVM_ARCH = {
     "x86_64": "x86_64",
-    "x86":    "i386",
-    "arm64":  "arm64",
+    "x86": "i386",
+    "arm64": "arm64",
     "arm64e": "arm64",
     "arm64_32": "arm64_32",
     "aarch64": "aarch64",
-    "arm":    "arm",
-    "riscv":  "riscv64",
+    "arm": "arm",
+    "riscv": "riscv64",
     "riscv64": "riscv64",
 }
 
 
 # ---- command building ------------------------------------------------------
+
 
 def _build_command(
     objdump: str,
@@ -132,6 +144,7 @@ def _build_command(
 
 # ---- output parsing --------------------------------------------------------
 
+
 def _parse_output(
     text: str,
 ) -> tuple[list[DisasmInstruction], dict[int, str]]:
@@ -172,24 +185,38 @@ def _parse_output(
         if op_str and re.match(r"^[0-9a-fA-F]+$", op_str):
             op_str = f"0x{op_str}"
 
-        instructions.append(DisasmInstruction(
-            addr=addr,
-            size=len(raw),
-            mnemonic=mnemonic,
-            op_str=op_str,
-            raw=raw,
-        ))
+        instructions.append(
+            DisasmInstruction(
+                addr=addr,
+                size=len(raw),
+                mnemonic=mnemonic,
+                op_str=op_str,
+                raw=raw,
+            )
+        )
 
     return instructions, func_labels
 
 
 # ---- helpers ---------------------------------------------------------------
 
+
 def _run_objdump(cmd: list[str]) -> str | None:
     """Run an objdump command and return stdout, or ``None`` on failure."""
+    # Never let objdump reach the network: with DEBUGINFOD_URLS set, LLVM 23's
+    # llvm-objdump fetches a debuginfod copy of stripped binaries by build ID
+    # and disassembles that instead — the copy has SHT_NOBITS sections, so it
+    # prints "..." with no instructions.  Sanitizing the environment also
+    # keeps tool runs deterministic.
+    env = os.environ.copy()
+    env.pop("DEBUGINFOD_URLS", None)
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=30,
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
         )
         if result.returncode != 0:
             return None
@@ -200,8 +227,11 @@ def _run_objdump(cmd: list[str]) -> str | None:
 
 # ---- public API -------------------------------------------------------------
 
+
 def disassemble_section_objdump(
-    info: BinaryInfo, seg_name: str, sect_name: str,
+    info: BinaryInfo,
+    seg_name: str,
+    sect_name: str,
 ) -> list[DisasmInstruction]:
     """Disassemble one section via objdump; returns ``[]`` when unavailable."""
     from cheerleader.formats.elf import ELFInfo
@@ -226,8 +256,13 @@ def disassemble_section_objdump(
         return []
 
     cmd = _build_command(
-        objdump, info.path, info.arch, is_elf, is_llvm,
-        seg_name=seg_name, sect_name=sect_name,
+        objdump,
+        info.path,
+        info.arch,
+        is_elf,
+        is_llvm,
+        seg_name=seg_name,
+        sect_name=sect_name,
     )
 
     stdout = _run_objdump(cmd)
@@ -256,7 +291,11 @@ def disassemble_full_objdump(
     is_elf = isinstance(info, ELFInfo)
 
     cmd = _build_command(
-        objdump, info.path, info.arch, is_elf, is_llvm,
+        objdump,
+        info.path,
+        info.arch,
+        is_elf,
+        is_llvm,
     )
 
     stdout = _run_objdump(cmd)
