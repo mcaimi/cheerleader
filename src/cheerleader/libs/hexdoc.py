@@ -1,4 +1,8 @@
-"""Lazily-loaded, overwrite-only editable view of a file's bytes."""
+"""Lazily-loaded, overwrite-only editable view of a file's bytes.
+
+Also hosts the byte-sequence diff kernel (`compute_diff_blocks`) and the
+streaming two-document diff (`iter_diff`) used by the hex compare view.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +11,7 @@ import tempfile
 import threading
 from bisect import bisect_left, insort
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 
 PAGE_SIZE = 64 * 1024
 MAX_CACHED_PAGES = 64
@@ -213,3 +217,88 @@ class HexDocument:
             if progress:
                 progress((end - hi) / total)
         return None
+
+
+# ── diffing ───────────────────────────────────────────────────────────────────
+
+# Diffs are tracked in 8-byte blocks so they map onto both 8- and 16-byte rows.
+DIFF_BLOCK = 8
+_CMP_CHUNK = 4096  # fast-skip granularity inside the common region
+# Streaming scan window: sized above HexDocument's bulk-read threshold so
+# scanning bypasses the page cache and does not evict the view's hot pages.
+DIFF_SCAN_CHUNK = 512 * 1024
+
+
+def compute_diff_blocks(left: bytes, right: bytes) -> tuple[list[int], int]:
+    """Return (sorted indexes of DIFF_BLOCK-sized blocks that differ, differing byte count).
+
+    Bytes past the end of the shorter input count as differing.
+    """
+    common = min(len(left), len(right))
+    blocks: list[int] = []
+    diff_bytes = 0
+    for start in range(0, common, _CMP_CHUNK):
+        end = min(start + _CMP_CHUNK, common)
+        if left[start:end] == right[start:end]:
+            continue
+        for b in range(start, end, DIFF_BLOCK):
+            e = min(b + DIFF_BLOCK, end)
+            if left[b:e] != right[b:e]:
+                blocks.append(b // DIFF_BLOCK)
+                diff_bytes += sum(1 for x, y in zip(left[b:e], right[b:e]) if x != y)
+    longest = max(len(left), len(right))
+    if longest > common:
+        first = common // DIFF_BLOCK
+        if blocks and blocks[-1] == first:
+            first += 1
+        blocks.extend(range(first, (longest + DIFF_BLOCK - 1) // DIFF_BLOCK))
+        diff_bytes += longest - common
+    return blocks, diff_bytes
+
+
+def iter_diff(
+    left: HexDocument,
+    right: HexDocument,
+    scan_chunk: int | None = None,
+    cancelled: CancelFn | None = None,
+) -> Iterator[tuple[list[int], int, float]]:
+    """Stream the diff of two documents chunk by chunk.
+
+    Yields ``(new_blocks, new_diff_bytes, progress)`` per scan window, where
+    *new_blocks* holds absolute DIFF_BLOCK indexes (ascending across yields)
+    and *progress* is in 0..1. Bytes past the end of the shorter document
+    count as differing (the length tail is delivered in the final yield).
+    Returns early when *cancelled* fires; the consumer detects this by the
+    generator ending without a final progress of 1.0 (or via its own cancel
+    flag). The result accumulated over all yields equals
+    ``compute_diff_blocks`` over both full contents.
+    """
+    if scan_chunk is None:
+        scan_chunk = DIFF_SCAN_CHUNK  # read at call time (monkeypatch-friendly)
+    common = min(left.size, right.size)
+    longest = max(left.size, right.size)
+    total = max(common, 1)
+    blocks: list[int] = []
+    diff_bytes = 0
+    for start in range(0, common, scan_chunk):
+        if cancelled and cancelled():
+            return
+        take = min(scan_chunk, common - start)
+        lc = left.read(start, take)
+        rc = right.read(start, take)
+        new_blocks: list[int] = []
+        n = 0
+        if lc != rc:
+            local, n = compute_diff_blocks(lc, rc)
+            # *local* holds chunk-relative block indexes; translate to absolute
+            new_blocks = [(start + b * DIFF_BLOCK) // DIFF_BLOCK for b in local]
+            blocks.extend(new_blocks)
+            diff_bytes += n
+        yield new_blocks, n, min(start + take, common) / total
+    if longest > common:
+        first = common // DIFF_BLOCK
+        if blocks and blocks[-1] == first:
+            first += 1
+        tail = list(range(first, (longest + DIFF_BLOCK - 1) // DIFF_BLOCK))
+        blocks.extend(tail)
+        yield tail, longest - common, 1.0

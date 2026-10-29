@@ -16,7 +16,7 @@ from rich.text import Text
 
 from cheerleader.libs.cfg import CallGraph, build_call_graph, build_cfg
 from cheerleader.libs.disasm import disassemble_all_sections, disassemble_section, extract_strings
-from cheerleader.libs.hexdoc import HexDocument
+from cheerleader.libs.hexdoc import DIFF_BLOCK, HexDocument, iter_diff
 from cheerleader.libs.types import (
     BinaryInfo,
     ChainedFixup,
@@ -44,7 +44,6 @@ from cheerleader.tui.widgets import (
     HexCompareView,
     HexEditorView,
     HexPane,
-    compute_diff_blocks,
 )
 
 
@@ -1142,54 +1141,129 @@ class HexEditorTab(TabPane):
 
 
 class HexCompareTab(TabPane):
+    """Side-by-side hex diff; files are read on demand and the diff streams
+    in a background worker, so multi-GB files display instantly."""
+
     def __init__(self) -> None:
         super().__init__("Hex Compare", id="tab-hexcmp")
+        self._docs: tuple[HexDocument, HexDocument] | None = None
+        self._gen = 0  # bumped per load; stale worker callbacks are dropped
+        self._last_pct = -1
 
     def compose(self) -> ComposeResult:
         yield HexCompareView(id="hexcmp-view")
         yield Static("", id="hexcmp-status")
 
     def load(self, left_path: str, right_path: str) -> None:
-        self._load_files(left_path, right_path)
+        self._gen += 1
+        self._last_pct = -1
+        self._load_files(self._gen, left_path, right_path)
 
-    @work(thread=True, exclusive=True)
-    def _load_files(self, left_path: str, right_path: str) -> None:
+    def _view(self) -> HexCompareView:
+        return self.query_one(HexCompareView)
+
+    @work(thread=True, exclusive=True, group="hexcmp")
+    def _load_files(self, gen: int, left_path: str, right_path: str) -> None:
+        worker = get_current_worker()
         self.app.call_from_thread(self._set_status, "Loading…")
-        with open(left_path, "rb") as f:
-            left = f.read()
-        with open(right_path, "rb") as f:
-            right = f.read()
-        diff_blocks, diff_bytes = compute_diff_blocks(left, right)
+        try:
+            left = HexDocument(left_path)
+        except OSError as e:
+            self.app.call_from_thread(self._open_failed, gen, str(e))
+            return
+        try:
+            right = HexDocument(right_path)
+        except OSError as e:
+            left.close()
+            self.app.call_from_thread(self._open_failed, gen, str(e))
+            return
         self.app.call_from_thread(
-            self._display, left_path, right_path, left, right, diff_blocks, diff_bytes
+            self._display_docs, gen, left, right, left_path, right_path
         )
 
-    def _display(
+        first_block: int | None = None
+        diff_bytes = 0
+        try:
+            for new_blocks, n, frac in iter_diff(
+                left, right, cancelled=lambda: worker.is_cancelled
+            ):
+                if new_blocks and first_block is None:
+                    first_block = new_blocks[0]
+                diff_bytes += n
+                self.app.call_from_thread(self._apply_diff, gen, new_blocks, frac)
+        except (OSError, ValueError):
+            # documents were closed by a newer load — this scan is obsolete
+            if not worker.is_cancelled and gen == self._gen:
+                self.app.call_from_thread(
+                    self._set_status, "[red]Comparison failed — I/O error[/red]"
+                )
+            return
+        if worker.is_cancelled:
+            return
+        self.app.call_from_thread(self._finish, gen, first_block, diff_bytes)
+
+    # ── UI-thread callbacks (stale generations are dropped) ──────────────────
+
+    def _open_failed(self, gen: int, error: str) -> None:
+        if gen != self._gen:
+            return
+        self.app.notify(f"Cannot compare: {error}", severity="error", timeout=6)
+
+    def _display_docs(
         self,
+        gen: int,
+        left: HexDocument,
+        right: HexDocument,
         left_path: str,
         right_path: str,
-        left: bytes,
-        right: bytes,
-        diff_blocks: list[int],
-        diff_bytes: int,
     ) -> None:
-        view = self.query_one(HexCompareView)
-        view.set_data(left, right, left_path, right_path, diff_blocks)
+        if gen != self._gen:
+            return
+        previous = self._docs
+        self._docs = (left, right)
+        view = self._view()
+        view.set_data(left, right, left_path, right_path, [])
         view.focus()
-        if diff_blocks:
-            a, b = left[diff_blocks[0] * 8 :], right[diff_blocks[0] * 8 :]
-            first = diff_blocks[0] * 8 + next(
-                (i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b))
-            )
+        # dispose of the previous pair only after the new one is on screen
+        if previous is not None:
+            for d in previous:
+                d.close()
+
+    def _apply_diff(self, gen: int, new_blocks: list[int], frac: float) -> None:
+        if gen != self._gen:
+            return
+        if new_blocks:
+            self._view().add_diff_blocks(new_blocks)
+        pct = int(frac * 100)
+        if pct // 5 != self._last_pct // 5:
+            self._last_pct = pct
+            self._set_status(f"Comparing… {pct}%")
+
+    def _finish(self, gen: int, first_block: int | None, diff_bytes: int) -> None:
+        if gen != self._gen or self._docs is None:
+            return
+        left, right = self._docs
+        if first_block is None:
+            diff_str = "[green]files are identical[/green]"
+        else:
+            first = self._first_diff_offset(first_block)
             diff_str = (
                 f"[red]{diff_bytes:,} differing bytes[/red]  first at 0x{first:08x}"
                 "  [dim]n/p → next/prev diff[/dim]"
             )
-        else:
-            diff_str = "[green]files are identical[/green]"
         self._set_status(
-            f"left {_human_size(len(left))} ({len(left):,})  "
-            f"right {_human_size(len(right))} ({len(right):,})  {diff_str}"
+            f"left {_human_size(left.size)} ({left.size:,})  "
+            f"right {_human_size(right.size)} ({right.size:,})  {diff_str}"
+        )
+
+    def _first_diff_offset(self, block: int) -> int:
+        left, right = self._docs
+        off = block * DIFF_BLOCK
+        a = left.read(off, DIFF_BLOCK)
+        b = right.read(off, DIFF_BLOCK)
+        return off + next(
+            (i for i, (x, y) in enumerate(zip(a, b)) if x != y),
+            min(len(a), len(b)),
         )
 
     def _set_status(self, msg: str) -> None:

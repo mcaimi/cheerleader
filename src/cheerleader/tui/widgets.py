@@ -18,7 +18,7 @@ from textual.scroll_view import ScrollView
 from textual.strip import Strip
 from textual.widgets import LoadingIndicator, Static
 
-from cheerleader.libs.hexdoc import HexDocument
+from cheerleader.libs.hexdoc import DIFF_BLOCK, HexDocument
 from cheerleader.libs.types import BinaryInfo
 from cheerleader.tui.hexrender import build_hex_dump, row_segments, row_width, x_to_col
 
@@ -70,42 +70,13 @@ class HexPane(VerticalScroll):
         self.query_one(Static).update(build_hex_dump(self._hex_bytes, self._hex_addr))
 
 
-# Diffs are tracked in 8-byte blocks so they map onto both 8- and 16-byte rows.
-DIFF_BLOCK = 8
-_CMP_CHUNK = 4096
-
-
-def compute_diff_blocks(left: bytes, right: bytes) -> tuple[list[int], int]:
-    """Return (sorted indexes of DIFF_BLOCK-sized blocks that differ, differing byte count).
-
-    Bytes past the end of the shorter input count as differing.
-    """
-    common = min(len(left), len(right))
-    blocks: list[int] = []
-    diff_bytes = 0
-    for start in range(0, common, _CMP_CHUNK):
-        end = min(start + _CMP_CHUNK, common)
-        if left[start:end] == right[start:end]:
-            continue
-        for b in range(start, end, DIFF_BLOCK):
-            e = min(b + DIFF_BLOCK, end)
-            if left[b:e] != right[b:e]:
-                blocks.append(b // DIFF_BLOCK)
-                diff_bytes += sum(1 for x, y in zip(left[b:e], right[b:e]) if x != y)
-    longest = max(len(left), len(right))
-    if longest > common:
-        first = common // DIFF_BLOCK
-        if blocks and blocks[-1] == first:
-            first += 1
-        blocks.extend(range(first, (longest + DIFF_BLOCK - 1) // DIFF_BLOCK))
-        diff_bytes += longest - common
-    return blocks, diff_bytes
-
-
 class HexCompareView(ScrollView, can_focus=True):
-    """Side-by-side hex dump of two byte strings, scrolled as one.
+    """Side-by-side hex dump of two files, scrolled as one.
 
-    Matching bytes are green, differing bytes red. Only visible rows are rendered.
+    Both sides are lazily-read :class:`HexDocument` instances — rows are read
+    on demand, so multi-GB files display instantly. Matching bytes are green,
+    differing bytes red. Only visible rows are rendered; diff blocks arrive
+    incrementally from the background comparison (see ``add_diff_blocks``).
     """
 
     BINDINGS: ClassVar[list[Binding]] = [
@@ -129,8 +100,8 @@ class HexCompareView(ScrollView, can_focus=True):
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
-        self._left = b""
-        self._right = b""
+        self._left: HexDocument | None = None
+        self._right: HexDocument | None = None
         self._left_name = ""
         self._right_name = ""
         self._diff_blocks: list[int] = []
@@ -139,21 +110,35 @@ class HexCompareView(ScrollView, can_focus=True):
 
     def set_data(
         self,
-        left: bytes,
-        right: bytes,
+        left: HexDocument,
+        right: HexDocument,
         left_name: str,
         right_name: str,
         diff_blocks: list[int],
     ) -> None:
         self._left, self._right = left, right
         self._left_name, self._right_name = left_name, right_name
-        self._diff_blocks = diff_blocks
+        self._diff_blocks = list(diff_blocks)
         self._relayout()
+
+    def add_diff_blocks(self, blocks: list[int]) -> None:
+        """Append newly-found differing blocks (ascending across calls)
+        and update the diff-row navigation index."""
+        if not blocks or self._left is None:
+            return
+        self._diff_blocks.extend(blocks)
+        per_row = max(self._bpl // DIFF_BLOCK, 1)
+        for b in blocks:
+            row = b // per_row
+            if not self._diff_rows or self._diff_rows[-1] != row:
+                self._diff_rows.append(row)
 
     # ── layout ────────────────────────────────────────────────────────────────
 
     def _rows(self) -> int:
-        longest = max(len(self._left), len(self._right))
+        if self._left is None or self._right is None:
+            return 0
+        longest = max(self._left.size, self._right.size)
         return (longest + self._bpl - 1) // self._bpl
 
     def _relayout(self) -> None:
@@ -183,11 +168,11 @@ class HexCompareView(ScrollView, can_focus=True):
             ]
             return Strip(segs)
         row = int(self.scroll_y) + y - 1
-        if row >= self._rows():
+        if self._left is None or self._right is None or row >= self._rows():
             return Strip.blank(self.size.width, self.rich_style)
         offset = row * self._bpl
-        a = self._left[offset : offset + self._bpl]
-        b = self._right[offset : offset + self._bpl]
+        a = self._left.read(offset, self._bpl)
+        b = self._right.read(offset, self._bpl)
         segs = self._pane_row(offset, a, b)
         segs.append(Segment(self._DIVIDER, self._ST_SEP))
         segs.extend(self._pane_row(offset, b, a))
