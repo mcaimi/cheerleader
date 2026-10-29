@@ -1,11 +1,13 @@
 # disassembly agent
 
+import sys
 from typing import Any
 from pathlib import Path
 from deepagents import create_deep_agent
 from langchain.chat_models import init_chat_model, BaseChatModel
 from langchain_core.messages import HumanMessage
 from langgraph.graph.state import CompiledStateGraph
+
 
 # the agent class
 class CheerleaderAIAgent(object):
@@ -16,6 +18,13 @@ class CheerleaderAIAgent(object):
         self.api_key: str = config.get("api_key")
         self.system_prompt: str = config.get("system_prompt")
         self.skills_path: Path = Path(config.get("skills_path"))
+        if not self.skills_path.exists() and sys.argv and sys.argv[0]:
+            # standalone builds ship skills/ next to the executable:
+            # fall back to that location when the configured path
+            # (e.g. CWD-relative ./skills) is not found
+            candidate = Path(sys.argv[0]).resolve().parent / self.skills_path.name
+            if candidate.exists():
+                self.skills_path = candidate
 
         # at the beginning, connection is empty
         self.llm_connector: BaseChatModel = None
@@ -53,10 +62,13 @@ class CheerleaderAIAgent(object):
 
             # check connector
             if self.llm_connector is None:
-                raise Exception(f"Connector for model {self.llm_model}, using URL {self.base_url} is not available.")
-        
+                raise Exception(
+                    f"Connector for model {self.llm_model}, using URL {self.base_url} is not available."
+                )
+
             # create a filesystem backend to load skills from
             from deepagents.backends.filesystem import FilesystemBackend
+
             fs_backend = FilesystemBackend(root_dir=self.skills_path.absolute().parent)
 
             # create the agent object
@@ -64,10 +76,11 @@ class CheerleaderAIAgent(object):
                 model=self.llm_connector,
                 backend=fs_backend,
                 system_prompt=self.system_prompt,
-                skills=[self.skills_path.name]
+                skills=[self.skills_path.name],
             )
         except Exception:
             import logging
+
             msg = f"Failed to initialize Agent: model={self.llm_model}"
 
             logging.critical(msg)
@@ -75,9 +88,7 @@ class CheerleaderAIAgent(object):
 
     # main method
     def invoke(self, user_prompt: str):
-        payload = {
-            "messages": [HumanMessage(content=user_prompt)]
-        }
+        payload = {"messages": [HumanMessage(content=user_prompt)]}
         return self.agent.invoke(payload)
 
     # stream the model/tool-calling loop as it happens
@@ -85,7 +96,5 @@ class CheerleaderAIAgent(object):
     # deltas (model/tool steps), mode "messages" carries token-level
     # (message_chunk, metadata) pairs for whatever is being generated
     def stream(self, user_prompt: str):
-        payload = {
-            "messages": [HumanMessage(content=user_prompt)]
-        }
+        payload = {"messages": [HumanMessage(content=user_prompt)]}
         yield from self.agent.stream(payload, stream_mode=["updates", "messages"])
