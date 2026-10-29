@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from bisect import bisect_left
 from dataclasses import dataclass, field
 
 from cheerleader.libs.types import BinaryInfo, DisasmInstruction, N_TYPE, N_SECT
@@ -48,6 +49,45 @@ class CallGraph:
         a = sa[idx]
         name = self.addr_to_name.get(a)
         return (name, a) if name is not None else None
+
+    def func_range(self, addr: int) -> tuple[int, int | None]:
+        """(start, next_start) bounds of the function starting at *addr*.
+
+        *next_start* is None when no known function follows. Raises
+        ValueError when *addr* is not a known function start.
+        """
+        return func_bounds(self._sorted_addrs, addr)
+
+
+def func_bounds(sorted_addrs: list[int], func_addr: int) -> tuple[int, int | None]:
+    """(start, next_start) bounds of the function starting at *func_addr*.
+
+    *sorted_addrs* must be a sorted list of known function start addresses;
+    *next_start* is None when no known function follows. Raises ValueError
+    when *func_addr* is not a known function start.
+    """
+    pos = bisect_left(sorted_addrs, func_addr)
+    if pos >= len(sorted_addrs) or sorted_addrs[pos] != func_addr:
+        raise ValueError(f"0x{func_addr:x} is not a known function start")
+    nxt = sorted_addrs[pos + 1] if pos + 1 < len(sorted_addrs) else None
+    return func_addr, nxt
+
+
+def slice_function_instrs(
+    instrs: list[DisasmInstruction],
+    func_addr: int,
+    next_func_addr: int | None,
+) -> list[DisasmInstruction]:
+    """Instructions of the function at *func_addr* from an address-sorted list.
+
+    Takes every instruction in ``[func_addr, next_func_addr)``; an
+    open-ended range when *next_func_addr* is None.
+    """
+    return [
+        i
+        for i in instrs
+        if i.addr >= func_addr and (next_func_addr is None or i.addr < next_func_addr)
+    ]
 
 
 @dataclass
