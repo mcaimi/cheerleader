@@ -67,9 +67,9 @@ def main() -> None:
     if fmt == "unknown" and not args.hex_compare:
         print("Warning: unrecognised binary format — continuing anyway")
 
-    from cheerleader.tui import DisasmApp
+    from cheerleader.tui import build_app
 
-    app = DisasmApp(
+    app = build_app(
         args.binary,
         env_file=args.env,
         hex_mode=args.hex,

@@ -1,13 +1,25 @@
-"""Root DisasmApp Textual application."""
+"""Per-mode Textual applications and the ``build_app`` factory.
+
+``_CheerApp`` holds the shared plumbing (CSS, quit/reload bindings,
+discard confirmation); each launch mode is its own subclass:
+
+- ``DisasmApp``      — binary inspector (default)
+- ``HexEditorApp``   — ``--hex``
+- ``HexCompareApp``  — ``--hex-compare``
+
+Use ``build_app()`` to construct the right app for a launch mode.
+"""
 
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from typing import ClassVar
 
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.css.query import NoMatches
 from textual.reactive import reactive
 from textual.widgets import Footer, Header, TabbedContent
 
@@ -33,15 +45,59 @@ from cheerleader.tui.widgets import InfoBar
 APP_TITLE = "CHEERLEADER"
 
 
-class DisasmApp(App):
-    """Binary inspector TUI."""
+class _CheerApp(App):
+    """Shared application plumbing: CSS, quit/reload, discard confirmation."""
 
     CSS_PATH = "app.tcss"
-    TITLE = "CHEERLEADER — binary inspector"
 
     BINDINGS: ClassVar[list[Binding]] = [
         Binding("q", "quit", "Quit"),
         Binding("r", "reload", "Reload"),
+    ]
+
+    _path: reactive[str] = reactive("", recompose=False)
+
+    def __init__(self, path: str) -> None:
+        super().__init__()
+        self._path = path
+        self._pending_reload_notify = False
+
+    def _load(self) -> None:
+        raise NotImplementedError
+
+    def _confirm_discard(self, action: str, then: Callable[[], None]) -> None:
+        """Run *then* directly, or after confirmation if the hex editor has unsaved edits."""
+        try:
+            modified = self.query_one(HexEditorTab).modified
+        except NoMatches:
+            modified = False
+        if not modified:
+            then()
+            return
+
+        def _answer(ok: bool | None) -> None:
+            if ok:
+                then()
+
+        self.push_screen(ConfirmPrompt(f"Discard unsaved edits and {action}?"), _answer)
+
+    def action_reload(self) -> None:
+        def _reload() -> None:
+            self._pending_reload_notify = True
+            self._load()
+
+        self._confirm_discard("reload", _reload)
+
+    def action_quit(self) -> None:
+        self._confirm_discard("quit", self.exit)
+
+
+class DisasmApp(_CheerApp):
+    """Binary inspector TUI."""
+
+    TITLE = "CHEERLEADER — binary inspector"
+
+    BINDINGS: ClassVar[list[Binding]] = [
         Binding("s", "slice", "Switch slice"),
         Binding("1", "tab('tab-segments')", "Segments"),
         Binding("2", "tab('tab-strings')", "Strings"),
@@ -54,63 +110,37 @@ class DisasmApp(App):
         Binding("9", "tab('tab-funcrev')", "Func Rev"),
     ]
 
-    _path: reactive[str] = reactive("", recompose=False)
     _slice: reactive[int] = reactive(0, recompose=False)
 
     def __init__(
         self,
         path: str,
         env_file: str | None = None,
-        hex_mode: bool = False,
-        hex_compare: str | None = None,
         disasm_engine: str = "objdump",
     ) -> None:
-        super().__init__()
-        self._path = path
+        super().__init__(path)
         self._slice = 0
         self._info: BinaryInfo | None = None
         self._slices: list[tuple[int, str]] = []
         self._env_file = env_file
-        self._hex_mode = hex_mode
-        self._hex_compare = hex_compare
         self._disasm_engine = disasm_engine
-        self._pending_reload_notify = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        if self._hex_compare:
-            with TabbedContent(id="main-tabs"):
-                yield HexCompareTab()
-        elif self._hex_mode:
-            with TabbedContent(id="main-tabs"):
-                yield HexEditorTab()
-        else:
-            yield InfoBar(id="info-bar")
-            with TabbedContent(id="main-tabs"):
-                yield SegmentsTab()
-                yield StringsTab()
-                yield SectionsTab()
-                yield LibrariesTab()
-                yield SymbolsTab()
-                yield ExportsTab()
-                yield ChainedFixupsTab()
-                yield DisasmTab(disasm_engine=self._disasm_engine)
-                yield FuncReversingTab(env_file=self._env_file, disasm_engine=self._disasm_engine)
+        yield InfoBar(id="info-bar")
+        with TabbedContent(id="main-tabs"):
+            yield SegmentsTab()
+            yield StringsTab()
+            yield SectionsTab()
+            yield LibrariesTab()
+            yield SymbolsTab()
+            yield ExportsTab()
+            yield ChainedFixupsTab()
+            yield DisasmTab(disasm_engine=self._disasm_engine)
+            yield FuncReversingTab(env_file=self._env_file, disasm_engine=self._disasm_engine)
         yield Footer()
 
     def on_mount(self) -> None:
-        if self._hex_compare:
-            self.title = "CHEERLEADER — hex compare"
-            self.sub_title = (
-                f"{os.path.basename(self._path)} ⇄ {os.path.basename(self._hex_compare)}"
-            )
-            self.query_one(HexCompareTab).load(self._path, self._hex_compare)
-            return
-        if self._hex_mode:
-            self.title = "CHEERLEADER — hex editor"
-            self.sub_title = os.path.basename(self._path)
-            self.query_one(HexEditorTab).load(self._path)
-            return
         fmt = detect_format(self._path)
         if fmt == "macho":
             self._slices = list_fat_slices(self._path)
@@ -119,12 +149,6 @@ class DisasmApp(App):
         self._load()
 
     def _load(self) -> None:
-        if self._hex_compare:
-            self.query_one(HexCompareTab).load(self._path, self._hex_compare)
-            return
-        if self._hex_mode:
-            self.query_one(HexEditorTab).load(self._path)
-            return
         self.query_one(InfoBar).set_analyzing(True)
         self._parse_binary()
 
@@ -158,30 +182,6 @@ class DisasmApp(App):
             self._pending_reload_notify = False
             self.notify("Reloaded", timeout=2)
 
-    def _confirm_discard(self, action: str, then) -> None:
-        """Run *then* directly, or after confirmation if the hex editor has unsaved edits."""
-        if not (self._hex_mode and self.query_one(HexEditorTab).modified):
-            then()
-            return
-
-        def _answer(ok: bool | None) -> None:
-            if ok:
-                then()
-
-        self.push_screen(ConfirmPrompt(f"Discard unsaved edits and {action}?"), _answer)
-
-    def action_reload(self) -> None:
-        def _reload() -> None:
-            self._pending_reload_notify = True
-            self._load()
-
-        self._confirm_discard("reload", _reload)
-
-    def on_hex_editor_tab_saved(self, event: HexEditorTab.Saved) -> None:
-        # Save-as switches the editor to the new file; reload should follow it.
-        self._path = event.path
-        self.sub_title = os.path.basename(event.path)
-
     def action_tab(self, tab_id: str) -> None:
         tabs = self.query_one(TabbedContent)
         tabs.active = tab_id
@@ -198,12 +198,71 @@ class DisasmApp(App):
 
         self.push_screen(SlicePicker(self._slices), _on_pick)
 
-    def check_action(
-        self, action: str, parameters: tuple[object, ...]
-    ) -> bool | None:
-        if (self._hex_mode or self._hex_compare) and action in ("tab", "slice"):
-            return False
-        return True
 
-    def action_quit(self) -> None:
-        self._confirm_discard("quit", self.exit)
+class HexEditorApp(_CheerApp):
+    """Overwrite-only hex editor TUI (``--hex``)."""
+
+    TITLE = "CHEERLEADER — hex editor"
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with TabbedContent(id="main-tabs"):
+            yield HexEditorTab()
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.sub_title = os.path.basename(self._path)
+        self._load()
+
+    def _load(self) -> None:
+        self.query_one(HexEditorTab).load(self._path)
+
+    def on_hex_editor_tab_saved(self, event: HexEditorTab.Saved) -> None:
+        # Save-as switches the editor to the new file; reload should follow it.
+        self._path = event.path
+        self.sub_title = os.path.basename(event.path)
+
+
+class HexCompareApp(_CheerApp):
+    """Side-by-side hex diff TUI (``--hex-compare``)."""
+
+    TITLE = "CHEERLEADER — hex compare"
+
+    def __init__(self, path: str, right_path: str) -> None:
+        super().__init__(path)
+        self._right_path = right_path
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with TabbedContent(id="main-tabs"):
+            yield HexCompareTab()
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.sub_title = (
+            f"{os.path.basename(self._path)} ⇄ {os.path.basename(self._right_path)}"
+        )
+        self._load()
+
+    def _load(self) -> None:
+        self.query_one(HexCompareTab).load(self._path, self._right_path)
+
+
+def build_app(
+    path: str,
+    env_file: str | None = None,
+    hex_mode: bool = False,
+    hex_compare: str | None = None,
+    disasm_engine: str = "objdump",
+) -> App:
+    """Construct the App for the requested launch mode.
+
+    This is the stable entry point: the per-mode subclasses may refine
+    their ``__init__`` signatures, but ``build_app`` keeps a single
+    dispatching signature for callers.
+    """
+    if hex_compare:
+        return HexCompareApp(path, hex_compare)
+    if hex_mode:
+        return HexEditorApp(path)
+    return DisasmApp(path, env_file=env_file, disasm_engine=disasm_engine)
