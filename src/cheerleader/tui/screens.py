@@ -13,7 +13,7 @@ from textual.screen import ModalScreen, Screen
 from textual.widgets import Input, Label, ListItem, ListView, LoadingIndicator, RichLog, Rule, Select, Static, Tree
 
 from cheerleader.libs.cfg import CallGraph, ControlFlowGraph
-from cheerleader.libs.hexdoc import parse_byte_sequence, parse_offset
+from cheerleader.tui.hexparse import parse_byte_sequence, parse_offset
 from cheerleader.tui.highlight import _esc_markup, _render_cfg
 
 

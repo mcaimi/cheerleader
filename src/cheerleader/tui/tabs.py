@@ -25,6 +25,7 @@ from cheerleader.libs.types import (
     N_UNDF,
     Symbol,
 )
+from cheerleader.tui.hexrender import ascii_char
 from cheerleader.tui.highlight import (
     _colorize_mnemonic,
     _colorize_operands,
@@ -958,8 +959,7 @@ class HexEditorTab(TabPane):
             extra = self._note[1]
         if doc.size:
             b = doc.read(cur, 1)[0]
-            ch = chr(b) if 0x20 <= b < 0x7F else "."
-            parts.append(f"0x{cur:08x} ({cur:,})  = 0x{b:02x} {b:3d} '{escape(ch)}'")
+            parts.append(f"0x{cur:08x} ({cur:,})  = 0x{b:02x} {b:3d} '{escape(ascii_char(b))}'")
         else:
             parts.append("empty file")
         if doc.modified:

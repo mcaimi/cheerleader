@@ -20,19 +20,7 @@ from textual.widgets import LoadingIndicator, Static
 
 from cheerleader.libs.hexdoc import HexDocument
 from cheerleader.libs.types import BinaryInfo
-
-
-def build_hex_dump(data: bytes, base_addr: int) -> str:
-    lines = []
-    for i in range(0, len(data), 16):
-        chunk = data[i : i + 16]
-        addr = base_addr + i
-        hex_left = " ".join(f"{b:02x}" for b in chunk[:8])
-        hex_right = " ".join(f"{b:02x}" for b in chunk[8:])
-        hex_part = f"{hex_left:<23}  {hex_right:<23}"
-        ascii_part = "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in chunk)
-        lines.append(f"{addr:08x}  {hex_part}  |{ascii_part}|")
-    return "\n".join(lines)
+from cheerleader.tui.hexrender import build_hex_dump, row_segments, row_width, x_to_col
 
 
 class HexPane(VerticalScroll):
@@ -164,25 +152,19 @@ class HexCompareView(ScrollView, can_focus=True):
 
     # ── layout ────────────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _pane_width(bpl: int) -> int:
-        # offset(8) + 2 + hex (3/byte, +1 gap per extra 8-byte group, -1) + 2 + |ascii|
-        hex_w = bpl * 3 - 1 + (bpl // 8 - 1)
-        return 8 + 2 + hex_w + 2 + bpl + 2
-
     def _rows(self) -> int:
         longest = max(len(self._left), len(self._right))
         return (longest + self._bpl - 1) // self._bpl
 
     def _relayout(self) -> None:
         width = self.scrollable_content_region.width
-        bpl = 16 if width >= self._pane_width(16) * 2 + len(self._DIVIDER) else 8
+        bpl = 16 if width >= row_width(16) * 2 + len(self._DIVIDER) else 8
         top_offset = int(self.scroll_y) * self._bpl
         self._bpl = bpl
         per_row = bpl // DIFF_BLOCK
         self._diff_rows = sorted({b // per_row for b in self._diff_blocks})
         # +1 row for the fixed header line
-        self.virtual_size = Size(self._pane_width(bpl) * 2 + len(self._DIVIDER), self._rows() + 1)
+        self.virtual_size = Size(row_width(bpl) * 2 + len(self._DIVIDER), self._rows() + 1)
         self.scroll_to(y=top_offset // bpl, animate=False)
         self.refresh()
 
@@ -192,7 +174,7 @@ class HexCompareView(ScrollView, can_focus=True):
     # ── rendering ─────────────────────────────────────────────────────────────
 
     def render_line(self, y: int) -> Strip:
-        pane_w = self._pane_width(self._bpl)
+        pane_w = row_width(self._bpl)
         if y == 0:
             segs = [
                 Segment(f" {self._left_name}"[:pane_w].ljust(pane_w), self._ST_HEADER),
@@ -206,36 +188,21 @@ class HexCompareView(ScrollView, can_focus=True):
         offset = row * self._bpl
         a = self._left[offset : offset + self._bpl]
         b = self._right[offset : offset + self._bpl]
-        segs = self._pane_segments(offset, a, b)
+        segs = self._pane_row(offset, a, b)
         segs.append(Segment(self._DIVIDER, self._ST_SEP))
-        segs.extend(self._pane_segments(offset, b, a))
+        segs.extend(self._pane_row(offset, b, a))
         return Strip(segs).crop(int(self.scroll_x), int(self.scroll_x) + self.size.width)
 
-    def _pane_segments(self, offset: int, mine: bytes, other: bytes) -> list[Segment]:
+    def _pane_row(self, offset: int, mine: bytes, other: bytes) -> list[Segment]:
+        """One rendered pane row: *mine* styled against *other*."""
         bpl = self._bpl
         if not mine:
-            return [Segment(" " * self._pane_width(bpl))]
-        segs = [Segment(f"{offset:08x}", self._ST_ADDR), Segment("  ")]
+            return [Segment(" " * row_width(bpl))]
         styles = [
             self._ST_SAME if i < len(other) and other[i] == mine[i] else self._ST_DIFF
             for i in range(len(mine))
         ]
-        for i in range(bpl):
-            if i:
-                segs.append(Segment("  " if i % 8 == 0 else " "))
-            if i < len(mine):
-                segs.append(Segment(f"{mine[i]:02x}", styles[i]))
-            else:
-                segs.append(Segment("  "))
-        segs.append(Segment("  |"))
-        for i in range(bpl):
-            if i < len(mine):
-                c = mine[i]
-                segs.append(Segment(chr(c) if 0x20 <= c < 0x7F else ".", styles[i]))
-            else:
-                segs.append(Segment(" "))
-        segs.append(Segment("|"))
-        return segs
+        return row_segments(offset, mine, styles, bpl, self._ST_ADDR)
 
     # ── diff navigation ───────────────────────────────────────────────────────
 
@@ -259,11 +226,13 @@ class HexEditorView(ScrollView, can_focus=True):
 
     Only visible rows are read and rendered. The selected byte is blue, bytes
     with unsaved edits are yellow, and the last search match is magenta.
+
+    Row geometry (column positions, hit-testing) comes from
+    :mod:`cheerleader.tui.hexrender` so rendering and click mapping share
+    the same constants.
     """
 
     BPL = 16
-    _HEX_X = 10  # column where the first hex byte starts
-    _ASCII_X = _HEX_X + BPL * 3 + 3  # after hex block (47 + group gap) and "  |"
 
     BINDINGS: ClassVar[list[Binding]] = [
         Binding("left", "move(-1)", "←", show=False),
@@ -306,7 +275,7 @@ class HexEditorView(ScrollView, can_focus=True):
         self._doc = doc
         self.cursor = min(self.cursor, max(doc.size - 1, 0))
         self._match = None
-        self.virtual_size = Size(self._ASCII_X + self.BPL + 1, self._rows())
+        self.virtual_size = Size(row_width(self.BPL), self._rows())
         self.refresh()
         self.post_message(self.CursorMoved(self.cursor))
 
@@ -356,15 +325,7 @@ class HexEditorView(ScrollView, can_focus=True):
             return
         x = offset.x + int(self.scroll_x)
         row = offset.y + int(self.scroll_y)
-        col: int | None = None
-        if self._HEX_X <= x < self._HEX_X + self.BPL * 3:
-            rel = x - self._HEX_X
-            if rel >= 8 * 3:  # skip the extra gap between the two 8-byte groups
-                rel -= 1
-            if rel % 3 != 2:
-                col = rel // 3
-        elif self._ASCII_X <= x < self._ASCII_X + self.BPL:
-            col = x - self._ASCII_X
+        col = x_to_col(self.BPL, x)
         if col is not None and row * self.BPL + col < self._doc.size:
             self.move_to(row * self.BPL + col)
 
@@ -378,22 +339,8 @@ class HexEditorView(ScrollView, can_focus=True):
         data = self._doc.read(offset, self.BPL)
         styles = [self._byte_style(offset + i) for i in range(len(data))]
         cursor_row = offset <= self.cursor < offset + self.BPL
-        segs = [
-            Segment(f"{offset:08x}", self._ST_CURSOR_ADDR if cursor_row else self._ST_ADDR),
-            Segment("  "),
-        ]
-        for i in range(self.BPL):
-            if i:
-                segs.append(Segment("  " if i % 8 == 0 else " "))
-            segs.append(Segment(f"{data[i]:02x}", styles[i]) if i < len(data) else Segment("  "))
-        segs.append(Segment("  |"))
-        for i in range(self.BPL):
-            if i < len(data):
-                c = data[i]
-                segs.append(Segment(chr(c) if 0x20 <= c < 0x7F else ".", styles[i]))
-            else:
-                segs.append(Segment(" "))
-        segs.append(Segment("|"))
+        addr_style = self._ST_CURSOR_ADDR if cursor_row else self._ST_ADDR
+        segs = row_segments(offset, data, styles, self.BPL, addr_style)
         return Strip(segs).crop(int(self.scroll_x), int(self.scroll_x) + self.size.width)
 
     def _byte_style(self, offset: int) -> Style | None:
