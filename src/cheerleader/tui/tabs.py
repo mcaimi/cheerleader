@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import enum
-from typing import Any, NamedTuple
+from typing import Any, ClassVar, NamedTuple
 
 from textual import on, work
 from textual.app import ComposeResult
@@ -37,7 +37,8 @@ from cheerleader.tui.highlight import (
     _colorize_mnemonic,
     _colorize_operands,
     _fmt_addr,
-    _fmt_size,
+    human_size,
+    raw_hex,
 )
 from cheerleader.tui.screens import (
     AIResponseScreen,
@@ -52,6 +53,18 @@ from cheerleader.tui.widgets import (
     HexEditorView,
     HexPane,
 )
+
+
+class StatusMixin:
+    """Mixin for tab panes with a status ``Static`` line (``#<STATUS_ID>``)."""
+
+    STATUS_ID: ClassVar[str]
+
+    def _set_status(self, msg: str) -> None:
+        try:
+            self.query_one(f"#{self.STATUS_ID}", Static).update(msg)
+        except Exception:
+            pass
 
 
 class SegmentsTab(TabPane):
@@ -84,9 +97,9 @@ class SegmentsTab(TabPane):
             t.add_row(
                 seg.name,
                 f"0x{seg.vmaddr:016x}",
-                _fmt_size(seg.vmsize),
+                human_size(seg.vmsize),
                 f"0x{seg.fileoff:08x}",
-                _fmt_size(seg.filesize),
+                human_size(seg.filesize),
                 seg.prot_str,
                 str(len(seg.sections)),
             )
@@ -118,7 +131,7 @@ class SectionsTab(TabPane):
                     s.segment,
                     s.name,
                     f"0x{s.addr:016x}",
-                    _fmt_size(s.size),
+                    human_size(s.size),
                     f"0x{s.offset:08x}",
                     f"2^{s.align}",
                     s.type_str,
@@ -157,7 +170,11 @@ class LibrariesTab(TabPane):
             )
 
 
-class SymbolsTab(TabPane):
+class SymbolsTab(StatusMixin, TabPane):
+    """Symbol table view with type/external filters."""
+
+    STATUS_ID = "sym-status"
+
     FILTER_ALL = "all"
     FILTER_EXT = "external"
     FILTER_UNDEF = "undefined"
@@ -194,12 +211,6 @@ class SymbolsTab(TabPane):
         search.value = ""
         search.display = False
         self._apply_filter()
-
-    def _set_status(self, msg: str) -> None:
-        try:
-            self.query_one("#sym-status", Static).update(msg)
-        except Exception:
-            pass
 
     def _apply_filter(self) -> None:
         t = self._table
@@ -358,7 +369,9 @@ class ChainedFixupsTab(TabPane):
             event.stop()
 
 
-class StringsTab(TabPane):
+class StringsTab(StatusMixin, TabPane):
+    STATUS_ID = "str-status"
+
     def __init__(self) -> None:
         super().__init__("Strings", id="tab-strings")
         self._table: DataTable | None = None
@@ -388,12 +401,6 @@ class StringsTab(TabPane):
         self.app.call_from_thread(self._set_status, "Extracting strings…")
         strings = extract_strings(info)
         self.app.call_from_thread(self._populate, strings)
-
-    def _set_status(self, msg: str) -> None:
-        try:
-            self.query_one("#str-status", Static).update(msg)
-        except Exception:
-            pass
 
     def _populate(self, strings: list) -> None:
         self._all = strings
@@ -481,7 +488,9 @@ def _format_update(node_name: str, data: Any) -> list[str]:
     return lines
 
 
-class FuncReversingTab(TabPane):
+class FuncReversingTab(StatusMixin, TabPane):
+    STATUS_ID = "funcrev-status"
+
     def __init__(self, env_file: str | None = None, disasm_engine: str = "objdump") -> None:
         super().__init__("Function Reversing", id="tab-funcrev")
         self._info: BinaryInfo | None = None
@@ -593,10 +602,9 @@ class FuncReversingTab(TabPane):
         t.clear()
         arch = self._info.arch if self._info else ""
         for insn in func_instrs:
-            raw_hex = " ".join(f"{b:02x}" for b in insn.raw)
             t.add_row(
                 Text(f"0x{insn.addr:016x}", style="cyan"),
-                Text(raw_hex, style="dim"),
+                Text(raw_hex(insn.raw), style="dim"),
                 _colorize_mnemonic(insn.mnemonic),
                 _colorize_operands(insn.op_str, arch),
             )
@@ -689,14 +697,10 @@ class FuncReversingTab(TabPane):
     def _toggle_hex(self) -> None:
         self._hex_pane.toggle()
 
-    def _set_status(self, msg: str) -> None:
-        try:
-            self.query_one("#funcrev-status", Static).update(msg)
-        except Exception:
-            pass
 
+class DisasmTab(StatusMixin, TabPane):
+    STATUS_ID = "disasm-status"
 
-class DisasmTab(TabPane):
     def __init__(self, disasm_engine: str = "objdump") -> None:
         super().__init__("Disasm", id="tab-disasm")
         self._info: BinaryInfo | None = None
@@ -760,12 +764,6 @@ class DisasmTab(TabPane):
         graph = build_call_graph(self._info, instrs) if instrs else None
         self.app.call_from_thread(self._populate, seg, sect, instrs, graph)
 
-    def _set_status(self, msg: str) -> None:
-        try:
-            self.query_one("#disasm-status", Static).update(msg)
-        except Exception:
-            pass
-
     def _populate(self, seg: str, sect: str, instrs: list, graph) -> None:
         self._instrs = instrs
         self._call_graph = graph
@@ -780,10 +778,9 @@ class DisasmTab(TabPane):
             return
         arch = self._info.arch if self._info else ""
         for insn in instrs:
-            raw_hex = " ".join(f"{b:02x}" for b in insn.raw)
             t.add_row(
                 Text(f"0x{insn.addr:016x}", style="cyan"),
-                Text(raw_hex, style="dim"),
+                Text(raw_hex(insn.raw), style="dim"),
                 _colorize_mnemonic(insn.mnemonic),
                 _colorize_operands(insn.op_str, arch),
             )
@@ -858,14 +855,6 @@ class DisasmTab(TabPane):
         self.app.push_screen(CallFlowScreen(self._call_graph, func_name))
 
 
-def _human_size(size: int) -> str:
-    if size >= 1024 * 1024:
-        return f"{size / (1024 * 1024):.1f} MiB"
-    if size >= 1024:
-        return f"{size / 1024:.1f} KiB"
-    return f"{size} bytes"
-
-
 class _Op(enum.Enum):
     """Long-running hex-editor operations that block conflicting actions."""
 
@@ -887,8 +876,10 @@ class _Busy(NamedTuple):
     worker: Worker | None = None
 
 
-class HexEditorTab(TabPane):
+class HexEditorTab(StatusMixin, TabPane):
     """Overwrite-only hex editor; the file is read on demand, edits kept in memory until saved."""
+
+    STATUS_ID = "hexedit-status"
 
     BINDINGS = [
         Binding("enter", "edit", "Edit"),
@@ -960,7 +951,7 @@ class HexEditorTab(TabPane):
         doc = self._doc
         if doc is None:
             return
-        parts = [f"[dim]{doc.path}[/dim]  {_human_size(doc.size)}"]
+        parts = [f"[dim]{doc.path}[/dim]  {human_size(doc.size)}"]
         cur = self._view().cursor
         if not extra and self._note and self._note[0] == cur:
             extra = self._note[1]
@@ -974,12 +965,6 @@ class HexEditorTab(TabPane):
         if extra:
             parts.append(extra)
         self._set_status("  │  ".join(parts))
-
-    def _set_status(self, msg: str) -> None:
-        try:
-            self.query_one("#hexedit-status", Static).update(msg)
-        except Exception:
-            pass
 
     # ── editing ───────────────────────────────────────────────────────────────
 
@@ -1151,9 +1136,11 @@ class HexEditorTab(TabPane):
         self._update_status()
 
 
-class HexCompareTab(TabPane):
+class HexCompareTab(StatusMixin, TabPane):
     """Side-by-side hex diff; files are read on demand and the diff streams
     in a background worker, so multi-GB files display instantly."""
+
+    STATUS_ID = "hexcmp-status"
 
     def __init__(self) -> None:
         super().__init__("Hex Compare", id="tab-hexcmp")
@@ -1263,8 +1250,8 @@ class HexCompareTab(TabPane):
                 "  [dim]n/p → next/prev diff[/dim]"
             )
         self._set_status(
-            f"left {_human_size(left.size)} ({left.size:,})  "
-            f"right {_human_size(right.size)} ({right.size:,})  {diff_str}"
+            f"left {human_size(left.size)} ({left.size:,})  "
+            f"right {human_size(right.size)} ({right.size:,})  {diff_str}"
         )
 
     def _first_diff_offset(self, block: int) -> int:
@@ -1276,9 +1263,3 @@ class HexCompareTab(TabPane):
             (i for i, (x, y) in enumerate(zip(a, b)) if x != y),
             min(len(a), len(b)),
         )
-
-    def _set_status(self, msg: str) -> None:
-        try:
-            self.query_one("#hexcmp-status", Static).update(msg)
-        except Exception:
-            pass

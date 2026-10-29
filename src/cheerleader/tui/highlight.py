@@ -116,14 +116,22 @@ def _fmt_addr(v: int | None) -> str:
     return f"0x{v:016x}"
 
 
-def _fmt_size(v: int) -> str:
-    if v == 0:
-        return "0"
-    for unit in ("B", "KB", "MB", "GB"):
-        if v < 1024:
-            return f"{v} {unit}"
-        v //= 1024
-    return f"{v} TB"
+def human_size(size: int) -> str:
+    """Human-readable byte size: '300 bytes', '1.0 KiB', '336.5 MiB', '2.0 GiB'."""
+    if size >= 1024 * 1024 * 1024:
+        return f"{size / (1024 * 1024 * 1024):.1f} GiB"
+    if size >= 1024 * 1024:
+        return f"{size / (1024 * 1024):.1f} MiB"
+    if size >= 1024:
+        return f"{size / 1024:.1f} KiB"
+    return f"{size} bytes"
+
+
+def raw_hex(raw: bytes, limit: int | None = None) -> str:
+    """Hex byte string ("de ad be ef"), optionally truncated to *limit* bytes."""
+    if limit is not None:
+        raw = raw[:limit]
+    return " ".join(f"{b:02x}" for b in raw)
 
 
 def _esc_markup(s: str) -> str:
@@ -170,15 +178,13 @@ def _render_cfg(cfg: ControlFlowGraph) -> str:
         lines.append(f" ┌{'─' * inner}┐")
 
         for insn in block.instrs:
-            raw_hex = " ".join(f"{b:02x}" for b in insn.raw[:6])
-            if len(insn.raw) > 6:
-                raw_hex += "…"
-            row = f"  [dim]0x{insn.addr:x}[/dim]  {raw_hex:<20}  {_esc_markup(insn.mnemonic):<8}  {_esc_markup(insn.op_str)}"
-            plain_len = len(f"  0x{insn.addr:x}  {raw_hex:<20}  {insn.mnemonic:<8}  {insn.op_str}")
+            hex_str = raw_hex(insn.raw, limit=6) + ("…" if len(insn.raw) > 6 else "")
+            row = f"  [dim]0x{insn.addr:x}[/dim]  {hex_str:<20}  {_esc_markup(insn.mnemonic):<8}  {_esc_markup(insn.op_str)}"
+            plain_len = len(f"  0x{insn.addr:x}  {hex_str:<20}  {insn.mnemonic:<8}  {insn.op_str}")
             if plain_len > inner:
                 budget = inner - (plain_len - len(insn.op_str)) - 1
                 row = (
-                    f"  [dim]0x{insn.addr:x}[/dim]  {raw_hex:<20}  "
+                    f"  [dim]0x{insn.addr:x}[/dim]  {hex_str:<20}  "
                     f"{_esc_markup(insn.mnemonic):<8}  "
                     f"{_esc_markup(insn.op_str[:max(0, budget)])}…"
                 )
