@@ -14,7 +14,11 @@ STAGE_VENV := $(BUILD_DIR)/venv
 SP_DIR     := $(STAGE_VENV)/lib/python3.11/site-packages
 ARTIFACT   := cheerleader-$(VERSION)-$(PLATFORM)
 
-.PHONY: standalone standalone-test standalone-tui-test clean
+.PHONY: standalone standalone-test standalone-tui-test test clean
+
+## Run the unit tests
+test:
+	uv run pytest
 
 ## Build the standalone single-file CLI into $(DIST)/
 standalone:
