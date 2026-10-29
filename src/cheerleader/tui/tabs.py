@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any
+import enum
+from typing import Any, NamedTuple
 
 from textual import on, work
 from textual.app import ComposeResult
@@ -10,11 +11,17 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.widgets import DataTable, Input, Label, ListItem, ListView, Static, TabPane
-from textual.worker import get_current_worker
+from textual.worker import Worker, get_current_worker
 from rich.markup import escape
 from rich.text import Text
 
-from cheerleader.libs.cfg import CallGraph, build_call_graph, build_cfg
+from cheerleader.libs.cfg import (
+    CallGraph,
+    build_call_graph,
+    build_cfg,
+    func_bounds,
+    slice_function_instrs,
+)
 from cheerleader.libs.disasm import disassemble_all_sections, disassemble_section, extract_strings
 from cheerleader.libs.hexdoc import DIFF_BLOCK, HexDocument, iter_diff
 from cheerleader.libs.types import (
@@ -574,20 +581,10 @@ class FuncReversingTab(TabPane):
 
     def _show_function(self, name: str, addr: int) -> None:
         try:
-            pos = self._sorted_func_addrs.index(addr)
+            _, next_addr = func_bounds(self._sorted_func_addrs, addr)
         except ValueError:
             return
-        next_addr = (
-            self._sorted_func_addrs[pos + 1]
-            if pos + 1 < len(self._sorted_func_addrs)
-            else None
-        )
-        func_instrs = [
-            i
-            for i in self._instrs
-            if i.addr >= addr
-            and (next_addr is None or i.addr < next_addr)
-        ]
+        func_instrs = slice_function_instrs(self._instrs, addr, next_addr)
         self._current_func_name = name
         self._current_func_instrs = func_instrs
         t = self._table
@@ -832,17 +829,8 @@ class DisasmTab(TabPane):
             )
             return
         func_name, func_addr = result
-
-        sa = self._call_graph._sorted_addrs
-        pos = sa.index(func_addr)
-        next_func_addr = sa[pos + 1] if pos + 1 < len(sa) else None
-
-        func_instrs = [
-            i
-            for i in self._instrs
-            if i.addr >= func_addr
-            and (next_func_addr is None or i.addr < next_func_addr)
-        ]
+        _, next_func_addr = self._call_graph.func_range(func_addr)
+        func_instrs = slice_function_instrs(self._instrs, func_addr, next_func_addr)
         if not func_instrs:
             self.app.notify("No instructions found for this function", timeout=3)
             return
@@ -878,6 +866,27 @@ def _human_size(size: int) -> str:
     return f"{size} bytes"
 
 
+class _Op(enum.Enum):
+    """Long-running hex-editor operations that block conflicting actions."""
+
+    SAVE = "saving"
+    SEARCH = "searching"
+
+
+class _Busy(NamedTuple):
+    """In-flight operation marker.
+
+    *worker* identifies the owning worker so completion callbacks from a
+    superseded search (exclusive group cancels it, but an already-posted
+    ``call_from_thread`` can still land) are recognized as stale and
+    dropped. The exclusive worker group plus this identity check replaces
+    the previous generation counter.
+    """
+
+    op: _Op
+    worker: Worker | None = None
+
+
 class HexEditorTab(TabPane):
     """Overwrite-only hex editor; the file is read on demand, edits kept in memory until saved."""
 
@@ -899,11 +908,10 @@ class HexEditorTab(TabPane):
     def __init__(self) -> None:
         super().__init__("Hex Editor", id="tab-hexedit")
         self._doc: HexDocument | None = None
-        self._busy: str | None = None
+        self._busy: _Busy | None = None
         self._search_mode = "offset"
         self._search_raw = ""
         self._pattern: bytes | None = None
-        self._search_gen = 0
         # Status note shown while the cursor stays on the given offset.
         self._note: tuple[int, str] | None = None
 
@@ -937,8 +945,8 @@ class HexEditorTab(TabPane):
     def _refuse_if_busy(self) -> bool:
         if self._doc is None:
             return True
-        if self._busy:
-            self.app.notify(f"Busy {self._busy}…", timeout=2)
+        if self._busy is not None:
+            self.app.notify(f"Busy {self._busy.op.value}…", timeout=2)
             return True
         return False
 
@@ -1013,7 +1021,7 @@ class HexEditorTab(TabPane):
 
         def _chosen(path: str | None) -> None:
             if path:
-                self._busy = "saving"
+                self._busy = _Busy(_Op.SAVE)
                 self._run_save(path)
 
         self.app.push_screen(SavePrompt(f"{self._doc.path}.patched"), _chosen)
@@ -1076,22 +1084,24 @@ class HexEditorTab(TabPane):
         self._start_search(forward=bool(forward))
 
     def action_cancel_search(self) -> None:
-        if self._busy == "searching":
+        if self._busy is not None and self._busy.op is _Op.SEARCH:
             self.workers.cancel_group(self, "hexsearch")
             self._busy = None
             self._note = (self._view().cursor, "search cancelled")
             self._update_status()
 
     def _start_search(self, forward: bool) -> None:
-        if self._doc is None or self._busy == "saving":
+        if self._doc is None or (self._busy is not None and self._busy.op is _Op.SAVE):
             self._refuse_if_busy()
             return
-        self._busy = "searching"
-        self._search_gen += 1
-        self._run_search(self._pattern, self._view().cursor, forward, self._search_gen)
+        # Restarting while a search runs is allowed: the exclusive worker
+        # group cancels the old run, and the worker handle stored in _Busy
+        # lets _search_done drop its (stale) completion callback.
+        worker = self._run_search(self._pattern, self._view().cursor, forward)
+        self._busy = _Busy(_Op.SEARCH, worker)
 
     @work(thread=True, exclusive=True, group="hexsearch")
-    def _run_search(self, pattern: bytes, cur: int, forward: bool, gen: int) -> None:
+    def _run_search(self, pattern: bytes, cur: int, forward: bool) -> None:
         worker = get_current_worker()
         doc = self._doc
         last = [-1]
@@ -1118,10 +1128,11 @@ class HexEditorTab(TabPane):
                 wrapped = True
                 hit = doc.rfind(pattern, cur, doc.size, cancelled=_cancelled, progress=_progress)
         if not worker.is_cancelled:
-            self.app.call_from_thread(self._search_done, gen, hit, n, wrapped)
+            self.app.call_from_thread(self._search_done, worker, hit, n, wrapped)
 
-    def _search_done(self, gen: int, hit: int | None, n: int, wrapped: bool) -> None:
-        if gen != self._search_gen:
+    def _search_done(self, worker: Worker, hit: int | None, n: int, wrapped: bool) -> None:
+        # Drop stale callbacks from a superseded/cancelled search run.
+        if self._busy is None or self._busy.op is not _Op.SEARCH or self._busy.worker is not worker:
             return
         self._busy = None
         view = self._view()

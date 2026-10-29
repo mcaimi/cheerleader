@@ -404,3 +404,90 @@ class TestPaging:
         for t in threads:
             t.join()
         assert errors == []
+
+
+# ── SparseOverlay ─────────────────────────────────────────────────────────────
+
+
+class TestSparseOverlay:
+    def test_set_and_get_roundtrip(self):
+        ov = hexdoc.SparseOverlay()
+        assert not ov
+        assert len(ov) == 0
+        ov.set(10, 0xAB)
+        assert bool(ov)
+        assert len(ov) == 1
+        assert 10 in ov
+        assert ov.get(10) == 0xAB
+        assert ov.get(9) is None
+        assert ov.get(9, 0x42) == 0x42
+
+    def test_set_same_offset_twice_no_duplicate_keys(self):
+        ov = hexdoc.SparseOverlay()
+        ov.set(5, 0x01)
+        ov.set(5, 0x02)
+        assert len(ov) == 1
+        assert ov.get(5) == 0x02
+        assert ov.keys_in_range(0, 100) == [5]
+
+    def test_set_none_removes(self):
+        ov = hexdoc.SparseOverlay()
+        ov.set(5, 0x01)
+        ov.set(5, None)
+        assert 5 not in ov
+        assert ov.get(5) is None
+        assert len(ov) == 0
+        assert ov.keys_in_range(0, 100) == []
+
+    def test_set_none_absent_is_noop(self):
+        ov = hexdoc.SparseOverlay()
+        ov.set(5, None)
+        assert len(ov) == 0
+
+    def test_keys_in_range_boundaries(self):
+        ov = hexdoc.SparseOverlay()
+        for off in (10, 20, 30, 40):
+            ov.set(off, 0xFF)
+        assert ov.keys_in_range(0, 100) == [10, 20, 30, 40]
+        assert ov.keys_in_range(0, 0) == []
+        assert ov.keys_in_range(11, 20) == []   # start exclusive of 10, end exclusive of 20
+        assert ov.keys_in_range(10, 20) == [10]
+        assert ov.keys_in_range(10, 21) == [10, 20]
+        assert ov.keys_in_range(31, 39) == []  # gap between 30 and 40
+        assert ov.keys_in_range(30, 31) == [30]
+        assert ov.keys_in_range(41, 100) == []
+
+    def test_keys_stay_sorted_after_mixed_ops(self):
+        ov = hexdoc.SparseOverlay()
+        for off in (50, 10, 30, 20, 40):
+            ov.set(off, 0x01)
+        for off in (30, 10):
+            ov.set(off, None)
+        ov.set(25, 0x02)
+        ov.set(25, None)
+        ov.set(5, 0x03)
+        # the core invariant: _keys is always the sorted keys of _values
+        assert ov._keys == sorted(ov._values)
+        assert ov.keys_in_range(0, 100) == [5, 20, 40, 50]
+
+    def test_clear(self):
+        ov = hexdoc.SparseOverlay()
+        for off in (1, 2, 3):
+            ov.set(off, 0xFF)
+        ov.clear()
+        assert not ov and len(ov) == 0
+        assert ov.keys_in_range(0, 10) == []
+
+    def test_document_uses_overlay(self, doc):
+        assert isinstance(doc._edits, hexdoc.SparseOverlay)
+        doc.write(5, b"\xaa\xbb")
+        doc.write(7, b"\xcc")
+        assert doc._edits.get(5) == 0xAA
+        assert doc._edits.get(6) == 0xBB
+        assert doc._edits.get(7) == 0xCC
+        assert doc.edit_count == len(doc._edits) == 3
+        # undo pops the last write (byte 7) via the overlay
+        doc.undo()
+        assert doc._edits.get(7) is None
+        assert doc._edits.get(6) == 0xBB
+        assert doc.modified

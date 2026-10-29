@@ -22,8 +22,68 @@ CancelFn = Callable[[], bool]
 ProgressFn = Callable[[float], None]
 
 
+class SparseOverlay:
+    """Sparse byte overlay: pending edits as ``{offset: new_value}``.
+
+    Owns the parallel-bookkeeping invariant: ``_keys`` is always the sorted
+    list of ``_values``' keys. All mutations go through :meth:`set` and
+    :meth:`clear`, so consumers never touch the two containers directly.
+    """
+
+    def __init__(self) -> None:
+        self._values: dict[int, int] = {}
+        self._keys: list[int] = []  # sorted keys of _values
+
+    def __bool__(self) -> bool:
+        return bool(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def __contains__(self, offset: object) -> bool:
+        return offset in self._values
+
+    def get(self, offset: int, default: int | None = None) -> int | None:
+        """Overlay value at *offset*, or *default* if that byte is unedited."""
+        return self._values.get(offset, default)
+
+    def keys_in_range(self, start: int, end: int) -> list[int]:
+        """Sorted edited offsets in ``[start, end)``."""
+        lo = bisect_left(self._keys, start)
+        hi = bisect_left(self._keys, end)
+        return self._keys[lo:hi]
+
+    def set(self, offset: int, value: int | None) -> None:
+        """Set the overlay byte at *offset*; ``None`` removes the entry.
+
+        Removing an absent offset is a no-op.
+        """
+        if value is None:
+            if offset in self._values:
+                del self._values[offset]
+                self._keys.pop(bisect_left(self._keys, offset))
+            return
+        if offset not in self._values:
+            insort(self._keys, offset)
+        self._values[offset] = value
+
+    def clear(self) -> None:
+        self._values.clear()
+        self._keys.clear()
+
+
 class HexDocument:
-    """File bytes read on demand in pages, with a sparse overlay of pending edits."""
+    """File bytes read on demand in pages, with a sparse overlay of pending edits.
+
+    Threading contract: ``_pages`` is guarded by ``_pages_lock`` so worker
+    threads (search, diff) may read concurrently with the UI thread. The
+    edit overlay and undo stack are *not* locked: they are mutated only by
+    the owning (UI) thread, and worker reads of already-published edits are
+    safe under the GIL. Mutating the document while a worker operation is
+    in flight is a caller error — the hex editor refuses conflicting
+    actions, and a re-opened document raises ``OSError``/``ValueError`` in
+    the worker (callers treat that as cancellation).
+    """
 
     def __init__(self, path: str) -> None:
         self.path = path
@@ -31,8 +91,7 @@ class HexDocument:
         self.size = os.fstat(self._fh.fileno()).st_size
         self._pages: OrderedDict[int, bytes] = OrderedDict()
         self._pages_lock = threading.Lock()
-        self._edits: dict[int, int] = {}
-        self._edit_keys: list[int] = []  # sorted keys of _edits
+        self._edits = SparseOverlay()
         self._undo: list[list[tuple[int, int | None]]] = []
 
     def close(self) -> None:
@@ -69,13 +128,12 @@ class HexDocument:
         return b"".join(parts)
 
     def _apply_edits(self, offset: int, data: bytes) -> bytes:
-        lo = bisect_left(self._edit_keys, offset)
-        hi = bisect_left(self._edit_keys, offset + len(data))
-        if lo == hi:
+        keys = self._edits.keys_in_range(offset, offset + len(data))
+        if not keys:
             return data
         buf = bytearray(data)
-        for key in self._edit_keys[lo:hi]:
-            buf[key - offset] = self._edits[key]
+        for key in keys:
+            buf[key - offset] = self._edits.get(key)
         return bytes(buf)
 
     def read(self, offset: int, n: int) -> bytes:
@@ -100,13 +158,9 @@ class HexDocument:
 
     def _set(self, offset: int, value: int | None) -> None:
         if value is None or value == self.original(offset):
-            if offset in self._edits:
-                del self._edits[offset]
-                self._edit_keys.pop(bisect_left(self._edit_keys, offset))
+            self._edits.set(offset, None)  # remove if present
             return
-        if offset not in self._edits:
-            insort(self._edit_keys, offset)
-        self._edits[offset] = value
+        self._edits.set(offset, value)
 
     def write(self, offset: int, data: bytes) -> None:
         """Overwrite bytes starting at *offset*; the file never grows."""
@@ -162,7 +216,6 @@ class HexDocument:
         with self._pages_lock:
             self._pages.clear()
         self._edits.clear()
-        self._edit_keys.clear()
         self._undo.clear()
 
     # ── searching ─────────────────────────────────────────────────────────────
