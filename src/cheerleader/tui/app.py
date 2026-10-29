@@ -20,6 +20,7 @@ from cheerleader.tui.tabs import (
     DisasmTab,
     ExportsTab,
     FuncReversingTab,
+    HexCompareTab,
     HexEditorTab,
     LibrariesTab,
     SectionsTab,
@@ -61,6 +62,7 @@ class DisasmApp(App):
         path: str,
         env_file: str | None = None,
         hex_mode: bool = False,
+        hex_compare: str | None = None,
         disasm_engine: str = "objdump",
     ) -> None:
         super().__init__()
@@ -70,12 +72,16 @@ class DisasmApp(App):
         self._slices: list[tuple[int, str]] = []
         self._env_file = env_file
         self._hex_mode = hex_mode
+        self._hex_compare = hex_compare
         self._disasm_engine = disasm_engine
         self._pending_reload_notify = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        if self._hex_mode:
+        if self._hex_compare:
+            with TabbedContent(id="main-tabs"):
+                yield HexCompareTab()
+        elif self._hex_mode:
             with TabbedContent(id="main-tabs"):
                 yield HexEditorTab()
         else:
@@ -93,6 +99,13 @@ class DisasmApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        if self._hex_compare:
+            self.title = "CHEERLEADER — hex compare"
+            self.sub_title = (
+                f"{os.path.basename(self._path)} ⇄ {os.path.basename(self._hex_compare)}"
+            )
+            self.query_one(HexCompareTab).load(self._path, self._hex_compare)
+            return
         if self._hex_mode:
             self.title = "CHEERLEADER — hex editor"
             self.sub_title = os.path.basename(self._path)
@@ -106,6 +119,9 @@ class DisasmApp(App):
         self._load()
 
     def _load(self) -> None:
+        if self._hex_compare:
+            self.query_one(HexCompareTab).load(self._path, self._hex_compare)
+            return
         if self._hex_mode:
             self.query_one(HexEditorTab).load(self._path)
             return
@@ -165,7 +181,7 @@ class DisasmApp(App):
     def check_action(
         self, action: str, parameters: tuple[object, ...]
     ) -> bool | None:
-        if self._hex_mode and action in ("tab", "slice"):
+        if (self._hex_mode or self._hex_compare) and action in ("tab", "slice"):
             return False
         return True
 

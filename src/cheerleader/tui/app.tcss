@@ -92,6 +92,12 @@ CFGScreen {
     background: $panel;
     dock: bottom;
 }
+#hexcmp-status {
+    height: 1;
+    padding: 0 1;
+    background: $panel;
+    dock: bottom;
+}
 #disasm-body {
     height: 1fr;
 }

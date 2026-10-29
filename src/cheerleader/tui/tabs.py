@@ -27,7 +27,12 @@ from cheerleader.tui.highlight import (
     _fmt_size,
 )
 from cheerleader.tui.screens import AIResponseScreen, CallFlowScreen, CFGScreen
-from cheerleader.tui.widgets import HexPane, build_hex_dump
+from cheerleader.tui.widgets import (
+    HexCompareView,
+    HexPane,
+    build_hex_dump,
+    compute_diff_blocks,
+)
 
 
 class SegmentsTab(TabPane):
@@ -853,6 +858,14 @@ class DisasmTab(TabPane):
         self.app.push_screen(CallFlowScreen(self._call_graph, func_name))
 
 
+def _human_size(size: int) -> str:
+    if size >= 1024 * 1024:
+        return f"{size / (1024 * 1024):.1f} MiB"
+    if size >= 1024:
+        return f"{size / 1024:.1f} KiB"
+    return f"{size} bytes"
+
+
 class HexEditorTab(TabPane):
     def __init__(self) -> None:
         super().__init__("Hex Editor", id="tab-hexedit")
@@ -878,12 +891,7 @@ class HexEditorTab(TabPane):
     def _display(self, data: bytes, dump: str) -> None:
         self.query_one("#hexedit-content", Static).update(dump)
         size = len(data)
-        if size >= 1024 * 1024:
-            size_str = f"{size / (1024 * 1024):.1f} MiB"
-        elif size >= 1024:
-            size_str = f"{size / 1024:.1f} KiB"
-        else:
-            size_str = f"{size} bytes"
+        size_str = _human_size(size)
         self._set_status(
             f"[dim]{self._path}[/dim]  {size_str}  ({size:,} bytes)"
         )
@@ -891,5 +899,63 @@ class HexEditorTab(TabPane):
     def _set_status(self, msg: str) -> None:
         try:
             self.query_one("#hexedit-status", Static).update(msg)
+        except Exception:
+            pass
+
+
+class HexCompareTab(TabPane):
+    def __init__(self) -> None:
+        super().__init__("Hex Compare", id="tab-hexcmp")
+
+    def compose(self) -> ComposeResult:
+        yield HexCompareView(id="hexcmp-view")
+        yield Static("", id="hexcmp-status")
+
+    def load(self, left_path: str, right_path: str) -> None:
+        self._load_files(left_path, right_path)
+
+    @work(thread=True, exclusive=True)
+    def _load_files(self, left_path: str, right_path: str) -> None:
+        self.app.call_from_thread(self._set_status, "Loading…")
+        with open(left_path, "rb") as f:
+            left = f.read()
+        with open(right_path, "rb") as f:
+            right = f.read()
+        diff_blocks, diff_bytes = compute_diff_blocks(left, right)
+        self.app.call_from_thread(
+            self._display, left_path, right_path, left, right, diff_blocks, diff_bytes
+        )
+
+    def _display(
+        self,
+        left_path: str,
+        right_path: str,
+        left: bytes,
+        right: bytes,
+        diff_blocks: list[int],
+        diff_bytes: int,
+    ) -> None:
+        view = self.query_one(HexCompareView)
+        view.set_data(left, right, left_path, right_path, diff_blocks)
+        view.focus()
+        if diff_blocks:
+            a, b = left[diff_blocks[0] * 8 :], right[diff_blocks[0] * 8 :]
+            first = diff_blocks[0] * 8 + next(
+                (i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b))
+            )
+            diff_str = (
+                f"[red]{diff_bytes:,} differing bytes[/red]  first at 0x{first:08x}"
+                "  [dim]n/p → next/prev diff[/dim]"
+            )
+        else:
+            diff_str = "[green]files are identical[/green]"
+        self._set_status(
+            f"left {_human_size(len(left))} ({len(left):,})  "
+            f"right {_human_size(len(right))} ({len(right):,})  {diff_str}"
+        )
+
+    def _set_status(self, msg: str) -> None:
+        try:
+            self.query_one("#hexcmp-status", Static).update(msg)
         except Exception:
             pass

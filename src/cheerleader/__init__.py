@@ -12,11 +12,19 @@ def main() -> None:
         description="Binary inspector TUI",
     )
     parser.add_argument("binary", help="path to the binary to inspect")
-    parser.add_argument(
+    hex_group = parser.add_mutually_exclusive_group()
+    hex_group.add_argument(
         "--hex",
         action="store_true",
         default=False,
         help="open in hex editor mode (raw file hex dump only)",
+    )
+    hex_group.add_argument(
+        "--hex-compare",
+        default=None,
+        metavar="TARGET_FILE",
+        dest="hex_compare",
+        help="open in hex compare mode: side-by-side diff of binary vs TARGET_FILE",
     )
     parser.add_argument(
         "--env",
@@ -44,16 +52,19 @@ def main() -> None:
             )
             sys.exit(1)
 
-    try:
-        open(args.binary, "rb").close()
-    except OSError as e:
-        print(f"Error: {e}")
-        sys.exit(1)
+    for path in (args.binary, args.hex_compare):
+        if path is None:
+            continue
+        try:
+            open(path, "rb").close()
+        except OSError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
 
     from cheerleader.formats import detect_format
 
     fmt = detect_format(args.binary)
-    if fmt == "unknown":
+    if fmt == "unknown" and not args.hex_compare:
         print("Warning: unrecognised binary format — continuing anyway")
 
     from cheerleader.tui import DisasmApp
@@ -62,6 +73,7 @@ def main() -> None:
         args.binary,
         env_file=args.env,
         hex_mode=args.hex,
+        hex_compare=args.hex_compare,
         disasm_engine=args.disasm_engine,
     )
     app.run()
