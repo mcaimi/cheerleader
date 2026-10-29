@@ -120,6 +120,25 @@ class MachOInfo(BinaryInfo):
     rpaths: list[str] = field(default_factory=list)
     dylinker: Optional[str] = None
 
+    def info_meta_lines(self) -> list[list[tuple[str, str]]]:
+        """Mach-O metadata for the info bar: version/build info on the first
+        line, then linker and RPATH lines (only when present)."""
+        first = []
+        if self.uuid:
+            first.append(("UUID", self.uuid))
+        if self.min_os:
+            first.append(("Min OS", self.min_os))
+        if self.sdk:
+            first.append(("SDK", self.sdk))
+        if self.source_version:
+            first.append(("SrcVer", self.source_version))
+        lines: list[list[tuple[str, str]]] = [first] if first else []
+        if self.dylinker:
+            lines.append([("Linker", self.dylinker)])
+        if self.rpaths:
+            lines.append([("RPATHs", "  ".join(self.rpaths))])
+        return lines
+
 
 def _ver(v: int) -> str:
     return f"{(v >> 16) & 0xFFFF}.{(v >> 8) & 0xFF}.{v & 0xFF}"

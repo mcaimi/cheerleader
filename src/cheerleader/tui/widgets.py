@@ -373,22 +373,8 @@ class InfoBar(Horizontal):
             f"[green]{info.bits}-bit[/green]  "
             f"[yellow]{info.file_type}[/yellow]",
         ]
-        # Mach-O specific metadata
-        from cheerleader.formats.macho import MachOInfo
-        if isinstance(info, MachOInfo):
-            meta = []
-            if info.uuid:
-                meta.append(f"UUID: [dim]{info.uuid}[/dim]")
-            if info.min_os:
-                meta.append(f"Min OS: [dim]{info.min_os}[/dim]")
-            if info.sdk:
-                meta.append(f"SDK: [dim]{info.sdk}[/dim]")
-            if info.source_version:
-                meta.append(f"SrcVer: [dim]{info.source_version}[/dim]")
-            if meta:
-                lines.append("  ".join(meta))
-            if info.dylinker:
-                lines.append(f"Linker: [dim]{info.dylinker}[/dim]")
-            if info.rpaths:
-                lines.append("RPATHs: " + "  ".join(f"[dim]{r}[/dim]" for r in info.rpaths))
+        for pairs in info.info_meta_lines():
+            lines.append(
+                "  ".join(f"{label}: [dim]{value}[/dim]" for label, value in pairs)
+            )
         self.query_one("#info-bar-text", Static).update("\n".join(lines))

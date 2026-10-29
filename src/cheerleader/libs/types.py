@@ -163,3 +163,9 @@ class BinaryInfo:
     chained_fixups: list[ChainedFixup] = field(default_factory=list)
     exports: list[dict] = field(default_factory=list)
     error: Optional[str] = None
+
+    def info_meta_lines(self) -> list[list[tuple[str, str]]]:
+        """Format-specific metadata for the TUI info bar: one list of
+        (label, value) pairs per rendered line. The base class adds none;
+        format subclasses (e.g. MachOInfo) override this."""
+        return []
