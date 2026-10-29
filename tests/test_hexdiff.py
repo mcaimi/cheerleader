@@ -1,12 +1,16 @@
-"""Tests for compute_diff_blocks (hex-compare diff kernel).
+"""Tests for the diff kernel: compute_diff_blocks and the streaming iter_diff.
 
 Bytes past the end of the shorter input count as differing; blocks are
-DIFF_BLOCK (8) - byte granular.
+DIFF_BLOCK (8) - byte granular. The streaming ``iter_diff`` must accumulate
+to exactly the same result as ``compute_diff_blocks`` over the full buffers.
 """
 
 from __future__ import annotations
 
-from cheerleader.tui.widgets import compute_diff_blocks
+import pytest
+
+from cheerleader.libs import hexdoc
+from cheerleader.libs.hexdoc import HexDocument, compute_diff_blocks, iter_diff
 
 DIFF_BLOCK = 8
 
@@ -125,3 +129,112 @@ class TestChunkBoundary:
     def test_identical_across_many_chunks(self):
         data = bytes(range(256)) * 32  # 8192 bytes
         assert compute_diff_blocks(data, data) == ([], 0)
+
+
+class TestIterDiff:
+    """The streaming two-document diff must accumulate to exactly the same
+    result as compute_diff_blocks over the full buffers."""
+
+    @staticmethod
+    def _docs(tmp_path, left: bytes, right: bytes) -> tuple[HexDocument, HexDocument]:
+        lp = tmp_path / "left.bin"
+        lp.write_bytes(left)
+        rp = tmp_path / "right.bin"
+        rp.write_bytes(right)
+        return HexDocument(str(lp)), HexDocument(str(rp))
+
+    @staticmethod
+    def _collect(left: HexDocument, right: HexDocument, **kwargs):
+        blocks: list[int] = []
+        total = 0
+        last_frac = -1.0
+        fracs: list[float] = []
+        for new_blocks, n, frac in iter_diff(left, right, **kwargs):
+            blocks.extend(new_blocks)
+            total += n
+            last_frac = frac
+            fracs.append(frac)
+        return blocks, total, last_frac, fracs
+
+    def test_identical_files(self, tmp_path):
+        data = bytes(range(256)) * 3
+        l, r = self._docs(tmp_path, data, data)
+        blocks, total, last_frac, _ = self._collect(l, r)
+        assert blocks == []
+        assert total == 0
+        assert last_frac == 1.0
+        l.close()
+        r.close()
+
+    def test_both_empty(self, tmp_path):
+        l, r = self._docs(tmp_path, b"", b"")
+        blocks, total, _, fracs = self._collect(l, r)
+        assert blocks == [] and total == 0 and fracs == []
+        l.close()
+        r.close()
+
+    def test_one_empty(self, tmp_path):
+        l, r = self._docs(tmp_path, b"", b"abcdefghij")
+        blocks, total, _, _ = self._collect(l, r)
+        exp_blocks, exp_total = compute_diff_blocks(b"", b"abcdefghij")
+        assert (blocks, total) == (exp_blocks, exp_total) == ([0, 1], 10)
+        l.close()
+        r.close()
+
+    def test_progress_advances(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(hexdoc, "DIFF_SCAN_CHUNK", 16)
+        l, r = self._docs(tmp_path, b"\x00" * 100, b"\x00" * 100)
+        _, _, _, fracs = self._collect(l, r)
+        assert fracs == sorted(fracs)
+        assert fracs[-1] == pytest.approx(1.0)
+        l.close()
+        r.close()
+
+    def test_cancelled_yields_nothing(self, tmp_path):
+        l, r = self._docs(tmp_path, b"x" * 100, b"y" * 100)
+        blocks, total, _, _ = self._collect(l, r, cancelled=lambda: True)
+        assert blocks == [] and total == 0
+        l.close()
+        r.close()
+
+    def test_matches_full_buffer_diff(self, tmp_path, monkeypatch):
+        # golden equivalence across boundary-straddling size combinations,
+        # with multi-page reads (PAGE_SIZE shrunk) and a small scan chunk
+        monkeypatch.setattr(hexdoc, "PAGE_SIZE", 32)
+        scan = 16
+        base = bytes(range(30))
+        cases = [
+            (b"", b""),
+            (b"", b"abcdefghij"),
+            (b"abcdefghij", b""),
+            (base, base),  # identical
+            (base, base[:20] + bytes(range(100, 117))),  # same prefix, longer right
+            (base[:15] + bytes([0xFF]) + base[16:20], base[:20]),  # diff in last common block
+            (bytes(8) + b"\xff" + bytes(6), bytes(9)),  # tail-block dedup (15 vs 9 bytes)
+            (bytes(range(50)), bytes(range(50, 100))),  # all different, multi-chunk
+            (bytes(range(50)), bytes(range(50))[:48] + b"\xff\xff"),  # sparse multi-chunk diffs
+            (bytes(range(16)), bytes(range(16)) + b"extra"),  # exact-block boundary tail
+        ]
+        for i, (ld, rd) in enumerate(cases):
+            l, r = self._docs(tmp_path, ld, rd, )
+            blocks, total, _, _ = self._collect(l, r, scan_chunk=scan)
+            exp_blocks, exp_total = compute_diff_blocks(ld, rd)
+            assert blocks == exp_blocks, f"case {i}: blocks mismatch"
+            assert total == exp_total, f"case {i}: byte count mismatch"
+            l.close()
+            r.close()
+
+    def test_sparse_diffs_across_scan_chunks(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(hexdoc, "DIFF_SCAN_CHUNK", 16)
+        size = 100
+        left = bytes(size)
+        right = bytearray(bytes(size))
+        for off in (5, 40, 97):
+            right[off] = 0xAB
+        l, r = self._docs(tmp_path, left, bytes(right))
+        blocks, total, _, _ = self._collect(l, r)
+        assert blocks == [0, 5, 12]  # 5//8, 40//8, 97//8
+        assert total == 3
+        l.close()
+        r.close()
+
