@@ -101,8 +101,10 @@ virtualenv needed. On first run the zipapp unpacks itself into `~/.shiv`
 Notes:
 
 - The default disassembly backend uses the system `objdump` (binutils / OS X
-  tools). capstone is bundled, so `--disasm-engine=capstone` needs no system
-  disassembler.
+  tools; GNU objdump preferred on Linux, llvm-objdump on macOS). capstone is
+  bundled, so `--disasm-engine=capstone` needs no system disassembler.
+  `DEBUGINFOD_URLS` is always stripped from the objdump environment (see
+  [Disassembly backends](#7--disasm)).
 - AI features are optional: copy `env.template` to `.env` (or pass
   `--env FILE`) and fill in the LLM settings. Without it the TUI works
   normally and the AI tab reports the missing configuration.
@@ -302,7 +304,7 @@ Dynamic pointer fixups resolved at load time.
 
 ### 7 · Disasm
 
-Interactive disassembler powered by [capstone](https://www.capstone-engine.org/). The tab shows two panels:
+Interactive disassembler backed by the system `objdump` (default) or [capstone](https://www.capstone-engine.org/) (`--disasm-engine=capstone`). The tab shows two panels:
 
 - **Left (28 cols)**: list of all sections in executable segments (`initprot & 0x4`). For Mach-O, `__TEXT,__text` is selected automatically on load.
 - **Right**: disassembly table for the selected section. Populated in a background thread so the UI stays responsive for large sections.
@@ -315,6 +317,22 @@ Interactive disassembler powered by [capstone](https://www.capstone-engine.org/)
 | Operands | Decoded operands in AT&T / Intel / ARM syntax             |
 
 The status bar at the bottom shows the section name, instruction count, and the `c → call flow   f → cfg` hints once disassembly completes.
+
+#### Disassembly backends
+
+Two disassembly engines are available:
+
+| Backend    | Flag                       | Notes                                                       |
+|------------|----------------------------|-------------------------------------------------------------|
+| `objdump`  | default                    | Shells out to the system `objdump` / `llvm-objdump` binary  |
+| `capstone` | `--disasm-engine=capstone` | Fully self-contained (bundled dependency, no system tools)  |
+
+Engine selection for the `objdump` backend:
+
+- **macOS**: `llvm-objdump` is preferred (it handles Mach-O slices well), falling back to `objdump`.
+- **Linux / other**: GNU `objdump` is preferred, falling back to `llvm-objdump`.
+
+> **Note (debuginfod):** when `DEBUGINFOD_URLS` is set in the environment, LLVM ≥ 23's `llvm-objdump` treats a stripped binary as incomplete, silently downloads a full copy from the debuginfod server using the build ID, and disassembles *that* instead of the given file. The downloaded debug file carries no section contents (`SHT_NOBITS`), so llvm-objdump emits a bare `...` with **no instruction lines** — cheerleader would report *"No output — objdump unavailable or section unreadable"*. To keep disassembly deterministic and free of silent network fetches, cheerleader strips `DEBUGINFOD_URLS` from the environment of every objdump invocation. If you *want* debuginfod-based symbol resolution, run `llvm-objdump` manually outside cheerleader.
 
 Capstone architecture mapping:
 
