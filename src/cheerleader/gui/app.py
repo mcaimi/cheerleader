@@ -121,7 +121,7 @@ class GuiApp:
 
 def _find_font_file() -> str | None:
     override = os.environ.get(FONT_ENV_VAR, "")
-    for path in (override, *_FONT_CANDIDATES):
+    for path in (override, *FONT_CANDIDATES):
         if path and os.path.isfile(path):
             return path
     return None
@@ -195,7 +195,7 @@ def build_shell(app: GuiApp, *, binary: str | None, hex_compare: str | None) -> 
     grid: HexGrid | None = None
     controller: EditorController | None = None
     with dpg.window(tag=WIN_TAG):
-        with dpg.child_window(tag=CONTENT_TAG, border=False, height=-_STATUS_RESERVE):
+        with dpg.child_window(tag=CONTENT_TAG, border=False, height=-STATUS_RESERVE):
             if binary is not None and hex_compare is None:
                 doc = HexDocument(binary)
                 grid = HexGrid(doc)

@@ -12,7 +12,7 @@
 import argparse
 import sys
 
-from cheerleader.gui.app import APP_TITLE
+from cheerleader.gui.const import APP_TITLE
 
 def main() -> None:
     parser = argparse.ArgumentParser(

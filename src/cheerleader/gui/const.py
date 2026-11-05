@@ -15,7 +15,7 @@ FONT_SIZE = 15
 APP_TITLE = "CHEERLEADER - GUI"
 
 # Reserve below the content child window for separator + status strip.
-_STATUS_RESERVE = 36
+STATUS_RESERVE = 36
 
 WIN_TAG = "gui-main-window"
 CONTENT_TAG = "gui-content"
@@ -23,7 +23,7 @@ STATUS_TAG = "gui-status"
 
 # Monospace candidates, first existing wins (env override → linux → macos →
 # windows). Missing entirely? The built-in default font (fixed-width) is used.
-_FONT_CANDIDATES: tuple[str, ...] = (
+FONT_CANDIDATES: tuple[str, ...] = (
     "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
     "/usr/share/fonts/truetype/liberation2/LiberationMono-Regular.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
