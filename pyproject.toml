@@ -15,9 +15,11 @@ dependencies = [
 
 [project.optional-dependencies]
 capstone = ["capstone>=5.0"]
+gui = ["dearpygui>=2.3"]
 
 [project.scripts]
 cheerleader = "cheerleader:main"
+cheerleader-gui = "cheerleader.gui:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
