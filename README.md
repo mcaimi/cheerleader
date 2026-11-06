@@ -4,6 +4,10 @@ A terminal-based binary inspector for macOS and Linux. Opens Mach-O executables,
 
 ![cheerleader.png](assets/cheerleader.png)
 
+An experimental GUI is being developed:
+
+![cheerleader-gui.png](assets/cheerleader-gui.png)
+
 ---
 
 ## Requirements
@@ -86,14 +90,30 @@ uv run cheerleader-gui
 ```
 
 The GUI takes **no CLI switches**: launching shows an empty window with a
-**File** / **Tools** menu bar. `File → Open File…` (`Ctrl+O`) loads a file —
-once loaded, the main window shows a bottom bar with the file's path, and
-`Tools → Hex Editor…` (grayed out until then) displays it in a floating
-editor window. `Tools → Hex Compare…` opens a picker with
-a **Source file** and a **Target file** row (each an editable path with its
-own `Browse…` button) and opens a side-by-side diff on `Compare`;
-`File → Quit` (quite like `Ctrl+Q`) exits. Several tool windows can be
-open at once, each with its own status strip.
+**File** / **Tools** / **Disassembler** menu bar. `File → Open File…`
+(`Ctrl+O`) loads a file — once loaded, the main window shows a bottom bar
+with the file's path, and `Tools → Hex Editor…` (grayed out until then)
+displays it in a floating editor window. `Tools → Hex Compare…` opens a
+picker with a **Source file** and a **Target file** row (each an editable
+path with its own `Browse…` button) and opens a side-by-side diff on
+`Compare`; `File → Quit` (quite like `Ctrl+Q`) exits. Several tool windows
+can be open at once, each with its own status strip.
+
+When the loaded file is a supported binary (Mach-O / ELF), the
+**Disassembler** menu (grayed out otherwise) offers read-only inspection
+views in floating windows: **Segments, Sections, Imports, Symbols,
+Exports** and **Fixups** — columns and filters ported from the terminal
+UI's tabs (Symbols filters stabs/external/undefined; Fixups filters
+binds/rebases). The **Disassembly** window opens automatically on a
+successful open: an executable-section list on the left (TUI selection
+rule), a virtualized one-instruction-per-row grid (address, bytes,
+mnemonic, operands — multi-GB sections scroll as smoothly as small ones),
+and `h` to flip the right pane to a hex view of the section bytes.
+Disassembly runs in the background (`Esc` cancels; capstone is used when
+importable, else `objdump`). Binary parsing happens in the background;
+re-opening a different file replaces the views' target while already-open
+windows keep their snapshot. Call-flow / CFG windows and a Strings view
+are being added incrementally — see `docs/gui-disasm-plan.md`.
 
 Like the terminal UI, files are read on demand — multi-GB files open
 instantly — and searches, saves and diff comparisons stream in the
