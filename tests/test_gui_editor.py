@@ -1,8 +1,10 @@
-"""Headless tests for the phase-3 editor controller.
+"""Headless tests for the editor controller.
 
 The controller flows run against a real :class:`HexDocument` and a real
-(unrendered) :class:`HexGrid`; background workers are joined explicitly and
-their UiBridge events drained + dispatched by hand, mirroring the frame loop.
+(unrendered) :class:`HexGrid`, opened through the shell's ``open_editor``
+flow inside a floating tool window; background workers are joined explicitly
+and their UiBridge events drained + dispatched by hand, mirroring the frame
+loop.
 """
 
 from __future__ import annotations
@@ -15,17 +17,13 @@ pytest.importorskip("dearpygui")
 
 import dearpygui.dearpygui as dpg
 
-from cheerleader.gui.app import STATUS_TAG, GuiApp, build_shell
+from cheerleader.gui.app import GuiApp, build_shell, open_editor
 from cheerleader.gui.editor import EditorController
 from cheerleader.gui.hexgrid import HexGrid
 from cheerleader.gui.workers import EventKind, UiEvent, WorkerHandle
 from cheerleader.libs.hexdoc import HexDocument
 
 DATA = bytes(range(256)) * 16  # 4 KiB; contains every byte value
-
-
-def _status() -> str:
-    return dpg.get_value(STATUS_TAG)
 
 
 @pytest.fixture()
@@ -35,14 +33,19 @@ def editor(tmp_path):
         path = tmp_path / "sample.bin"
         path.write_bytes(DATA)
         app = GuiApp()
-        build_shell(app, binary=str(path), hex_compare=None)
-        ctl = app.controller
-        assert ctl is not None
+        build_shell(app)
+        open_editor(app, str(path))
+        tool = app.tools[-1]
+        ctl = tool.controller
         yield SimpleNamespace(
-            app=app, grid=app.grid, doc=ctl.doc, ctl=ctl, path=str(path)
+            app=app, tool=tool, grid=ctl.grid, doc=ctl.doc, ctl=ctl, path=str(path)
         )
     finally:
         dpg.destroy_context()
+
+
+def _status(ns) -> str:
+    return dpg.get_value(ns.tool.status_tag)
 
 
 def _finish(ns) -> list[UiEvent]:
@@ -60,7 +63,7 @@ def _finish(ns) -> list[UiEvent]:
 
 
 def test_initial_status(editor) -> None:
-    text = _status()
+    text = _status(editor)
     assert "sample.bin" in text
     assert "4.0 KiB" in text
     assert "0x00000000" in text
@@ -71,20 +74,20 @@ def test_initial_status(editor) -> None:
 
 def test_status_tracks_cursor_and_edits(editor) -> None:
     editor.grid.move_to(0x101)
-    assert "0x00000101 (257)" in _status()
-    assert "= 0x01   1 '.'" in _status()
+    assert "0x00000101 (257)" in _status(editor)
+    assert "= 0x01   1 '.'" in _status(editor)
     editor.ctl.type_hex_digit(0xF)
     editor.ctl.type_hex_digit(0xF)
-    assert "1 unsaved [modified]" in _status()
+    assert "1 unsaved [modified]" in _status(editor)
 
 
 def test_note_only_shows_while_cursor_stays(editor) -> None:
     editor.ctl.type_hex_digit(0xF)
     editor.ctl.action_undo()
     editor.ctl.action_undo()  # nothing to undo → note at cursor 0
-    assert "nothing to undo" in _status()
+    assert "nothing to undo" in _status(editor)
     editor.grid.move_to(300)
-    assert "nothing to undo" not in _status()
+    assert "nothing to undo" not in _status(editor)
 
 
 # ── inline hex typing ─────────────────────────────────────────────────────────
@@ -133,10 +136,17 @@ def test_typing_ignored_on_empty_file(tmp_path) -> None:
         path.write_bytes(b"")
         doc = HexDocument(str(path))
         with dpg.window(tag="empty-win"):
-            pass
+            dpg.add_text("", tag="empty-status")
         grid = HexGrid(doc)
         grid.build("empty-win")
-        ctl = EditorController(GuiApp(), grid, doc)
+        ctl = EditorController(
+            GuiApp(),
+            grid,
+            doc,
+            window="empty-win",
+            status_tag="empty-status",
+            ns="tx",
+        )
         ctl.type_hex_digit(0xF)
         assert doc.size == 0
     finally:
@@ -185,7 +195,7 @@ def test_edit_refused_when_busy(editor) -> None:
     ctl.busy.start("searching", WorkerHandle())  # simulate an in-flight search
     ctl.action_edit()
     assert ctl._modal is None
-    assert "busy searching…" in _status()
+    assert "busy searching…" in _status(editor)
     ctl.busy.clear()
 
 
@@ -203,7 +213,7 @@ def test_undo_restores_and_reports_exhaustion(editor) -> None:
     assert editor.doc.read(0, 1) == b"\x00"  # overlay back to the original
     assert not editor.doc.is_edited(0)
     ctl.action_undo()
-    assert "nothing to undo" in _status()
+    assert "nothing to undo" in _status(editor)
 
 
 # ── saving ────────────────────────────────────────────────────────────────────
@@ -219,13 +229,13 @@ def test_save_flow(editor, tmp_path) -> None:
     ctl._on_save_chosen(str(target))
     assert ctl._modal is None
     assert ctl.busy.op == "saving"
-    assert "Saving…" in _status()
+    assert "Saving…" in _status(editor)
     _finish(editor)
     assert target.read_bytes() == b"\xfe" + DATA[1:]
     assert editor.doc.path == str(target)
     assert not editor.doc.modified  # reopen dropped the edits
     assert ctl.busy.op is None
-    assert f"saved {target}" in _status()
+    assert f"saved {target}" in _status(editor)
 
 
 def test_save_overwrite_confirm(editor, tmp_path) -> None:
@@ -261,7 +271,7 @@ def test_save_failure_shows_note(editor, tmp_path) -> None:
     ctl.action_save()
     ctl._on_save_chosen(str(bad))
     _finish(editor)
-    assert "Save failed" in _status()
+    assert "Save failed" in _status(editor)
     assert ctl.busy.op is None
 
 
@@ -272,7 +282,7 @@ def test_progress_events_update_status(editor, tmp_path) -> None:
     ctl._on_save_chosen(str(target))
     worker = ctl.busy.worker
     ctl.on_event(UiEvent(0, EventKind.PROGRESS, 0.47, worker))
-    assert "Saving… 47%" in _status()
+    assert "Saving… 47%" in _status(editor)
     _finish(editor)
 
 
@@ -291,7 +301,7 @@ def test_search_offset_mode(editor) -> None:
     assert editor.grid.top_row == 0x200 // 16  # placed at the top
     assert ctl._modal is None
     assert editor.grid.input_enabled
-    assert "match at" not in _status()
+    assert "match at" not in _status(editor)
 
 
 def test_search_hex_found_then_n_and_upper_n(editor) -> None:
@@ -302,8 +312,8 @@ def test_search_hex_found_then_n_and_upper_n(editor) -> None:
     _finish(editor)
     assert editor.grid.cursor == 10
     assert editor.grid._match == (10, 2)
-    assert "match at 0x0000000a" in _status()
-    assert "n/N" in _status()
+    assert "match at 0x0000000a" in _status(editor)
+    assert "n/N" in _status(editor)
 
     ctl.action_search_next(forward=True)
     _finish(editor)
@@ -316,7 +326,7 @@ def test_search_hex_found_then_n_and_upper_n(editor) -> None:
 
 def test_search_next_without_pattern(editor) -> None:
     editor.ctl.action_search_next(forward=True)
-    assert "no search pattern" in _status()
+    assert "no search pattern" in _status(editor)
 
 
 def test_search_wraps_backward_and_forward(editor) -> None:
@@ -326,13 +336,13 @@ def test_search_wraps_backward_and_forward(editor) -> None:
     ctl._start_search(forward=True)  # nothing after 4000 → wraps to the top
     _finish(editor)
     assert editor.grid.cursor == 10  # first occurrence (TUI wrap semantics)
-    assert "(wrapped)" in _status()
+    assert "(wrapped)" in _status(editor)
 
     editor.grid.move_to(5)
     ctl._start_search(forward=False)  # nothing before 5 → wraps to the bottom
     _finish(editor)
     assert editor.grid.cursor == 3850  # last occurrence in [5, size)
-    assert "(wrapped)" in _status()
+    assert "(wrapped)" in _status(editor)
 
 
 def test_search_not_found(editor) -> None:
@@ -341,7 +351,7 @@ def test_search_not_found(editor) -> None:
     editor.grid.move_to(100)
     ctl._start_search(forward=True)
     _finish(editor)
-    assert "pattern not found" in _status()
+    assert "pattern not found" in _status(editor)
     assert editor.grid._match is None
 
 
@@ -374,8 +384,8 @@ def test_search_progress_events(editor) -> None:
     ctl._start_search(forward=True)
     worker = ctl.busy.worker
     ctl.on_event(UiEvent(0, EventKind.PROGRESS, 0.3, worker))
-    assert "Searching… 30%" in _status()
-    assert "Esc cancels" in _status()
+    assert "Searching… 30%" in _status(editor)
+    assert "Esc cancels" in _status(editor)
     _finish(editor)
 
 
@@ -386,7 +396,7 @@ def test_esc_cancels_search_and_drops_late_completion(editor) -> None:
     worker = ctl.busy.worker
     ctl._on_escape_key()
     assert ctl.busy.op is None
-    assert "search cancelled" in _status()
+    assert "search cancelled" in _status(editor)
     worker.thread.join(timeout=10.0)
     for event in editor.app.bridge.drain():  # the worker's own (late) events
         ctl.on_event(event)
@@ -419,7 +429,7 @@ def test_save_refused_while_searching(editor) -> None:
     worker = ctl.busy.worker
     ctl.action_save()
     assert ctl._modal is None  # no save dialog opened
-    assert "busy searching…" in _status()
+    assert "busy searching…" in _status(editor)
     ctl._on_escape_key()
     assert ctl.busy.op is None
     worker.thread.join(timeout=10.0)
@@ -436,11 +446,11 @@ def test_search_refused_while_saving(editor, tmp_path) -> None:
     assert ctl.busy.op == "saving"
     ctl.action_search()
     assert ctl._modal is None
-    assert "busy saving…" in _status()
+    assert "busy saving…" in _status(editor)
     _finish(editor)
 
 
-# ── reload / quit ─────────────────────────────────────────────────────────────
+# ── reload ────────────────────────────────────────────────────────────────────
 
 
 def test_reload_clean_is_immediate(editor) -> None:
@@ -463,28 +473,47 @@ def test_reload_discards_edits_after_confirm(editor) -> None:
     assert editor.grid.cursor == 30  # clamped, position kept
 
 
-def test_quit_clean_stops_immediately(editor, monkeypatch) -> None:
-    stopped: list[bool] = []
-    monkeypatch.setattr(dpg, "stop_dearpygui", lambda: stopped.append(True))
-    editor.app.request_quit()
-    assert stopped == [True]
-    assert editor.ctl._modal is None
+# ── window close (X button) ───────────────────────────────────────────────────
 
 
-def test_quit_dirty_asks_then_stops(editor, monkeypatch) -> None:
-    stopped: list[bool] = []
-    monkeypatch.setattr(dpg, "stop_dearpygui", lambda: stopped.append(True))
+def test_window_close_clean_closes_tool(editor) -> None:
+    ctl = editor.ctl
+    assert dpg.does_item_exist(ctl.window)
+    ctl.window_close_requested()  # clean → closes without a dialog
+    assert ctl._modal is None
+    assert editor.app.tools == []
+    assert not dpg.does_item_exist(ctl.window)
+    assert not dpg.does_item_exist(f"editor-keys-{ctl.ns}")
+    assert not dpg.does_item_exist(f"{ctl.ns}-hexgrid-input")
+
+
+def test_window_close_dirty_confirm_veto_then_close(editor) -> None:
     ctl = editor.ctl
     ctl.type_hex_digit(0xF)
-    editor.app.request_quit()
+    ctl.window_close_requested()
     assert ctl._modal == "confirm"
     assert "1 unsaved edit" in ctl._dialog.message
-    assert "quit without saving" in ctl._dialog.message
-    ctl._dialog._on_answer(False)
-    assert stopped == []
-    editor.app.request_quit()
-    ctl._dialog._on_answer(True)
-    assert stopped == [True]
+    assert "close without saving" in ctl._dialog.message
+    ctl._dialog._on_answer(False)  # veto: the window comes back
+    assert ctl._modal is None
+    assert editor.app.tools  # tool kept alive
+    assert dpg.does_item_exist(ctl.window)
+    assert dpg.get_item_configuration(ctl.window)["show"] is True
+    ctl.window_close_requested()  # second attempt
+    assert ctl._modal == "confirm"
+    ctl._dialog._on_answer(True)  # discard → tool closes
+    assert editor.app.tools == []
+    assert not dpg.does_item_exist(ctl.window)
+
+
+def test_dirty_edit_count_for_aggregate_quit(editor) -> None:
+    assert editor.ctl.dirty_edit_count() == 0
+    editor.ctl.type_hex_digit(0xF)  # 1 edited byte (per-offset count)
+    assert editor.ctl.dirty_edit_count() == 1
+    editor.grid.move_to(50)
+    editor.ctl.type_hex_digit(0xA)
+    editor.ctl.type_hex_digit(0xB)  # same byte → still 1 more edited offset
+    assert editor.ctl.dirty_edit_count() == 2
 
 
 # ── grid keys vs. dialogs ─────────────────────────────────────────────────────

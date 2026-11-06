@@ -610,3 +610,91 @@ def test_page_keys_registered_under_both_spellings(grid_window, tmp_path):
     # today Prior/Next are stale (266/267 ≠ 517/518): exactly two spellings
     assert len({KEY_PAGE_UP, dpg.mvKey_Prior}) == 2
     assert len({KEY_PAGE_DOWN, dpg.mvKey_Next}) == 2
+
+
+# ── compare-mode hooks ───────────────────────────────────────────────
+
+
+def test_color_for_overrides_editor_colors(grid_window, tmp_path):
+    doc = _make_doc(tmp_path)
+    grid = HexGrid(doc)
+    grid.build(grid_window)
+    grid.tick()
+    base = grid._grid_tag
+    cell = f"{base}-r0-h5"  # not the cursor cell (offset 0 is the cursor)
+    assert _cell_color(cell) == COL_TEXT
+    red = (255, 0, 0, 255)
+    grid.color_for = lambda offset: red
+    grid.refresh()
+    grid.tick()
+    assert _cell_color(cell) == red
+    assert grid._byte_color(123) == red
+    grid.color_for = None
+    assert grid._byte_color(123) == COL_TEXT  # falls back to editor colors
+
+
+def test_max_top_rows_extends_range_and_blank_tail(grid_window, tmp_path):
+    doc = _make_doc(tmp_path, size=256)  # 16 rows
+    grid = HexGrid(doc)
+    grid.build(grid_window)
+    grid._vis = 4
+    assert grid._max_top() == 12
+    grid.max_top_rows = lambda: 32  # partner document is twice as long
+    assert grid._max_top() == 28
+    grid.set_top(10**6)
+    assert grid.top_row == 28
+    grid.tick()
+    base = grid._grid_tag
+    # Rows past the shorter document's own EOF render fully blank.
+    assert dpg.get_value(f"{base}-r0-off") == " " * (8 + 2)
+
+
+def test_set_top_clamps_and_pushes_slider(grid_window, tmp_path):
+    doc = _make_doc(tmp_path, size=256)
+    grid = HexGrid(doc)
+    grid.build(grid_window)
+    grid._vis = 4
+    grid.set_top(2)
+    assert grid.top_row == 2
+    assert dpg.get_value(grid._scroll_tag) == grid._max_top() - 2  # inverted
+    grid.set_top(-3)
+    assert grid.top_row == 0
+    grid.set_top(999)
+    assert grid.top_row == grid._max_top()
+
+
+def test_set_scrollbar_visible_roundtrip(grid_window, tmp_path):
+    doc = _make_doc(tmp_path)
+    grid = HexGrid(doc)
+    grid.build(grid_window)
+    assert dpg.get_item_configuration(grid._scroll_tag)["show"] is True
+    grid.set_scrollbar_visible(False)
+    assert dpg.get_item_configuration(grid._scroll_tag)["show"] is False
+    grid.set_scrollbar_visible(True)
+    assert dpg.get_item_configuration(grid._scroll_tag)["show"] is True
+
+
+def test_scroll_mode_keys_scroll_without_cursor(grid_window, tmp_path):
+    doc = _make_doc(tmp_path, size=4096)
+    grid = HexGrid(doc)
+    grid.build(grid_window)
+    grid._vis = 4
+    grid.scroll_mode = True
+    cursor = grid.cursor
+    grid._key_down()
+    assert grid.top_row == 1 and grid.cursor == cursor
+    grid._key_page_down()
+    assert grid.top_row == 1 + 4
+    grid._key_end()
+    assert grid.top_row == grid._max_top()
+    grid._key_home()
+    assert grid.top_row == 0
+    grid._key_up()
+    assert grid.top_row == 0  # clamped at the top
+    # editor mode unchanged: Home/End keep their cursor semantics
+    grid.scroll_mode = False
+    grid.move_to(35)
+    grid._key_home()
+    assert grid.cursor == 32  # row start
+    grid._key_end()
+    assert grid.cursor == 47  # row end

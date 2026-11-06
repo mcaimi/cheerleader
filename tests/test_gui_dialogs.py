@@ -1,4 +1,4 @@
-"""Headless tests for the phase-3 modal dialogs.
+"""Headless tests for the modal dialogs.
 
 The dialogs own only widgets and visibility: validation is delegated to a
 ``validate`` callable, results flow back through the callbacks. Tests drive
@@ -15,9 +15,12 @@ import dearpygui.dearpygui as dpg
 
 from cheerleader.gui.dialogs import (
     ByteEditDialog,
+    CompareOpenDialog,
     ConfirmDialog,
     SaveDialog,
     SearchDialog,
+    add_all_files_filter,
+    picked_path,
 )
 from cheerleader.tui.hexparse import parse_byte_sequence, parse_offset
 
@@ -106,7 +109,125 @@ def test_save_dialog_reports_choice_or_cancel(dpg_context) -> None:
     chosen: list[str | None] = []
     dlg = SaveDialog(default_path="/tmp/dir/in.patched", on_chosen=chosen.append)
     assert dpg.get_item_configuration(dlg.TAG)["show"] is False
-    dlg._picked(None, ["/tmp/dir/out.patched"])
-    dlg._picked(None, [])
+    # DPG 2.3.1 payload shape (verified against mvFileDialog.cpp): a dict.
+    dlg._picked(None, {"selections": {"file_1": "/tmp/dir/out.patched"}})
+    dlg._picked(None, {"selections": {}})  # OK with nothing selected
     dlg._cancelled()
     assert chosen == ["/tmp/dir/out.patched", None, None]
+
+
+def test_file_dialogs_register_all_files_filter(dpg_context) -> None:
+    """A dialog without extension children lists directories only."""
+    dlg = SaveDialog(default_path="/tmp/dir/in.patched", on_chosen=lambda _p: None)
+    # DPG keeps file-extension items in child slot 0 (slot 1 stays empty).
+    ext_types = [
+        dpg.get_item_info(child)["type"] for child in dpg.get_item_children(dlg.TAG, 0)
+    ]
+    assert "mvAppItemType::mvFileExtension" in ext_types
+    # the helper used by every file dialog in the package
+    dpg.add_file_dialog(tag="fd-x", show=False, width=1, height=1)
+    add_all_files_filter("fd-x")
+    assert any(
+        dpg.get_item_info(child)["type"] == "mvAppItemType::mvFileExtension"
+        for child in dpg.get_item_children("fd-x", 0)
+    )
+
+
+# ── picked_path payload extraction (pure) ─────────────────────────────────────
+
+
+def test_picked_path_from_dict_selections() -> None:
+    """The real DPG 2.3.1 payload: {'selections': {key: path}, ...}."""
+    payload = {
+        "current_path": "/tmp",
+        "current_filter": ".*",
+        "selections": {"file_1": "/tmp/a.bin", "file_2": "/tmp/b.bin"},
+    }
+    assert picked_path(payload) == "/tmp/a.bin"
+    assert picked_path({"selections": {}}) is None  # OK with nothing picked
+    assert picked_path({}) is None
+
+
+def test_picked_path_other_shapes() -> None:
+    # tolerate list/tuple/bare-path shapes (tests, older DPG versions)
+    assert picked_path(["/a/b"]) == "/a/b"
+    assert picked_path(()) is None
+    assert picked_path("/a/b") == "/a/b"
+    assert picked_path(None) is None
+    assert picked_path("") is None
+    # legacy single-selection key seen in the wild
+    assert picked_path({"file_path_name": "/a/b"}) == "/a/b"
+
+
+# ── CompareOpenDialog ────────────────────
+
+
+def _make_cmp_picker():
+    launched: list[tuple[str, str]] = []
+    dlg = CompareOpenDialog(on_launch=lambda s, t: launched.append((s, t)))
+    return dlg, launched
+
+
+def test_compare_picker_layout_and_browse(dpg_context) -> None:
+    dlg, launched = _make_cmp_picker()
+    assert dpg.get_item_configuration(dlg.TAG)["show"] is False  # built hidden
+    dlg.open()
+    assert dpg.get_item_configuration(dlg.TAG)["show"] is True
+    # Two rows, each: label + editable path input + a Browse… button whose
+    # callback shows that row's (hidden) file dialog.
+    assert dpg.get_value(dlg._src_tag) == ""
+    assert dpg.get_value(dlg._tgt_tag) == ""
+    kids = dpg.get_item_children(dlg.TAG, 1)
+    rows = ((kids[0], kids[1]), (kids[2], kids[3]))
+    for (label, row), dlg_tag in zip(rows, (dlg._src_dlg, dlg._tgt_dlg)):
+        assert dpg.does_item_exist(dlg_tag)
+        assert dpg.get_item_configuration(dlg_tag)["show"] is False
+        browse = dpg.get_item_children(row, 1)[1]
+        assert dpg.get_item_label(browse) == "Browse…"
+        dpg.get_item_callback(browse)()
+        assert dpg.get_item_configuration(dlg_tag)["show"] is True
+    assert launched == []
+
+
+def test_compare_picker_browse_fill_via_file_dialogs(dpg_context) -> None:
+    """Each Browse button's file dialog fills its own input (dict payload)."""
+    dlg, launched = _make_cmp_picker()
+    # Drive the file-dialog callbacks exactly as DPG would on OK.
+    dpg.get_item_callback(dlg._src_dlg)(
+        dlg._src_dlg, {"selections": {"file_1": "/tmp/a.bin"}}
+    )
+    dpg.get_item_callback(dlg._tgt_dlg)(
+        dlg._tgt_dlg, {"selections": {"file_1": "/tmp/b.bin"}}
+    )
+    assert dpg.get_value(dlg._src_tag) == "/tmp/a.bin"
+    assert dpg.get_value(dlg._tgt_tag) == "/tmp/b.bin"
+    assert launched == []
+    dlg._launch()
+    assert launched == [("/tmp/a.bin", "/tmp/b.bin")]
+    # A successful launch closes the picker and both file dialogs.
+    assert not dpg.does_item_exist(dlg.TAG)
+    assert not dpg.does_item_exist(dlg._src_dlg)
+    assert not dpg.does_item_exist(dlg._tgt_dlg)
+
+
+def test_compare_picker_requires_both_paths(dpg_context) -> None:
+    dlg, launched = _make_cmp_picker()
+    dlg.open()
+    dpg.set_value(dlg._src_tag, "/tmp/a.bin")
+    dlg._launch()  # target missing → inline error, no launch
+    assert "both" in dpg.get_value(dlg._error_tag)
+    assert launched == []
+    assert dpg.does_item_exist(dlg.TAG)  # stays open for the user to fix
+    dpg.set_value(dlg._tgt_tag, "/tmp/b.bin")
+    dlg._launch()
+    assert launched == [("/tmp/a.bin", "/tmp/b.bin")]
+
+
+def test_compare_picker_cancel_deletes_everything(dpg_context) -> None:
+    dlg, launched = _make_cmp_picker()
+    dlg.open()
+    dlg.close()  # the Cancel button's callback
+    assert not dpg.does_item_exist(dlg.TAG)
+    assert not dpg.does_item_exist(dlg._src_dlg)
+    assert not dpg.does_item_exist(dlg._tgt_dlg)
+    assert launched == []
