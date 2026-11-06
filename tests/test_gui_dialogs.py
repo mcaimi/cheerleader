@@ -17,6 +17,8 @@ from cheerleader.gui.dialogs import (
     ByteEditDialog,
     CompareOpenDialog,
     ConfirmDialog,
+    ErrorPopup,
+    InfoDialog,
     SaveDialog,
     SearchDialog,
     add_all_files_filter,
@@ -231,3 +233,58 @@ def test_compare_picker_cancel_deletes_everything(dpg_context) -> None:
     assert not dpg.does_item_exist(dlg._src_dlg)
     assert not dpg.does_item_exist(dlg._tgt_dlg)
     assert launched == []
+
+
+# ── title-bar X (on_close) ────────────────────────────────────────────────────
+
+
+def _click_x(tag) -> None:
+    """Headless stand-in for the title-bar X: run the wired on_close."""
+    dpg.get_item_configuration(tag)["on_close"](tag, None, None)
+
+
+def test_confirm_dialog_x_answers_no(dpg_context) -> None:
+    answers: list[bool] = []
+    dlg = ConfirmDialog(message="sure?", on_answer=answers.append)
+    dlg.open()
+    _click_x(dlg.TAG)
+    assert answers == [False]  # the caller is never left waiting
+
+
+def test_edit_and_search_dialog_x_cancels(dpg_context) -> None:
+    cancelled: list[str] = []
+    edit = ByteEditDialog(
+        offset=0,
+        current=b"\x00",
+        validate=parse_byte_sequence,
+        on_accept=lambda _d: None,
+        on_cancel=lambda: cancelled.append("edit"),
+    )
+    _click_x(edit.TAG)
+    search = SearchDialog(
+        mode="hex",
+        value="",
+        validate=lambda m, t: (m, t, t),
+        on_accept=lambda _r: None,
+        on_cancel=lambda: cancelled.append("search"),
+    )
+    _click_x(search.TAG)
+    assert cancelled == ["edit", "search"]
+
+
+def test_info_dialog_reopens_and_deletes_itself(dpg_context) -> None:
+    first = InfoDialog(message="about")
+    first.open()
+    second = InfoDialog(message="about")  # fixed tags used to collide here
+    second.open()
+    assert first.TAG != second.TAG
+    first.close()
+    _click_x(second.TAG)
+    assert not dpg.does_item_exist(first.TAG)
+    assert not dpg.does_item_exist(second.TAG)
+
+
+def test_error_popup_x_deletes_window(dpg_context) -> None:
+    popup = ErrorPopup("boom")
+    _click_x(popup.TAG)
+    assert not dpg.does_item_exist(popup.TAG)

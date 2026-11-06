@@ -18,8 +18,8 @@ instruction view gets virtualization in D3). Filter state renders as a
 button row above the table (the TUI's single-letter keys); the active
 filter's button is prefixed with ``●``.
 
-Every controller exposes ``view_kind`` + ``path`` so the shell's
-:meth:`~cheerleader.gui.app.find_inspector_tool` focus guard can find an
+Every controller exposes ``view_kind`` + ``path`` so the
+:func:`~cheerleader.gui.tooling.find_tool` focus guard can find an
 already-open view of the same kind for the same file. A view holds its
 *own* ``BinaryInfo`` reference: re-opening a different file replaces
 ``GuiApp.current_info`` but open view windows keep their snapshot data
@@ -32,28 +32,36 @@ import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
-from cheerleader.gui.app import (
-    GuiApp,
-    Tool,
-    _tool_window_closed,
-    find_inspector_tool,
+from cheerleader.gui.const import TABLE_WIN_H, TABLE_WIN_W
+from cheerleader.gui.tooling import (
+    ReadOnlyController,
+    build_tool_window,
+    find_tool,
+    focus_tool,
     human_size,
 )
-from cheerleader.gui.const import (
-    STATUS_RESERVE,
-    TABLE_WIN_H,
-    TABLE_WIN_W,
-    TOOL_MIN_H,
-    TOOL_MIN_W,
-)
 from cheerleader.libs.types import N_TYPE, N_UNDF, BinaryInfo
+
+if TYPE_CHECKING:
+    from cheerleader.gui.app import GuiApp
 
 try:
     import dearpygui.dearpygui as dpg
 except ImportError:
     dpg = None  # type: ignore[assignment]
+
+
+def file_offset_of(info: BinaryInfo, addr: int | None) -> int | None:
+    """Absolute file offset of virtual address *addr*, via the segment
+    that maps it from the file (``None`` when unmapped / zero-fill)."""
+    if addr is None:
+        return None
+    for seg in info.segments:
+        if seg.filesize and seg.vmaddr <= addr < seg.vmaddr + seg.filesize:
+            return info.slice_offset + seg.fileoff + (addr - seg.vmaddr)
+    return None
 
 
 def fmt_addr(v: int | None) -> str:
@@ -91,6 +99,15 @@ class ViewSpec:
     # Relative column weights under mvTable_SizingStretchProp; missing
     # entries default to 1.0.
     weights: tuple[float, ...] = ()
+    # Live search box above the table: the text an item is matched against
+    # (case-insensitive substring). None = no search box.
+    search: Callable[[Any], str] | None = None
+    # Absolute file offset of an item's bytes; makes rows clickable (jump
+    # into the hex editor). None = plain, non-clickable rows.
+    offset: Callable[[BinaryInfo, Any], int | None] | None = None
+    # Per-column sort key (item → comparable); missing / None entries sort
+    # by the rendered cell text (numerically when it is all digits).
+    sort_keys: tuple[Callable[[Any], Any] | None, ...] = ()
 
     def filter(self, key: str | None) -> FilterSpec | None:
         if self.filters is None or key is None:
@@ -214,6 +231,16 @@ _SPECS: dict[str, ViewSpec] = {
         items=_segments,
         row=_row_segment,
         weights=(2.0,),
+        offset=lambda info, seg: info.slice_offset + seg.fileoff
+        if seg.filesize
+        else None,
+        sort_keys=(
+            None,
+            lambda seg: seg.vmaddr,
+            lambda seg: seg.vmsize,
+            lambda seg: seg.fileoff,
+            lambda seg: seg.filesize,
+        ),
     ),
     "sections": ViewSpec(
         kind="sections",
@@ -232,6 +259,15 @@ _SPECS: dict[str, ViewSpec] = {
         items=_sections,
         row=_row_section,
         weights=(1.0, 2.0),
+        offset=lambda info, s: info.slice_offset + s.offset if s.offset else None,
+        sort_keys=(
+            None,
+            None,
+            lambda s: s.addr,
+            lambda s: s.size,
+            lambda s: s.offset,
+            lambda s: s.align,
+        ),
     ),
     "imports": ViewSpec(
         kind="imports",
@@ -241,6 +277,9 @@ _SPECS: dict[str, ViewSpec] = {
         items=_libraries,
         row=_row_library,
         weights=(0.4, 4.0),
+        search=lambda lib: lib.name,
+        # the library's load command inside the header
+        offset=lambda info, lib: info.slice_offset + lib.offset,
     ),
     "symbols": ViewSpec(
         kind="symbols",
@@ -259,6 +298,9 @@ _SPECS: dict[str, ViewSpec] = {
         ),
         default_filter="no-stabs",  # TUI SymbolsTab parity
         weights=(1.2, 0.7, 0.5, 0.8, 4.0),
+        search=lambda sym: sym.name,
+        offset=lambda info, sym: file_offset_of(info, sym.addr),
+        sort_keys=(lambda sym: sym.addr or 0, None, lambda sym: sym.sect),
     ),
     "exports": ViewSpec(
         kind="exports",
@@ -268,6 +310,9 @@ _SPECS: dict[str, ViewSpec] = {
         items=_exports,
         row=_row_export,
         weights=(1.2, 0.7, 4.0),
+        search=lambda exp: exp.get("name", ""),
+        offset=lambda info, exp: file_offset_of(info, exp.get("addr")),
+        sort_keys=(lambda exp: exp.get("addr") or 0, lambda exp: exp.get("flags", 0)),
     ),
     "fixups": ViewSpec(
         kind="fixups",
@@ -291,6 +336,9 @@ _SPECS: dict[str, ViewSpec] = {
         ),
         default_filter="all",  # TUI ChainedFixupsTab parity
         weights=(1.2, 1.2, 1.2, 0.7, 2.0, 2.5, 0.6),
+        search=lambda fx: fx.name or "",
+        offset=lambda info, fx: file_offset_of(info, fx.offset),
+        sort_keys=(None, lambda fx: fx.offset),
     ),
 }
 
@@ -298,12 +346,20 @@ _SPECS: dict[str, ViewSpec] = {
 # ── the generic controller ────────────────────────────────────────────────────
 
 
-class TableController:
+def _text_key(text: str) -> tuple[int, int | str]:
+    """Default sort key: numbers numerically, everything else as text."""
+    return (0, int(text)) if text.isdigit() else (1, text.lower())
+
+
+class TableController(ReadOnlyController):
     """One read-only data-table view over a :class:`BinaryInfo` snapshot.
 
-    Renders *spec* against *info* into a plain DPG table; optional filters
-    re-populate the table from the snapshot (buttons above the table; no
-    global key handlers, so ``shutdown`` has nothing to unregister).
+    Renders *spec* against *info* into a DPG table — sortable by any column
+    header, row-clipped (only visible rows are laid out) — with optional
+    filter buttons, an optional live search box (re-filtered per frame by
+    :meth:`tick`) and optionally clickable rows that show the item's bytes
+    in the hex editor. Rows keep their snapshot position as the row index
+    (the Imports ``#``), whatever the filter/search/sort.
     """
 
     def __init__(
@@ -314,57 +370,149 @@ class TableController:
         *,
         window: int | str,
         status_tag: int | str,
-        table_tag: int | str,
         ns: str,
-        filter_buttons: dict[str, int | str] | None = None,
     ) -> None:
         self.app = app
         self.spec = spec
         self.info = info  # the view's private snapshot (plan decision 3)
         self.window = window
         self.status_tag = status_tag
-        self.table_tag = table_tag
         self.ns = ns
-        self.filter_buttons = filter_buttons or {}
-        # Focus-guard keys used by find_inspector_tool.
+        self.table_tag = f"{ns}-tbl"
+        self.search_tag = f"{ns}-search"
+        self.filter_buttons: dict[str, int | str] = {}
+        self._columns: list[int | str] = []  # column tags, in column order
+        # Focus-guard keys used by find_tool.
         self.view_kind = spec.kind
         self.path = info.path
         self._filter = spec.default_filter
-        self._mark_active_button()
+        self._query = ""  # search text currently applied
+        self._sort: tuple[int, bool] | None = None  # (column, descending)
+
+    # ── widgets ──────────────────────────────────────────────────────────
+
+    def build(self, content: int | str) -> None:
+        """Filter buttons, search box and table inside *content*."""
+        spec = self.spec
+        if spec.filters:
+            with dpg.group(horizontal=True, parent=content):
+                dpg.add_text("Filter:")
+                for f in spec.filters:
+                    tag = f"{self.ns}-flt-{f.key}"
+                    self.filter_buttons[f.key] = tag
+                    dpg.add_button(
+                        tag=tag, label=f.label, callback=partial(self._on_filter, f.key)
+                    )
+            self._mark_active_button()
+        if spec.search is not None:
+            dpg.add_input_text(
+                tag=self.search_tag,
+                parent=content,
+                hint=f"Search {spec.noun}…",
+                width=-1,
+            )
+        with dpg.table(
+            tag=self.table_tag,
+            parent=content,
+            header_row=True,
+            row_background=True,
+            borders_innerH=True,
+            borders_outerH=True,
+            scrollY=True,
+            clipper=True,  # lay out only the visible rows (large tables)
+            sortable=True,
+            callback=self._on_sort,
+            policy=dpg.mvTable_SizingStretchProp,
+        ):
+            for i, col in enumerate(spec.columns):
+                weight = spec.weights[i] if i < len(spec.weights) else 1.0
+                self._columns.append(
+                    dpg.add_table_column(label=col, init_width_or_weight=weight)
+                )
+
+    # ── data ─────────────────────────────────────────────────────────────
+
+    def _items(self) -> list[Any]:
+        """Every item of the view (subclasses may load them elsewhere)."""
+        return self.spec.items(self.info)
+
+    def _visible(self) -> list[tuple[int, Any]]:
+        """``(snapshot index, item)`` surviving filter + search, sorted."""
+        rows = list(enumerate(self._items()))
+        f = self.spec.filter(self._filter)
+        if f is not None and f.predicate is not None:
+            rows = [(i, item) for i, item in rows if f.predicate(item)]
+        q = self._query.strip().lower()
+        if q and self.spec.search is not None:
+            text = self.spec.search
+            rows = [(i, item) for i, item in rows if q in text(item).lower()]
+        if self._sort is not None:
+            col, descending = self._sort
+            rows.sort(key=self._sort_key(col), reverse=descending)
+        return rows
+
+    def _sort_key(self, col: int) -> Callable[[tuple[int, Any]], Any]:
+        keys = self.spec.sort_keys
+        custom = keys[col] if col < len(keys) else None
+        if custom is not None:
+            return lambda row: custom(row[1])
+        return lambda row: _text_key(self.spec.row(row[1], row[0])[col])
 
     # ── rendering ────────────────────────────────────────────────────────
 
-    def _visible(self) -> list[Any]:
-        """The snapshot items that survive the active filter."""
-        f = self.spec.filter(self._filter)
-        items = self.spec.items(self.info)
-        if f is None or f.predicate is None:
-            return items
-        return [item for item in items if f.predicate(item)]
-
-    def populate(self) -> None:
-        """(Re-)fill the table body from the snapshot + active filter."""
+    def populate(self, visible: list[tuple[int, Any]] | None = None) -> None:
+        """(Re-)fill the table body from the snapshot + filter/search/sort."""
+        if visible is None:
+            visible = self._visible()
+        clickable = self.spec.offset is not None
         dpg.delete_item(self.table_tag, children_only=True, slot=1)
-        for i, item in enumerate(self._visible()):
-            cells = self.spec.row(item, i)
+        for i, item in visible:
             with dpg.table_row(parent=self.table_tag):
-                for cell in cells:
-                    dpg.add_text(cell)
+                for cell in self.spec.row(item, i):
+                    if clickable:
+                        dpg.add_selectable(
+                            label=cell, user_data=item, callback=self._on_row
+                        )
+                    else:
+                        dpg.add_text(cell)
 
-    def update_status(self) -> None:
-        """Row count + filter state (plan v3 D2 status-strip contract)."""
-        total = len(self.spec.items(self.info))
-        shown = len(self._visible())
+    def _status_text(self, shown: int, total: int) -> str:
+        """Row count + filter/search state (plan v3 D2 status-strip contract)."""
+        noun = self.spec.noun
         f = self.spec.filter(self._filter)
-        if f is None:
-            text = f"{total:,} {self.spec.noun}"
+        q = self._query.strip()
+        if f is None and not q:
+            text = f"{total:,} {noun}"
         else:
-            text = f"{shown:,} of {total:,} {self.spec.noun} — filter: {f.label}"
-        dpg.set_value(self.status_tag, text)
+            text = f"{shown:,} of {total:,} {noun}"
+            if q:
+                text += f" matching {q!r}"
+            if f is not None:
+                text += f" — filter: {f.label}"
+        if self.spec.offset is not None:
+            text += "  ·  click a row to view it in the hex editor"
+        return text
+
+    def update_status(self, shown: int | None = None) -> None:
+        if shown is None:
+            shown = len(self._visible())
+        dpg.set_value(self.status_tag, self._status_text(shown, len(self._items())))
 
     def refresh(self) -> None:
-        self.populate()
-        self.update_status()
+        visible = self._visible()  # filter once for body + status
+        self.populate(visible)
+        self.update_status(len(visible))
+
+    def tick(self) -> None:
+        """Per-frame: re-filter when the search box changed (live typing)."""
+        if self.spec.search is None or not dpg.does_item_exist(self.search_tag):
+            return
+        query = dpg.get_value(self.search_tag)
+        if query != self._query:
+            self._query = query
+            self.refresh()
+
+    # ── callbacks ────────────────────────────────────────────────────────
 
     def _mark_active_button(self) -> None:
         """``● `` prefix on the active filter's button, plain labels else."""
@@ -381,122 +529,80 @@ class TableController:
         self._mark_active_button()
         self.refresh()
 
-    # ── the shell's Controller protocol ──────────────────────────────────
+    def _on_sort(self, _sender, app_data) -> None:
+        """Header click: *app_data* is ``[[column, direction]]`` (direction
+        1 ascending, -1 descending) or ``None`` when sorting is cleared."""
+        if not dpg.does_item_exist(self.table_tag):
+            return  # queued callback delivered after the window closed
+        self._sort = None
+        if app_data:
+            column, direction = app_data[0]
+            if column in self._columns:
+                self._sort = (self._columns.index(column), direction < 0)
+        self.refresh()
 
-    def on_event(self, event: Any) -> None:
-        """No workers in D2 views — nothing to receive."""
-
-    def dirty_edit_count(self) -> int:
-        """Read-only view — never dirty (quit needs no confirmation)."""
-        return 0
-
-    def window_close_requested(self) -> None:
-        self.app.close_tool_for(self)
-
-    def shutdown(self) -> None:
-        """No registries/dialogs/workers — the window delete suffices."""
+    def _on_row(self, sender, _app_data, user_data) -> None:
+        """Row click: show the item's bytes in the hex editor (opened on
+        demand — a click never leaves the user without the bytes)."""
+        if sender is not None and dpg.does_item_exist(sender):
+            dpg.set_value(sender, False)  # selectables are buttons here
+        offset = self.spec.offset(self.info, user_data) if self.spec.offset else None
+        if offset is None:
+            dpg.set_value(self.status_tag, "This row has no bytes in the file")
+            return
+        if self.app.show_in_editor(self.path, offset):
+            dpg.set_value(
+                self.status_tag, f"Jumped to 0x{offset:08x} in the hex editor"
+            )
 
 
 # ── opener ────────────────────────────────────────────────────────────────────
 
 
+def open_table_view(app: GuiApp, controller_factory, title: str) -> TableController:
+    """Shared tool-window construction of the table views.
+
+    *controller_factory* is ``(window, status_tag, ns) -> TableController``;
+    the controller builds its widgets into the window's content area.
+    """
+    ns, window, content, status_tag = build_tool_window(
+        app, title, TABLE_WIN_W, TABLE_WIN_H
+    )
+    controller = controller_factory(window, status_tag, ns)
+    controller.build(content)
+    app.register_tool(window, status_tag, controller, tick=controller.tick)
+    return controller
+
+
 def open_inspector(app: GuiApp, kind: str, path: str) -> None:
     """Open the *kind* view for *path* in a floating tool window.
 
-    Fails soft (silent return) when the kind is unknown or *path* is not the shell's currently parsed binary —
-    the menu gating makes both unreachable in practice. An already-open
-    view of the same kind for the same file is focused, not duplicated.
+    Fails soft (silent return) when the kind is unknown or *path* is not the
+    shell's currently parsed binary — the menu gating makes both unreachable
+    in practice. An already-open view of the same kind for the same file is
+    focused, not duplicated.
     """
     spec = _SPECS.get(kind)
     info = app.current_info
     if spec is None or info is None or info.path != path:
         return
-    existing = find_inspector_tool(app, kind, path)
+    existing = find_tool(app, view_kind=kind, path=path)
     if existing is not None:
-        dpg.configure_item(existing.window, show=True)
-        dpg.focus_item(existing.window)
+        focus_tool(existing)
         return
-    ns = app.next_ns()
-    window = f"gui-tool-{ns}"
-    content = f"{window}-content"
-    status_tag = f"{window}-status"
-    table_tag = f"{ns}-tbl"
-    with dpg.window(
-        tag=window,
-        label=f"{spec.title} — {os.path.basename(path)}",
-        width=TABLE_WIN_W,
-        height=TABLE_WIN_H,
-        min_size=[TOOL_MIN_W, TOOL_MIN_H],
-        no_collapse=True,
-        on_close=lambda *_a: _tool_window_closed(app, window),
-    ):
-        dpg.add_child_window(tag=content, border=False, height=-STATUS_RESERVE)
-        dpg.add_separator()
-        dpg.add_text("", tag=status_tag)
-    controller = TableController(
+    controller = open_table_view(
         app,
-        spec,
-        info,
-        window=window,
-        status_tag=status_tag,
-        table_tag=table_tag,
-        ns=ns,
+        lambda window, status_tag, ns: TableController(
+            app, spec, info, window=window, status_tag=status_tag, ns=ns
+        ),
+        f"{spec.title} — {os.path.basename(path)}",
     )
-    filter_buttons: dict[str, int | str] = {}
-    if spec.filters:
-        with dpg.group(horizontal=True, parent=content):
-            dpg.add_text("Filter:")
-            for f in spec.filters:
-                tag = f"{ns}-flt-{f.key}"
-                filter_buttons[f.key] = tag
-                dpg.add_button(
-                    tag=tag,
-                    label=f.label,
-                    callback=partial(controller._on_filter, f.key),
-                )
-    controller.filter_buttons = filter_buttons
-    controller._mark_active_button()
-    with dpg.table(
-        tag=table_tag,
-        parent=content,
-        header_row=True,
-        row_background=True,
-        borders_innerH=True,
-        borders_outerH=True,
-        scrollY=True,
-        policy=dpg.mvTable_SizingStretchProp,
-    ):
-        for i, col in enumerate(spec.columns):
-            weight = spec.weights[i] if i < len(spec.weights) else 1.0
-            dpg.add_table_column(label=col, init_width_or_weight=weight)
     controller.refresh()
-    app.tools.append(
-        Tool(
-            window=window,
-            status_tag=status_tag,
-            controller=controller,
-            grids=(),
-            tick=None,
-        )
-    )
 
 
-def _opener_for(kind: str) -> Callable[[GuiApp, str], None]:
-    """Registry-shaped opener (app, path) for one view kind."""
-
-    def _open(app: GuiApp, path: str) -> None:
-        open_inspector(app, kind, path)
-
-    return _open
-
-
-def register_inspector_openers() -> None:
-    """Publish every inspector opener into the shell's registry."""
-    from cheerleader.gui.app import _INSPECTOR_OPENERS
-
-    for kind in _SPECS:
-        _INSPECTOR_OPENERS.setdefault(kind, _opener_for(kind))
-    
-    from cheerleader.gui import disasm as _disasm
-
-    _disasm.register_opener()
+def openers() -> dict[str, Callable[[GuiApp, str], None]]:
+    """Shell-registry-shaped openers ``(app, path)``, one per table kind."""
+    return {
+        kind: (lambda app, path, kind=kind: open_inspector(app, kind, path))
+        for kind in _SPECS
+    }

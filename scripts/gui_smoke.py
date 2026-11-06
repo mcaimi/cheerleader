@@ -31,6 +31,7 @@ import tempfile
 NOP = b"\x1f\x20\x03\xd5"  # arm64 nop — the fixture's __text payload
 
 CHILD_MAIN = "from cheerleader.gui import main; main()"
+CONFIG_DIR_ENV = "CHEERLEADER_CONFIG_DIR"  # see cheerleader.gui.settings
 
 
 def _write_inputs(tmp: str) -> tuple[str, str]:
@@ -132,8 +133,7 @@ def headless_checks() -> None:
             build_shell(app)
             # Drive the real menu path: File → Open File… pick loads the file
             # and enables Tools → Hex Editor…; clicking it opens the editor.
-            from cheerleader.gui.app import MI_EDITOR
-            from cheerleader.gui.const import SHELL_STATUS, SHELL_STATUS_BAR
+            from cheerleader.gui.const import MI_EDITOR, SHELL_STATUS, SHELL_STATUS_BAR
 
             dpg.get_item_callback(DLG_OPEN)(DLG_OPEN, {"selections": {"file_1": a}})
             assert app.current_file == a
@@ -144,7 +144,7 @@ def headless_checks() -> None:
             # Disassembler menu (plan v3 D1) and auto-opens the Disassembly
             # view (plan v3 D3).
             _settle_parse(app)
-            from cheerleader.gui.app import DISASM_ITEMS
+            from cheerleader.gui.const import DISASM_ITEMS
 
             assert app.current_info is not None
             assert app.current_info.path == a
@@ -167,7 +167,7 @@ def headless_checks() -> None:
             build_shell(app)
             # Disassembler menu → table views (plan v3 D2): menu callbacks
             # open floating read-only views over the parsed binary.
-            from cheerleader.gui.app import MI_SEGMENTS, MI_SYMBOLS
+            from cheerleader.gui.const import MI_SEGMENTS, MI_SYMBOLS
 
             dpg.get_item_callback(DLG_OPEN)(DLG_OPEN, {"selections": {"file_1": a}})
             _settle_parse(app)
@@ -211,8 +211,8 @@ def headless_checks() -> None:
             build_shell(app)
             # Disassembler → Strings… (plan v3 D5): menu callback opens the
             # view, the extraction worker lands, search filters live, and a
-            # row click jumps into an already-open hex editor.
-            from cheerleader.gui.app import MI_EDITOR, MI_STRINGS
+            # row click shows the string in the hex editor (opened on demand).
+            from cheerleader.gui.const import MI_STRINGS
 
             dpg.get_item_callback(DLG_OPEN)(DLG_OPEN, {"selections": {"file_1": a}})
             _settle_parse(app)
@@ -241,20 +241,21 @@ def headless_checks() -> None:
             dpg.set_value(ctl.search_tag, "")
             app.tick()
             assert len(dpg.get_item_children(ctl.table_tag)[1]) == 4
-            # row click with no hex editor open → status hint, no new tools
+            # row click with no hex editor open → one is opened at 0x1B8
             payload_row = dpg.get_item_children(ctl.table_tag)[1][3]
             sel = dpg.get_item_children(payload_row)[1][0]
             cfg = dpg.get_item_configuration(sel)
             cfg["callback"](sel, None, cfg["user_data"])
-            assert "Hex Editor" in dpg.get_value(ctl.status_tag)
-            assert len(app.tools) == 1
-            # now with the editor open: the click jumps to 0x1B8
-            dpg.get_item_callback(MI_EDITOR)()
-            app.tick()
-            cfg["callback"](sel, None, cfg["user_data"])
+            assert len(app.tools) == 2
             ed = next(t for t in app.tools if getattr(t.controller, "doc", None))
             assert ed.controller.grid.cursor == 0x1B8
             assert "Jumped to 0x000001b8" in dpg.get_value(ctl.status_tag)
+            # with the editor already open: the click reuses it
+            app.tick()
+            ed.controller.grid.move_to(0)
+            cfg["callback"](sel, None, cfg["user_data"])
+            assert len(app.tools) == 2
+            assert ed.controller.grid.cursor == 0x1B8
             # focus guard: re-firing Strings… must not duplicate
             dpg.get_item_callback(MI_STRINGS)()
             assert len(app.tools) == 2
@@ -329,6 +330,9 @@ def main() -> int:
         help="watchdog window per live launch (default: 8)",
     )
     args = parser.parse_args()
+    # Throwaway preferences: the open flows record recent files, and the
+    # live child inherits the environment.
+    os.environ[CONFIG_DIR_ENV] = tempfile.mkdtemp(prefix="cheerleader-gui-smoke-")
 
     print("cheerleader-gui smoke — headless shell + open-flow checks")
     try:

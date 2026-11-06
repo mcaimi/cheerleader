@@ -32,10 +32,17 @@ Worker contract (mirrors the TUI's exclusive ``hexcmp`` worker group):
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
+from typing import TYPE_CHECKING
 
-from cheerleader.gui.app import GuiApp, human_size
 from cheerleader.gui.const import SLIDER_RESERVE
 from cheerleader.gui.hexgrid import HexGrid
+from cheerleader.gui.theme import COL_DIFF, COL_SAME
+from cheerleader.gui.tooling import (
+    add_tool_menu,
+    delete_if_exists,
+    human_size,
+    install_keys,
+)
 from cheerleader.gui.workers import (
     BusyTracker,
     EventKind,
@@ -46,14 +53,13 @@ from cheerleader.gui.workers import (
 )
 from cheerleader.libs.hexdoc import DIFF_BLOCK, HexDocument, iter_diff
 
+if TYPE_CHECKING:
+    from cheerleader.gui.app import GuiApp
+
 try:
     import dearpygui.dearpygui as dpg
 except ImportError:  # pragma: no cover - gui/__init__ prints the hint first
     dpg = None  # type: ignore[assignment]
-
-# TUI HexCompareView parity: matching bytes green, differing red.
-COL_SAME = (110, 200, 110, 255)
-COL_DIFF = (255, 100, 100, 255)
 
 
 class CompareController:
@@ -94,7 +100,7 @@ class CompareController:
         self._nav_bpl = left_grid.bpl
         self._note: str | None = None
         self._synced = 0  # last top_row propagated to both panes
-        self._pane_w = -1  # last pane width pushed to the containers
+        self._pane_size: tuple[int, int] | None = None  # last size pushed to the panes
         # Shared scroll range + per-pane coloring + row-scrolling keys. The
         # range reads the sizes live (reload may change them via reopen).
         for grid in (left_grid, right_grid):
@@ -104,6 +110,15 @@ class CompareController:
         left_grid.color_for = self._left_color
         right_grid.color_for = self._right_color
         self._install_keys()
+        # Bar buttons mirror the keys (discoverability).
+        add_tool_menu(
+            window,
+            [
+                ("◀ Prev diff (P)", "", self.action_prev_diff),
+                ("Next diff (N) ▶", "", self.action_next_diff),
+                ("Rescan (R)", "", self.action_reload),
+            ],
+        )
 
     def _shared_rows(self) -> int:
         """Total rows of the longer document (shared scroll range)."""
@@ -114,11 +129,16 @@ class CompareController:
 
     def _install_keys(self) -> None:
         """Register the compare mode's global key handlers (per-instance)."""
-        with dpg.handler_registry(tag=f"compare-keys-{self.ns}"):
-            dpg.add_key_press_handler(key=dpg.mvKey_N, callback=self._on_next_key)
-            dpg.add_key_press_handler(key=dpg.mvKey_P, callback=self._on_prev_key)
-            dpg.add_key_press_handler(key=dpg.mvKey_R, callback=self._on_reload_key)
-            dpg.add_key_press_handler(key=dpg.mvKey_Escape, callback=self._on_escape)
+        install_keys(
+            f"compare-keys-{self.ns}",
+            self.window,
+            [
+                (dpg.mvKey_N, self._on_next_key),
+                (dpg.mvKey_P, self._on_prev_key),
+                (dpg.mvKey_R, self._on_reload_key),
+                (dpg.mvKey_Escape, self._on_escape),
+            ],
+        )
 
     def start(self) -> None:
         """Start the initial (or restarted) background comparison."""
@@ -178,9 +198,9 @@ class CompareController:
             return
         width = max((int(w) - 2 * SLIDER_RESERVE) // 2, 100)
         height = max(int(h), 100)
-        if (width, height) == self._pane_w:
+        if (width, height) == self._pane_size:
             return
-        self._pane_w = (width, height)
+        self._pane_size = (width, height)
         for tag in self._pane_tags:
             if dpg.does_item_exist(tag):
                 dpg.configure_item(tag, width=width, height=height)
@@ -229,7 +249,7 @@ class CompareController:
             self._note = "No further differences"
             self.update_status()
             return
-        self._set_top(self._diff_rows[idx])
+        self._go_to_diff(idx)
 
     def action_prev_diff(self) -> None:
         idx = bisect_left(self._diff_rows, self.left_grid.top_row) - 1
@@ -237,7 +257,16 @@ class CompareController:
             self._note = "No previous differences"
             self.update_status()
             return
+        self._go_to_diff(idx)
+
+    def _go_to_diff(self, idx: int) -> None:
+        """Scroll differing row *idx* to the top and say where it sits."""
         self._set_top(self._diff_rows[idx])
+        total = len(self._diff_rows)
+        more = "+" if self.busy.op == "comparing" else ""  # still scanning
+        offset = self._diff_rows[idx] * self._nav_bpl
+        self._note = f"diff {idx + 1} of {total:,}{more}  at 0x{offset:08x}"
+        self.update_status()
 
     # ── scan control ────────────────────────────────────────────────────────
 
@@ -317,7 +346,7 @@ class CompareController:
             extra = self._note
         if extra:
             parts.append(extra)
-        parts.append("Ctrl+Q quit")
+        parts.append("F1 shortcuts")
         dpg.set_value(self.status_tag, "  │  ".join(parts))
 
     def _first_diff_offset(self, block: int) -> int:
@@ -352,7 +381,7 @@ class CompareController:
                 first = self._first_diff_offset(first_block)
                 summary = (
                     f"{diff_bytes:,} differing bytes  first at 0x{first:08x}"
-                    "  n/p → next/prev diff"
+                    "  N / P → next / prev diff"
                 )
             self._note = None
             self.update_status(summary)
@@ -372,5 +401,4 @@ class CompareController:
         """Teardown before the tool window is deleted: worker + keys."""
         if self.busy.op is not None and self.busy.worker is not None:
             self.busy.worker.cancel.cancel()
-        if dpg.does_item_exist(f"compare-keys-{self.ns}"):
-            dpg.delete_item(f"compare-keys-{self.ns}")
+        delete_if_exists(f"compare-keys-{self.ns}")

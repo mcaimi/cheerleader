@@ -22,18 +22,17 @@ from cheerleader.gui.app import (
     DISASM_ITEMS,
     DLG_OPEN,
     MENU_TAG,
-    MI_DISASM,
     MI_EDITOR,
-    MI_SEGMENTS,
     SHELL_STATUS,
     SHELL_STATUS_BAR,
     WIN_TAG,
     GuiApp,
     build_shell,
-    find_inspector_tool,
     open_compare,
     open_editor,
 )
+from cheerleader.gui.const import MI_DISASM, MI_SEGMENTS
+from cheerleader.gui.tooling import find_tool
 from cheerleader.gui.workers import EventKind, UiEvent
 
 DATA = bytes(range(256)) * 16  # 4 KiB
@@ -56,11 +55,6 @@ def _error_popups() -> list[str]:
         for alias in (dpg.get_item_alias(w),)
         if alias.startswith("gui-error-")
     ]
-
-
-def _popup_message(tag: str) -> str:
-    """An ErrorPopup's message (its first child is the wrapped text)."""
-    return dpg.get_value(dpg.get_item_children(tag)[1][0])
 
 
 def _menu_labels() -> list[str]:
@@ -126,7 +120,14 @@ def test_build_shell_minimal(dpg_context) -> None:
     assert _menu_labels() == [
         "File",
         "Open File…",
+        "Open Recent",
+        "(no recent files)",
+        "",  # separator
         "Quit",
+        "View",
+        "Zoom In",
+        "Zoom Out",
+        "Actual Size",
         "Disassembler",
         "Disassembly…",
         "Segments…",
@@ -143,8 +144,11 @@ def test_build_shell_minimal(dpg_context) -> None:
         "Tools",
         "Hex Editor…",
         "Hex Compare…",
-        "About",
-        "Info",
+        "Window",
+        "(no open windows)",
+        "Help",
+        "Keyboard Shortcuts",
+        "About Cheerleader",
     ]
     # File → Open File… dialog exists, hidden until the menu shows it.
     assert dpg.does_item_exist(DLG_OPEN)
@@ -160,9 +164,10 @@ def test_build_shell_minimal(dpg_context) -> None:
     # Bottom bar exists but stays hidden until a file is loaded.
     assert dpg.does_item_exist(SHELL_STATUS_BAR)
     assert dpg.get_item_configuration(SHELL_STATUS_BAR)["show"] is False
-    # Global key registry: Ctrl+Q quit + Ctrl+O open.
+    # Global key registry: Ctrl+Q quit, Ctrl+O open, F1 help, zoom in
+    # (= under both spellings + keypad), zoom out (- + keypad), Ctrl+0.
     assert dpg.does_item_exist("gui-global-keys")
-    assert len(dpg.get_item_children("gui-global-keys")[1]) == 2
+    assert len(dpg.get_item_children("gui-global-keys")[1]) == 9
     assert app.tools == []
 
 
@@ -277,7 +282,7 @@ def test_open_editor_flow(dpg_context, tmp_path) -> None:
     assert "sample.bin" in status
     assert "4.0 KiB" in status
     assert "0x00000000" in status
-    assert "Ctrl+Q quit" in status
+    assert "F1 shortcuts" in status
     app.tick()  # grid maintenance runs without a display
     assert dpg.get_value("t1-hexgrid-r0-off") == "00000000  "
 
@@ -565,7 +570,7 @@ def test_open_file_parses_binary_and_enables_disasm(dpg_context, tmp_path) -> No
     assert len(_error_popups()) == 0
 
 
-def test_open_file_garbage_pops_error_disasm_stays_grayed(
+def test_open_file_garbage_notes_status_disasm_stays_grayed(
     dpg_context, tmp_path
 ) -> None:
     """An unrecognized file keeps the hex flow live but grays the menu."""
@@ -578,16 +583,15 @@ def test_open_file_garbage_pops_error_disasm_stays_grayed(
     assert app.current_file == str(path)
     assert dpg.get_item_configuration(MI_EDITOR)["enabled"] is True
     assert dpg.get_item_configuration(SHELL_STATUS_BAR)["show"] is True
-    assert dpg.get_value(SHELL_STATUS) == str(path)
     # …but no binary model and the Disassembler menu stays grayed.
     assert app.current_info is None
     for tag in DISASM_ITEMS:
         assert dpg.get_item_configuration(tag)["enabled"] is False
-    popups = _error_popups()
-    assert len(popups) == 1
-    message = _popup_message(popups[0])
-    assert "Cannot disassemble" in message
-    assert str(path) in message
+    # Not an error: a status-bar note, no modal popup.
+    assert _error_popups() == []
+    status = dpg.get_value(SHELL_STATUS)
+    assert status.startswith(str(path))
+    assert "Disassembler unavailable" in status
 
 
 def test_reopen_file_replaces_and_clears_current_info(dpg_context, tmp_path) -> None:
@@ -647,7 +651,7 @@ def test_inspector_menu_items_inert_without_file(dpg_context) -> None:
     assert len(_error_popups()) == 0
 
 
-def test_find_inspector_tool_matches_kind_and_path(dpg_context) -> None:
+def test_find_tool_matches_kind_and_path(dpg_context) -> None:
     """The focus guard matches (view_kind, path) across open tools."""
     app = GuiApp()
     app.tools.append(
@@ -659,11 +663,139 @@ def test_find_inspector_tool_matches_kind_and_path(dpg_context) -> None:
     app.tools.append(
         SimpleNamespace(controller=SimpleNamespace(view_kind="segments", path="/x/b"))
     )
-    assert find_inspector_tool(app, "segments", "/x/a") is app.tools[0]
-    assert find_inspector_tool(app, "symbols", "/x/a") is app.tools[1]
-    assert find_inspector_tool(app, "segments", "/x/b") is app.tools[2]
-    assert find_inspector_tool(app, "exports", "/x/a") is None
-    assert find_inspector_tool(app, "segments", "/x/zzz") is None
+    assert find_tool(app, view_kind="segments", path="/x/a") is app.tools[0]
+    assert find_tool(app, view_kind="symbols", path="/x/a") is app.tools[1]
+    assert find_tool(app, view_kind="segments", path="/x/b") is app.tools[2]
+    assert find_tool(app, view_kind="exports", path="/x/a") is None
+    assert find_tool(app, view_kind="segments", path="/x/zzz") is None
     # Tools without the inspector attributes (e.g. hex editors) never match.
     app.tools.append(SimpleNamespace(controller=object()))
-    assert find_inspector_tool(app, "", "") is None
+    assert find_tool(app, view_kind="", path="") is None
+
+
+# ── Phase 3: start panel, recent files, Window menu, zoom, help ───────────────
+
+
+def _texts_under(tag) -> list[str]:
+    """Every text value / button+selectable label below *tag* (depth-first)."""
+    out: list[str] = []
+    for child in dpg.get_item_children(tag)[1]:
+        info = dpg.get_item_info(child)["type"]
+        if info.endswith("mvText"):
+            out.append(dpg.get_value(child))
+        elif info.endswith(("mvButton", "mvSelectable")):
+            out.append(dpg.get_item_label(child))
+        out.extend(_texts_under(child))
+    return out
+
+
+def test_non_executable_opens_hex_editor(dpg_context, tmp_path) -> None:
+    path = tmp_path / "raw.bin"
+    path.write_bytes(DATA)
+    app = GuiApp()
+    build_shell(app)
+    _pick_file(app, path)
+    assert len(app.tools) == 1
+    assert app.tools[0].controller.doc.path == str(path)
+
+
+def test_start_panel_then_summary_card(dpg_context, tmp_path) -> None:
+    from cheerleader.gui.const import SHELL_FILL
+
+    app = GuiApp()
+    build_shell(app)
+    texts = _texts_under(SHELL_FILL)
+    assert any("Open File…" in t for t in texts)
+    assert any("F1" in t for t in texts)
+    path = tmp_path / "raw.bin"
+    path.write_bytes(DATA)
+    _pick_file(app, path)
+    texts = _texts_under(SHELL_FILL)
+    assert "raw.bin" in texts
+    assert any("hex tools only" in t for t in texts)
+    assert "Hex Editor" in texts and "Disassembly" in texts
+
+
+def test_recent_files_persist_and_reopen(dpg_context, tmp_path) -> None:
+    from cheerleader.gui.app import open_file
+    from cheerleader.gui.const import MI_RECENT
+    from cheerleader.gui.settings import Settings
+
+    a, b = tmp_path / "a.bin", tmp_path / "b.bin"
+    a.write_bytes(DATA)
+    b.write_bytes(DATA)
+    app = GuiApp()
+    build_shell(app)
+    _pick_file(app, a)
+    _pick_file(app, b)
+    assert Settings.load().recent == [str(b), str(a)]  # most recent first
+    labels = [dpg.get_item_label(c) for c in dpg.get_item_children(MI_RECENT)[1]]
+    assert labels[0].startswith("b.bin") and labels[1].startswith("a.bin")
+    # a vanished recent file: error popup + entry dropped
+    a.unlink()
+    open_file(app, str(a))
+    assert len(_error_popups()) == 1
+    assert Settings.load().recent == [str(b)]
+
+
+def test_window_menu_lists_tools(dpg_context, tmp_path) -> None:
+    from cheerleader.gui.app import close_all_windows
+    from cheerleader.gui.const import WINDOW_MENU
+
+    path = tmp_path / "sample.bin"
+    path.write_bytes(DATA)
+    app = GuiApp()
+    build_shell(app)
+    open_editor(app, str(path))
+    labels = [dpg.get_item_label(c) for c in dpg.get_item_children(WINDOW_MENU)[1]]
+    assert labels[0] == "hex editor — sample.bin"
+    assert "Close all windows" in labels
+    # a dirty editor survives "Close all"
+    app.tools[0].controller.type_hex_digit(0xA)
+    close_all_windows(app)
+    assert len(app.tools) == 1
+    app.tools[0].controller.action_undo()
+    close_all_windows(app)
+    assert app.tools == []
+    labels = [dpg.get_item_label(c) for c in dpg.get_item_children(WINDOW_MENU)[1]]
+    assert labels == ["(no open windows)"]
+
+
+def test_tool_windows_cascade(dpg_context, tmp_path) -> None:
+    a, b = tmp_path / "a.bin", tmp_path / "b.bin"
+    a.write_bytes(DATA)
+    b.write_bytes(DATA)
+    app = GuiApp()
+    open_editor(app, str(a))
+    open_editor(app, str(b))
+    p1, p2 = (dpg.get_item_pos(t.window) for t in app.tools)
+    assert p1 != p2 and p2[0] > p1[0] and p2[1] > p1[1]
+
+
+def test_zoom_clamps_persists_and_relayouts(dpg_context, tmp_path) -> None:
+    from cheerleader.gui.settings import Settings
+
+    path = tmp_path / "sample.bin"
+    path.write_bytes(DATA)
+    app = GuiApp()
+    open_editor(app, str(path))
+    grid = app.tools[0].grids[0]
+    grid._last_parent_size = (100, 100)
+    app.set_zoom(1.3)
+    assert abs(dpg.get_global_font_scale() - 1.3) < 1e-6
+    assert grid._last_parent_size is None  # re-fit next frame
+    assert Settings.load().zoom == 1.3
+    app.set_zoom(99)
+    assert app.zoom == 2.5  # clamped
+
+
+def test_shortcuts_dialog_single_instance(dpg_context) -> None:
+    from cheerleader.gui.app import show_shortcuts
+
+    app = GuiApp()
+    build_shell(app)
+    show_shortcuts(app)
+    first = app._shortcuts_dlg
+    show_shortcuts(app)  # F1 again while open: no second window
+    assert app._shortcuts_dlg is first
+    assert dpg.does_item_exist(first.TAG)

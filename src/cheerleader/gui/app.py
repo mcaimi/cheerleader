@@ -1,27 +1,33 @@
 """
 Dear PyGui application shell for the cheerleader hex UI.
 
-``cheerleader-gui`` takes no CLI switches: launching shows an empty shell
-window with a **File** / **Tools** / **Disassembler** menu bar.
-``File → Open File…`` (Ctrl+O) loads a file (parsed in the background);
-``Tools → Hex Editor…`` — grayed out until a file is loaded — displays it
-in a floating editor window, ``Tools → Hex Compare…`` opens a two-file
-picker (Source/Target), and the **Disassembler** menu — grayed until a
-*supported binary* (Mach-O/ELF) is loaded — opens binary-inspection views
-(plan v3). Tools show in **floating windows** — several may be open at
-once, each with its own status strip.
+``cheerleader-gui`` takes no CLI switches: launching shows the shell
+window — a **File / View / Disassembler / Tools / Window / Help** menu bar
+over a start panel (open, compare, recent files). ``File → Open File…``
+(Ctrl+O) or ``File → Open Recent`` loads a file (parsed in the
+background) and turns the panel into the file's summary card; a supported
+binary (Mach-O/ELF) opens the Disassembly view and enables the
+**Disassembler** menu's inspection views (plan v3), anything else opens
+in the hex editor. Tools show in cascaded **floating windows** — several
+may be open at once, each with its own menu bar and status strip; the
+**Window** menu lists and arranges them. Recent files and the View zoom
+persist via :mod:`cheerleader.gui.settings`.
 
 Frame loop::
 
     while running:
+        dpg.run_callbacks(queue)          # widget callbacks, on this thread
         for event in bridge.drain():      # worker results → owning tool
             dispatch(event)               # routed by worker identity
         app.tick()                        # every tool's per-frame maintenance
         dpg.render_dearpygui_frame()
 
-Threading model: tool/controller state is owned by the main frame loop. DPG
-widget callbacks run inside ``render_dearpygui_frame()`` on the main thread;
-worker threads only touch :class:`~cheerleader.gui.workers.UiBridge`.
+Threading model: tool/controller state is owned by the main frame loop.
+DPG's default runs widget callbacks on a separate callback thread, where
+they would race the loop's own widget mutations (and DPG's shared ``with``
+container stack); the app therefore enables manual callback management and
+runs the queued callbacks at the top of each frame, on the main thread.
+Worker threads only touch :class:`~cheerleader.gui.workers.UiBridge`.
 
 Quit paths: the viewport is created with ``disable_close=True`` (no close
 veto exists) and tool windows route their X through
@@ -34,18 +40,23 @@ from __future__ import annotations
 
 import itertools
 import os
+import sys
 from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Protocol
 
 from cheerleader.formats import parse as parse_binary
+from cheerleader.gui import disasm, strings, views
+from cheerleader.gui.compare import CompareController
 from cheerleader.gui.const import (
     APP_TITLE,
     APP_VERSION,
+    CASCADE_ORIGIN,
+    CASCADE_SLOTS,
+    CASCADE_STEP,
     COMPARE_WIN_H,
     COMPARE_WIN_W,
     DISASM_ITEMS,
     DISASM_MENU,
+    DISASM_MENU_ITEMS,
     DLG_OPEN,
     EDITOR_WIN_H,
     EDITOR_WIN_W,
@@ -54,17 +65,12 @@ from cheerleader.gui.const import (
     FONT_CANDIDATES,
     FONT_ENV_VAR,
     FONT_SIZE,
+    KEY_EQUAL,
     MENU_TAG,
-    MI_DISASM,
     MI_EDITOR,
-    MI_EXPORTS,
-    MI_FIXUPS,
-    MI_IMPORTS,
     MI_INFO,
-    MI_SECTIONS,
-    MI_SEGMENTS,
-    MI_STRINGS,
-    MI_SYMBOLS,
+    MI_RECENT,
+    MI_SHORTCUTS,
     MIN_VIEWPORT_H,
     MIN_VIEWPORT_W,
     SHELL_FILL,
@@ -73,22 +79,37 @@ from cheerleader.gui.const import (
     SLIDER_RESERVE,
     SRC_URL,
     STATUS_RESERVE,
-    TOOL_MIN_H,
-    TOOL_MIN_W,
     VIEWPORT_H,
     VIEWPORT_TITLE,
     VIEWPORT_W,
     WIN_TAG,
+    WINDOW_MENU,
+    ZOOM_MAX,
+    ZOOM_MIN,
+    ZOOM_STEP,
 )
 from cheerleader.gui.dialogs import (
     CompareOpenDialog,
     ConfirmDialog,
     ErrorPopup,
     InfoDialog,
+    ShortcutsDialog,
     add_all_files_filter,
     picked_path,
 )
+from cheerleader.gui.editor import EditorController
 from cheerleader.gui.hexgrid import HexGrid
+from cheerleader.gui.settings import Settings
+from cheerleader.gui.theme import COL_BLUE, COL_DIM, COL_YELLOW, build_theme
+from cheerleader.gui.tooling import (
+    Controller,
+    Tool,
+    build_tool_window,
+    ctrl_down,
+    find_editor,
+    focus_tool,
+    human_size,
+)
 from cheerleader.gui.workers import (
     EventKind,
     UiBridge,
@@ -103,40 +124,6 @@ try:
     import dearpygui.dearpygui as dpg
 except ImportError:  # pragma: no cover - main() prints the install hint first
     dpg = None  # type: ignore[assignment]
-
-
-def human_size(size: int) -> str:
-    """Human-readable byte size: '300 bytes', '1.0 KiB', '336.5 MiB'."""
-    if size >= 1024 * 1024 * 1024:
-        return f"{size / (1024 * 1024 * 1024):.1f} GiB"
-    if size >= 1024 * 1024:
-        return f"{size / (1024 * 1024):.1f} MiB"
-    if size >= 1024:
-        return f"{size / 1024:.1f} KiB"
-    return f"{size} bytes"
-
-
-class Controller(Protocol):
-    """What the shell needs from a tool's controller."""
-
-    def on_event(self, event: UiEvent) -> None: ...
-
-    def dirty_edit_count(self) -> int: ...
-
-    def window_close_requested(self) -> None: ...
-
-    def shutdown(self) -> None: ...
-
-
-@dataclass(eq=False)
-class Tool:
-    """One open floating tool window (editor or compare) and its parts."""
-
-    window: int | str
-    status_tag: int | str
-    controller: Controller
-    grids: tuple[HexGrid, ...]
-    tick: Callable[[], None] | None
 
 
 class GuiApp:
@@ -162,10 +149,77 @@ class GuiApp:
         # are not supported executables (hex tools still work).
         self.current_info: BinaryInfo | None = None
         self._parse_worker: WorkerHandle | None = None
+        self.settings = Settings.load()  # recent files + zoom
+        self._pos_counter = itertools.count()
+        self._font_base_scale = 1.0  # 0.5 when a 2x font is loaded (HiDPI)
+        self._shortcuts_dlg: ShortcutsDialog | None = None
+
+    def next_window_pos(self) -> list[int]:
+        """Cascade position for the next tool window."""
+        i = next(self._pos_counter) % CASCADE_SLOTS
+        x0, y0 = CASCADE_ORIGIN
+        return [x0 + i * CASCADE_STEP, y0 + i * CASCADE_STEP]
+
+    # ── zoom (View menu, Ctrl+= / Ctrl+- / Ctrl+0) ────────────────────────
+
+    @property
+    def zoom(self) -> float:
+        return self.settings.zoom
+
+    def set_zoom(self, zoom: float) -> None:
+        """Scale every font by *zoom* (clamped); grids re-fit next frame."""
+        zoom = round(min(max(zoom, ZOOM_MIN), ZOOM_MAX), 2)
+        self.settings.zoom = zoom
+        self.settings.save()
+        self.apply_zoom()
+
+    def apply_zoom(self) -> None:
+        dpg.set_global_font_scale(self._font_base_scale * self.settings.zoom)
+        for tool in self.tools:
+            for grid in tool.grids:
+                grid.invalidate_layout()
 
     def next_ns(self) -> str:
         """Unique per-app namespace for a new tool's tags/registries."""
         return f"t{next(self._ns_counter)}"
+
+    def register_tool(
+        self,
+        window: int | str,
+        status_tag: int | str,
+        controller: Controller,
+        *,
+        grids: tuple = (),
+        tick: Callable[[], None] | None = None,
+    ) -> Tool:
+        """Track a newly opened tool (event dispatch, tick, quit, close)."""
+        tool = Tool(
+            window=window,
+            status_tag=status_tag,
+            controller=controller,
+            grids=grids,
+            tick=tick,
+        )
+        self.tools.append(tool)
+        _refresh_window_menu(self)
+        return tool
+
+    def show_in_editor(self, path: str, offset: int) -> bool:
+        """Show *offset* of *path* in its hex editor, opening one if needed.
+
+        Returns False when the editor could not be opened (the open path
+        already reported why).
+        """
+        tool = find_editor(self, path)
+        if tool is None:
+            open_editor(self, path)
+            tool = find_editor(self, path)
+            if tool is None:
+                return False
+        else:
+            focus_tool(tool)
+        tool.controller.grid.move_to(offset)
+        return True
 
     def dispatch(self, event: UiEvent) -> None:
         """Route a worker event to the tool whose busy worker posted it.
@@ -225,20 +279,27 @@ class GuiApp:
         if info.error is not None:
             # Not a supported executable (or unparseable): the hex flow is
             # already live for this file; the Disassembler menu stays grayed.
+            # A status note, not a modal — hex-editing arbitrary files is a
+            # normal use, not an error.
             self.current_info = None
             _set_disasm_enabled(False)
-            ErrorPopup(f"Cannot disassemble {self.current_file}:\n{info.error}")
+            dpg.set_value(
+                SHELL_STATUS,
+                f"{self.current_file}  │  Disassembler unavailable: {info.error}",
+            )
+            _refresh_landing(self)
+            # Nothing to disassemble: show the bytes instead, so opening a
+            # file always puts something on screen.
+            if self.current_file is not None:
+                open_editor(self, self.current_file)
             return
         self.current_info = info
         _set_disasm_enabled(True)
+        _refresh_landing(self)
         # Plan v3 decision 4: a successful open shows the Disassembly view
         # in a new window (focus guard dedupes same-file re-opens).
-        from cheerleader.gui import views
-
-        views.register_inspector_openers()
-        opener = _INSPECTOR_OPENERS.get("disasm")
-        if opener is not None and self.current_file is not None:
-            opener(self, self.current_file)
+        if self.current_file is not None:
+            INSPECTOR_OPENERS["disasm"](self, self.current_file)
 
     def request_quit(self) -> None:
         """
@@ -283,6 +344,7 @@ class GuiApp:
         if dpg.does_item_exist(tool.window):
             dpg.delete_item(tool.window)
         self.tools[:] = [t for t in self.tools if t is not tool]
+        _refresh_window_menu(self)
 
 
 def _find_font_file() -> str | None:
@@ -293,48 +355,34 @@ def _find_font_file() -> str | None:
     return None
 
 
-def _build_theme() -> None:
-    """Compact dark theme in the spirit of the TUI."""
-    with dpg.theme() as theme, dpg.theme_component(dpg.mvAll):
-        dpg.add_theme_color(dpg.mvThemeCol_WindowBg, (18, 18, 22, 255))
-        dpg.add_theme_color(dpg.mvThemeCol_TitleBg, (28, 28, 34, 255))
-        dpg.add_theme_color(dpg.mvThemeCol_TitleBgActive, (38, 38, 46, 255))
-        dpg.add_theme_color(dpg.mvThemeCol_Text, (216, 216, 222, 255))
-        dpg.add_theme_color(dpg.mvThemeCol_FrameBg, (30, 30, 37, 255))
-        dpg.add_theme_color(dpg.mvThemeCol_FrameBgHovered, (38, 38, 46, 255))
-        dpg.add_theme_color(dpg.mvThemeCol_Button, (44, 44, 54, 255))
-        dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (58, 58, 70, 255))
-        dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (72, 72, 86, 255))
-        dpg.add_theme_color(dpg.mvThemeCol_SliderGrab, (68, 120, 190, 255))
-        dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 6, 4)
-        dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 6, 4)
-    dpg.bind_theme(theme)
-
-
-def _build_font() -> None:
+def _build_font() -> float:
     """
     Bind the first available monospace font; skip on any failure.
 
     The built-in DPG font is fixed-width, so the hex grid stays aligned even
-    when no candidate font exists on the system.
+    when no candidate font exists on the system. Returns the base global
+    font scale: on macOS the font is rasterized at 2x and drawn at 0.5 —
+    the same layout size, but sharp on Retina displays.
     """
     path = _find_font_file()
     if path is None:
-        return
+        return 1.0
+    oversample = 2 if sys.platform == "darwin" else 1
     try:
         with dpg.font_registry():
-            font = dpg.add_font(path, FONT_SIZE)
+            font = dpg.add_font(path, FONT_SIZE * oversample)
         dpg.bind_font(font)
     except (SystemError, RuntimeError, OSError):
         # Corrupt or unsupported font file — the default font is fine.
-        pass
+        return 1.0
+    return 1.0 / oversample
 
 
 def _on_quit_key(app: GuiApp):
     """Global Ctrl+Q handler factory (Q alone would clash with popup typing)."""
 
     def _handler(_sender, _app_data) -> None:
-        if dpg.is_key_down(dpg.mvKey_LControl) or dpg.is_key_down(dpg.mvKey_RControl):
+        if ctrl_down():
             app.request_quit()
 
     return _handler
@@ -344,18 +392,29 @@ def _on_open_key(app: GuiApp):
     """Global Ctrl+O handler: show the File → Open File… dialog."""
 
     def _handler(_sender, _app_data) -> None:
-        if dpg.is_key_down(dpg.mvKey_LControl) or dpg.is_key_down(dpg.mvKey_RControl):
+        if ctrl_down():
             dpg.configure_item(DLG_OPEN, show=True)
 
     return _handler
 
 
-def _tool_window_closed(app: GuiApp, window: int | str) -> None:
-    """``on_close`` of a tool window (X clicked): the controller decides."""
-    for tool in app.tools:
-        if tool.window == window:
-            tool.controller.window_close_requested()
-            return
+def _on_ctrl(action: Callable[[], None]):
+    """Global Ctrl+<key> handler factory."""
+
+    def _handler(*_args) -> None:
+        if ctrl_down():
+            action()
+
+    return _handler
+
+
+def show_shortcuts(app: GuiApp) -> None:
+    """Help ▸ Keyboard shortcuts (F1) — one instance at a time."""
+    dlg = app._shortcuts_dlg
+    if dlg is not None and dpg.does_item_exist(dlg.TAG):
+        return
+    app._shortcuts_dlg = ShortcutsDialog()
+    app._shortcuts_dlg.open()
 
 
 def open_editor(app: GuiApp, path: str) -> None:
@@ -370,48 +429,22 @@ def open_editor(app: GuiApp, path: str) -> None:
     except OSError as e:
         ErrorPopup(f"Cannot open {path}:\n{e}")
         return
-    for tool in app.tools:
-        existing = getattr(tool.controller, "doc", None)
-        if existing is not None and existing.path == path:
-            doc.close()
-            dpg.configure_item(tool.window, show=True)
-            dpg.focus_item(tool.window)
-            return
-    ns = app.next_ns()
-    window = f"gui-tool-{ns}"
-    content = f"{window}-content"
-    status_tag = f"{window}-status"
-    with dpg.window(
-        tag=window,
-        label=f"hex editor — {os.path.basename(path)}",
-        width=EDITOR_WIN_W,
-        height=EDITOR_WIN_H,
-        min_size=[TOOL_MIN_W, TOOL_MIN_H],
-        no_collapse=True,
-        on_close=lambda *_a: _tool_window_closed(app, window),
-    ):
-        dpg.add_child_window(tag=content, border=False, height=-STATUS_RESERVE)
-        dpg.add_separator()
-        dpg.add_text("", tag=status_tag)
+    existing = find_editor(app, path)
+    if existing is not None:
+        doc.close()
+        focus_tool(existing)
+        return
+    ns, window, content, status_tag = build_tool_window(
+        app, f"hex editor — {os.path.basename(path)}", EDITOR_WIN_W, EDITOR_WIN_H
+    )
     grid = HexGrid(doc, name=ns)
     grid.build(content)
-    # Lazy import: this module must stay importable on its own (the editor
-    # imports this module's helpers).
-    from cheerleader.gui.editor import EditorController
-
+    grid.enable_cursor_highlight(window, content)
     controller = EditorController(
         app, grid, doc, window=window, status_tag=status_tag, ns=ns
     )
     controller.update_status()
-    app.tools.append(
-        Tool(
-            window=window,
-            status_tag=status_tag,
-            controller=controller,
-            grids=(grid,),
-            tick=grid.tick,
-        )
-    )
+    app.register_tool(window, status_tag, controller, grids=(grid,), tick=grid.tick)
 
 
 def open_compare(app: GuiApp, left_path: str, right_path: str) -> None:
@@ -431,25 +464,13 @@ def open_compare(app: GuiApp, left_path: str, right_path: str) -> None:
     except OSError as e:
         ErrorPopup(f"Cannot compare:\n{e}")
         return
-    ns = app.next_ns()
-    window = f"gui-tool-{ns}"
-    content = f"{window}-content"
-    status_tag = f"{window}-status"
-    with dpg.window(
-        tag=window,
-        label=(
-            f"hex compare — {os.path.basename(left_path)}"
-            f" ⇄ {os.path.basename(right_path)}"
-        ),
-        width=COMPARE_WIN_W,
-        height=COMPARE_WIN_H,
-        min_size=[TOOL_MIN_W, TOOL_MIN_H],
-        no_collapse=True,
-        on_close=lambda *_a: _tool_window_closed(app, window),
-    ):
-        dpg.add_child_window(tag=content, border=False, height=-STATUS_RESERVE)
-        dpg.add_separator()
-        dpg.add_text("", tag=status_tag)
+    ns, window, content, status_tag = build_tool_window(
+        app,
+        f"hex compare — {os.path.basename(left_path)}"
+        f" ⇄ {os.path.basename(right_path)}",
+        COMPARE_WIN_W,
+        COMPARE_WIN_H,
+    )
     # Dual panes: each grid gets its own container so its measured relayout
     # covers one half of the window.
     pane_l, pane_r = f"{ns}-cmp-l-pane", f"{ns}-cmp-r-pane"
@@ -472,9 +493,6 @@ def open_compare(app: GuiApp, left_path: str, right_path: str) -> None:
     right_grid.build(pane_r)
     # TUI parity: one scrollbar; the left pane's drives both.
     right_grid.set_scrollbar_visible(False)
-    # Lazy import (compare imports this module's helpers).
-    from cheerleader.gui.compare import CompareController
-
     controller = CompareController(
         app,
         left_grid,
@@ -486,14 +504,12 @@ def open_compare(app: GuiApp, left_path: str, right_path: str) -> None:
         ns=ns,
     )
     controller.start()  # initial diff scan
-    app.tools.append(
-        Tool(
-            window=window,
-            status_tag=status_tag,
-            controller=controller,
-            grids=(left_grid, right_grid),
-            tick=controller.tick,
-        )
+    app.register_tool(
+        window,
+        status_tag,
+        controller,
+        grids=(left_grid, right_grid),
+        tick=controller.tick,
     )
 
 
@@ -507,27 +523,43 @@ def _show_dialog(tag: int | str):
 
 
 def _file_picked(app: GuiApp, app_data) -> None:
-    """File → Open File… pick: validate and hold as the shell's current file.
+    """File → Open File… pick (dialog callback)."""
+    path = picked_path(app_data)
+    if path:  # OK with an empty selection — treat like a cancel
+        open_file(app, path)
+
+
+def open_file(app: GuiApp, path: str) -> None:
+    """Load *path* as the shell's current file (Open File…, Open Recent,
+    the start panel).
 
     The file is *loaded* here (a `HexDocument` is constructed to fail fast
-    on vanished/unreadable paths, then released) — the editor itself is
-    displayed only when Tools → Hex Editor… is clicked, which stays grayed
-    out until a file has been picked successfully.
+    on vanished/unreadable paths, then released) and parsed in the
+    background; the parse result opens the Disassembly view for supported
+    binaries, else the hex editor.
     """
-    path = picked_path(app_data)
-    if not path:
-        return  # OK with an empty selection — treat like a cancel
     try:
         doc = HexDocument(path)
     except OSError as e:
         ErrorPopup(f"Cannot open {path}:\n{e}")
+        if path in app.settings.recent:  # a stale recent entry
+            app.settings.remove_recent(path)
+            _refresh_recent_menu(app)
+            _refresh_landing(app)
         return
     doc.close()
+    app.settings.add_recent(path)
+    _refresh_recent_menu(app)
     app.current_file = path
+    # The previous file's binary model no longer applies: gray the
+    # Disassembler menu until this file's parse completes.
+    app.current_info = None
+    _set_disasm_enabled(False)
     dpg.configure_item(MI_EDITOR, enabled=True)
     dpg.configure_item(SHELL_STATUS_BAR, show=True)
     dpg.set_value(SHELL_STATUS, path)
     app._start_parse(path)
+    _refresh_landing(app)
 
 
 def _set_disasm_enabled(enabled: bool) -> None:
@@ -536,26 +568,22 @@ def _set_disasm_enabled(enabled: bool) -> None:
         dpg.configure_item(tag, enabled=enabled)
 
 
-# View openers by kind ("segments", "sections", …), registered by D2/D3;
-# an unregistered kind makes its menu item a silent no-op.
-_INSPECTOR_OPENERS: dict[str, Callable[[GuiApp, str], None]] = {}
+# Inspector view openers by kind — the Disassembler menu's targets (see
+# const.DISASM_MENU_ITEMS). Each takes (app, path) and fails soft when path
+# is not the shell's currently parsed binary.
+INSPECTOR_OPENERS: dict[str, Callable[[GuiApp, str], None]] = {
+    "disasm": disasm.open_disassembly,
+    **views.openers(),
+    "strings": strings.open_strings,
+}
 
 
 def _inspector_menu_opener(app: GuiApp, kind: str):
     """Disassembler menu-item callback factory"""
 
     def _open(*_args) -> None:
-        if app.current_file is None:
-            return
-        # First use: register the D2+ view openers (lazy — views.py
-        # imports this module at module level; registration is idempotent).
-        from cheerleader.gui import strings, views
-
-        views.register_inspector_openers()
-        strings.register_opener()
-        opener = _INSPECTOR_OPENERS.get(kind)
-        if opener is not None:
-            opener(app, app.current_file)
+        if app.current_file is not None:
+            INSPECTOR_OPENERS[kind](app, app.current_file)
 
     return _open
 
@@ -565,9 +593,7 @@ def _engine_menu_pick(value: str):
     choice and refresh the "● " markers."""
 
     def _pick(*_args) -> None:
-        from cheerleader.gui import disasm as disasm_mod
-
-        disasm_mod.set_engine_override(value)
+        disasm.set_engine_override(value)
         _mark_engine_items()
 
     return _pick
@@ -576,32 +602,13 @@ def _engine_menu_pick(value: str):
 def _mark_engine_items() -> None:
     """Engine submenu radio state: "● " prefix on the active choice;
     capstone/objdump items grayed while unavailable in this process."""
-    from cheerleader.gui import disasm as disasm_mod
-
-    active = disasm_mod.engine_override()
+    active = disasm.engine_override()
     for label, value, tag in ENGINE_ITEMS:
         dpg.configure_item(
             tag,
             label=f"● {label}" if value == active else label,
-            enabled=value == "auto" or disasm_mod.engine_available(value),
+            enabled=value == "auto" or disasm.engine_available(value),
         )
-
-
-def find_inspector_tool(app: GuiApp, kind: str, path: str) -> Tool | None:
-    """The open view of *kind* for *path*, if any (focus-guard helper).
-
-    Inspector controllers expose ``view_kind`` and ``path``; used to focus
-    an existing window instead of opening a duplicate (the ``open_editor``
-    duplicate-open guard, generalized to (kind, path)).
-    """
-    for tool in app.tools:
-        ctl = tool.controller
-        if (
-            getattr(ctl, "view_kind", None) == kind
-            and getattr(ctl, "path", None) == path
-        ):
-            return tool
-    return None
 
 
 def _editor_menu_opener(app: GuiApp):
@@ -619,13 +626,167 @@ def _editor_menu_opener(app: GuiApp):
     return _open
 
 
-def _compare_dialog_opener(app: GuiApp):
+def _compare_dialog_opener(app: GuiApp, source: str = ""):
     """Menu-item callback factory: open the two-file compare picker."""
 
     def _open(*_args) -> None:
-        CompareOpenDialog(on_launch=lambda src, tgt: open_compare(app, src, tgt)).open()
+        CompareOpenDialog(
+            on_launch=lambda src, tgt: open_compare(app, src, tgt), source=source
+        ).open()
 
     return _open
+
+
+# ── dynamic shell parts: start panel, Open Recent, Window menu ────────────────
+
+
+def _refresh_landing(app: GuiApp) -> None:
+    """(Re)build the shell's start panel / loaded-file summary card."""
+    if not dpg.does_item_exist(SHELL_FILL):
+        return  # shell not built (headless controller tests)
+    dpg.delete_item(SHELL_FILL, children_only=True)
+    with dpg.group(parent=SHELL_FILL, indent=24):
+        dpg.add_spacer(height=24)
+        if app.current_file is None:
+            _landing_welcome(app)
+        else:
+            _landing_summary(app, app.current_file)
+
+
+def _landing_welcome(app: GuiApp) -> None:
+    dpg.add_text("Cheerleader — your friendly binary inspector", color=COL_BLUE)
+    dpg.add_text(
+        "Open any file to view and edit its bytes; open a Mach-O or ELF "
+        "binary to disassemble and inspect it too.",
+        color=COL_DIM,
+        wrap=640,
+    )
+    dpg.add_spacer(height=12)
+    with dpg.group(horizontal=True):
+        dpg.add_button(label="Open File…  (Ctrl+O)", callback=_show_dialog(DLG_OPEN))
+        dpg.add_button(label="Compare two files…", callback=_compare_dialog_opener(app))
+    if app.settings.recent:
+        dpg.add_spacer(height=16)
+        dpg.add_text("Recent files")
+        for path in app.settings.recent:
+            dpg.add_selectable(
+                label=f"{os.path.basename(path)}    {os.path.dirname(path)}",
+                callback=lambda *_a, p=path: open_file(app, p),
+            )
+    dpg.add_spacer(height=16)
+    dpg.add_text("Press F1 to see every keyboard shortcut.", color=COL_DIM)
+
+
+def _landing_summary(app: GuiApp, path: str) -> None:
+    info = app.current_info
+    dpg.add_text(os.path.basename(path), color=COL_BLUE)
+    try:
+        size = human_size(os.path.getsize(path))
+    except OSError:
+        size = "?"
+    dpg.add_text(f"{path}   ·   {size}", color=COL_DIM)
+    if info is not None:
+        dpg.add_text(
+            f"{info.file_type} · {info.arch} · {info.bits}-bit   —   "
+            f"{len(info.segments)} segments · {len(info.symbols):,} symbols · "
+            f"{len(info.libraries)} libraries"
+        )
+    elif app._parse_worker is not None:
+        dpg.add_text("Parsing…", color=COL_YELLOW)
+    else:
+        dpg.add_text("Not a Mach-O / ELF executable — hex tools only", color=COL_DIM)
+    dpg.add_spacer(height=12)
+    with dpg.group(horizontal=True):
+        dpg.add_button(label="Hex Editor", callback=_editor_menu_opener(app))
+        for label, kind in (("Disassembly", "disasm"), ("Strings", "strings")):
+            dpg.add_button(
+                label=label,
+                enabled=info is not None,
+                callback=_inspector_menu_opener(app, kind),
+            )
+        dpg.add_button(
+            label="Compare with…", callback=_compare_dialog_opener(app, source=path)
+        )
+        dpg.add_button(label="Open another file…", callback=_show_dialog(DLG_OPEN))
+
+
+def _refresh_recent_menu(app: GuiApp) -> None:
+    if not dpg.does_item_exist(MI_RECENT):
+        return
+    dpg.delete_item(MI_RECENT, children_only=True)
+    for path in app.settings.recent:
+        dpg.add_menu_item(
+            label=f"{os.path.basename(path)}    {os.path.dirname(path)}",
+            parent=MI_RECENT,
+            callback=lambda *_a, p=path: open_file(app, p),
+        )
+    if not app.settings.recent:
+        dpg.add_menu_item(label="(no recent files)", enabled=False, parent=MI_RECENT)
+        return
+    dpg.add_separator(parent=MI_RECENT)
+    dpg.add_menu_item(
+        label="Clear recent files",
+        parent=MI_RECENT,
+        callback=lambda *_a: _clear_recent(app),
+    )
+
+
+def _clear_recent(app: GuiApp) -> None:
+    app.settings.clear_recent()
+    _refresh_recent_menu(app)
+    _refresh_landing(app)
+
+
+def _refresh_window_menu(app: GuiApp) -> None:
+    """Window menu: one entry per open tool (click to focus) + arrange."""
+    if not dpg.does_item_exist(WINDOW_MENU):
+        return
+    dpg.delete_item(WINDOW_MENU, children_only=True)
+    for tool in app.tools:
+        exists = dpg.does_item_exist(tool.window)
+        label = dpg.get_item_label(tool.window) if exists else "?"
+        dpg.add_menu_item(
+            label=label,
+            parent=WINDOW_MENU,
+            callback=lambda *_a, t=tool: focus_tool(t),
+        )
+    if not app.tools:
+        dpg.add_menu_item(label="(no open windows)", enabled=False, parent=WINDOW_MENU)
+        return
+    dpg.add_separator(parent=WINDOW_MENU)
+    dpg.add_menu_item(
+        label="Cascade windows",
+        parent=WINDOW_MENU,
+        callback=lambda *_a: cascade_windows(app),
+    )
+    dpg.add_menu_item(
+        label="Close all windows",
+        parent=WINDOW_MENU,
+        callback=lambda *_a: close_all_windows(app),
+    )
+
+
+def cascade_windows(app: GuiApp) -> None:
+    """Re-stack every tool window diagonally, the last one on top."""
+    app._pos_counter = itertools.count()
+    for tool in app.tools:
+        dpg.set_item_pos(tool.window, app.next_window_pos())
+        focus_tool(tool)
+
+
+def close_all_windows(app: GuiApp) -> None:
+    """Close every tool without unsaved edits; dirty editors stay open
+    (each would need its own confirmation)."""
+    for tool in list(app.tools):
+        if tool.controller.dirty_edit_count() == 0:
+            app.close_tool(tool)
+    if app.tools and dpg.does_item_exist(SHELL_STATUS):
+        n = len(app.tools)
+        dpg.configure_item(SHELL_STATUS_BAR, show=True)
+        dpg.set_value(
+            SHELL_STATUS,
+            f"{n} window{'s' if n != 1 else ''} with unsaved edits left open",
+        )
 
 
 def _info_opener(app: GuiApp):
@@ -646,24 +807,39 @@ def build_shell(app: GuiApp) -> int | str:
     floating windows. The open-file dialog is a pre-built top-level item,
     shown by the File menu entry.
     """
-    _build_theme()
-    _build_font()
+    build_theme()
+    app._font_base_scale = _build_font()
+    app.apply_zoom()
     with dpg.window(tag=WIN_TAG), dpg.menu_bar(tag=MENU_TAG):
         with dpg.menu(label="File"):
-            dpg.add_menu_item(label="Open File…", callback=_show_dialog(DLG_OPEN))
-            dpg.add_menu_item(label="Quit", callback=app.request_quit)
+            dpg.add_menu_item(
+                label="Open File…", shortcut="Ctrl+O", callback=_show_dialog(DLG_OPEN)
+            )
+            dpg.add_menu(label="Open Recent", tag=MI_RECENT)
+            dpg.add_separator()
+            dpg.add_menu_item(
+                label="Quit", shortcut="Ctrl+Q", callback=app.request_quit
+            )
+
+        with dpg.menu(label="View"):
+            dpg.add_menu_item(
+                label="Zoom In",
+                shortcut="Ctrl+=",
+                callback=lambda *_a: app.set_zoom(app.zoom + ZOOM_STEP),
+            )
+            dpg.add_menu_item(
+                label="Zoom Out",
+                shortcut="Ctrl+-",
+                callback=lambda *_a: app.set_zoom(app.zoom - ZOOM_STEP),
+            )
+            dpg.add_menu_item(
+                label="Actual Size",
+                shortcut="Ctrl+0",
+                callback=lambda *_a: app.set_zoom(1.0),
+            )
 
         with dpg.menu(label="Disassembler", tag=DISASM_MENU):
-            for label, tag, kind in (
-                ("Disassembly…", MI_DISASM, "disasm"),
-                ("Segments…", MI_SEGMENTS, "segments"),
-                ("Sections…", MI_SECTIONS, "sections"),
-                ("Imports…", MI_IMPORTS, "imports"),
-                ("Symbols…", MI_SYMBOLS, "symbols"),
-                ("Exports…", MI_EXPORTS, "exports"),
-                ("Fixups…", MI_FIXUPS, "fixups"),
-                ("Strings…", MI_STRINGS, "strings"),
-            ):
+            for label, tag, kind in DISASM_MENU_ITEMS:
                 dpg.add_menu_item(
                     label=label,
                     tag=tag,
@@ -694,9 +870,17 @@ def build_shell(app: GuiApp) -> int | str:
                 label="Hex Compare…", callback=_compare_dialog_opener(app)
             )
 
-        with dpg.menu(label="About"):
+        dpg.add_menu(label="Window", tag=WINDOW_MENU)
+
+        with dpg.menu(label="Help"):
             dpg.add_menu_item(
-                label="Info", tag=MI_INFO, enabled=True, callback=_info_opener(app)
+                label="Keyboard Shortcuts",
+                tag=MI_SHORTCUTS,
+                shortcut="F1",
+                callback=lambda *_a: show_shortcuts(app),
+            )
+            dpg.add_menu_item(
+                label="About Cheerleader", tag=MI_INFO, callback=_info_opener(app)
             )
 
     # Bottom bar: hidden until a file is loaded via File → Open File…; the
@@ -727,7 +911,23 @@ def build_shell(app: GuiApp) -> int | str:
     with dpg.handler_registry(tag="gui-global-keys"):
         dpg.add_key_press_handler(key=dpg.mvKey_Q, callback=_on_quit_key(app))
         dpg.add_key_press_handler(key=dpg.mvKey_O, callback=_on_open_key(app))
+        dpg.add_key_press_handler(
+            key=dpg.mvKey_F1, callback=lambda *_a: show_shortcuts(app)
+        )
+        zoom_in = _on_ctrl(lambda: app.set_zoom(app.zoom + ZOOM_STEP))
+        zoom_out = _on_ctrl(lambda: app.set_zoom(app.zoom - ZOOM_STEP))
+        # "=" under both spellings (see const.KEY_EQUAL) + the keypad keys.
+        for key in {KEY_EQUAL, dpg.mvKey_Plus, dpg.mvKey_Add}:
+            dpg.add_key_press_handler(key=key, callback=zoom_in)
+        for key in (dpg.mvKey_Minus, dpg.mvKey_Subtract):
+            dpg.add_key_press_handler(key=key, callback=zoom_out)
+        dpg.add_key_press_handler(
+            key=dpg.mvKey_0, callback=_on_ctrl(lambda: app.set_zoom(1.0))
+        )
 
+    _refresh_recent_menu(app)
+    _refresh_window_menu(app)
+    _refresh_landing(app)
     return WIN_TAG
 
 
@@ -742,6 +942,8 @@ def run_gui() -> None:
         )
     dpg.create_context()
     try:
+        # Callbacks run on the main thread, inside the frame loop below.
+        dpg.configure_app(manual_callback_management=True)
         app = GuiApp()
         window = build_shell(app)
         dpg.create_viewport(
@@ -756,6 +958,7 @@ def run_gui() -> None:
         dpg.show_viewport()
         dpg.set_primary_window(window, True)
         while dpg.is_dearpygui_running():
+            dpg.run_callbacks(dpg.get_callback_queue())
             for event in app.bridge.drain():
                 app.dispatch(event)
             app.tick()

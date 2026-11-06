@@ -4,17 +4,26 @@ Dear PyGui application shell for the cheerleader hex UI.
 Constants
 """
 
+from importlib.metadata import PackageNotFoundError, version
+
+
+def _app_version() -> str:
+    try:
+        return version("cheerleader")
+    except PackageNotFoundError:  # running from a source tree, not installed
+        return "dev"
+
+
 VIEWPORT_TITLE = "Cheerleader: Your Friendly Binary Inspector"
 VIEWPORT_W, VIEWPORT_H = 1280, 800
 MIN_VIEWPORT_W, MIN_VIEWPORT_H = 640, 420
 
-ERR_COLOR = (240, 120, 120, 255)
 INPUT_W = 300
 
 FONT_ENV_VAR = "CHEERLEADER_GUI_FONT"
 FONT_SIZE = 15
 APP_TITLE = "CHEERLEADER"
-APP_VERSION = "0.3.0"
+APP_VERSION = _app_version()
 SRC_URL = "https://github.com/mcaimi/cheerleader"
 
 # Reserve below the content child window for separator + status strip.
@@ -50,16 +59,21 @@ MI_EXPORTS = "gui-mi-exports"
 MI_FIXUPS = "gui-mi-fixups"
 MI_STRINGS = "gui-mi-strings"
 MI_INFO = "gui-mi-info"
-DISASM_ITEMS: tuple[str, ...] = (
-    MI_DISASM,
-    MI_SEGMENTS,
-    MI_SECTIONS,
-    MI_IMPORTS,
-    MI_SYMBOLS,
-    MI_EXPORTS,
-    MI_FIXUPS,
-    MI_STRINGS,
+MI_SHORTCUTS = "gui-mi-shortcuts"
+MI_RECENT = "gui-mi-recent"  # File ▸ Open Recent submenu (rebuilt on change)
+WINDOW_MENU = "gui-window-menu"  # Window menu (rebuilt when tools open/close)
+DISASM_MENU_ITEMS: tuple[tuple[str, str, str], ...] = (
+    # (label, menu-item tag, inspector kind — key of app.INSPECTOR_OPENERS)
+    ("Disassembly…", MI_DISASM, "disasm"),
+    ("Segments…", MI_SEGMENTS, "segments"),
+    ("Sections…", MI_SECTIONS, "sections"),
+    ("Imports…", MI_IMPORTS, "imports"),
+    ("Symbols…", MI_SYMBOLS, "symbols"),
+    ("Exports…", MI_EXPORTS, "exports"),
+    ("Fixups…", MI_FIXUPS, "fixups"),
+    ("Strings…", MI_STRINGS, "strings"),
 )
+DISASM_ITEMS: tuple[str, ...] = tuple(tag for _, tag, _ in DISASM_MENU_ITEMS)
 
 # Disassembler ▸ Engine radio submenu (plan v3 §5, D5). The submenu itself
 # stays enabled with or without a loaded binary — engine choice is a
@@ -124,3 +138,83 @@ KEY_ESCAPE = 526  # ImGui named key (dearpygui 2.3.1 ships no mvKey_Escape)
 # confirmed Escape (526). A raw constant is future-proof: a later mvKey_Enter
 # would carry the same value.
 KEY_ENTER = 525
+# ImGui named key for "=" (Apostrophe 596 … Slash 600, Semicolon 601,
+# Equal 602); dearpygui 2.3.1 ships only the stale GLFW ``mvKey_Plus`` (61).
+KEY_EQUAL = 602
+
+# Floating tool windows cascade from here, stepping per opened tool.
+CASCADE_ORIGIN = (40, 50)
+CASCADE_STEP = 28
+CASCADE_SLOTS = 10
+
+# View ▸ zoom (multiplies the base global font scale).
+ZOOM_MIN, ZOOM_MAX, ZOOM_STEP = 0.6, 2.5, 0.1
+
+RECENT_MAX = 10  # File ▸ Open Recent entries
+CONFIG_DIR_ENV = "CHEERLEADER_CONFIG_DIR"  # settings dir override (tests)
+
+# Help ▸ Keyboard shortcuts — one table per tool, shared by the help dialog
+# and the per-tool menus' shortcut labels. (section, [(action, keys), …])
+SHORTCUTS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
+    (
+        "Everywhere",
+        (
+            ("Open file", "Ctrl+O"),
+            ("Quit", "Ctrl+Q"),
+            ("Zoom in / out / reset", "Ctrl+= / Ctrl+- / Ctrl+0"),
+            ("Keyboard shortcuts", "F1"),
+        ),
+    ),
+    (
+        "Hex editor",
+        (
+            ("Move the cursor", "Arrows, PgUp / PgDn"),
+            ("Row start / end", "Home / End"),
+            ("File start / end", "Ctrl+Home / Ctrl+End"),
+            ("Overwrite with hex digits", "0-9, A-F"),
+            ("Edit bytes at the cursor", "Enter"),
+            ("Undo", "Ctrl+Z  or  U"),
+            ("Save as", "Ctrl+S  or  S"),
+            ("Go to offset / search", "Ctrl+F, Ctrl+G  or  /"),
+            ("Next / previous match", "F3 / Shift+F3  or  N / Shift+N"),
+            ("Reload from disk", "R"),
+            ("Cancel search", "Esc"),
+        ),
+    ),
+    (
+        "Hex compare",
+        (
+            ("Scroll", "Arrows, PgUp / PgDn, Home / End"),
+            ("Next / previous difference", "N / P"),
+            ("Rescan both files", "R"),
+            ("Cancel the scan", "Esc"),
+        ),
+    ),
+    (
+        "Disassembly",
+        (
+            ("Move", "Arrows, PgUp / PgDn, Home / End"),
+            ("Call flow of the function", "C"),
+            ("Control-flow graph", "F"),
+            ("Go to address", "Ctrl+G"),
+            ("More actions", "Right-click"),
+            ("Cancel disassembly", "Esc"),
+        ),
+    ),
+    (
+        "Tables and Strings",
+        (
+            ("Sort", "Click a column header"),
+            ("Show the row in the hex editor", "Click a row"),
+            ("Cancel string extraction", "Esc"),
+        ),
+    ),
+    (
+        "Call flow / CFG",
+        (
+            ("Drill into a function", "Click its name"),
+            ("Back (call flow)", "B"),
+            ("Close", "Esc"),
+        ),
+    ),
+)

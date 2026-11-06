@@ -25,24 +25,25 @@ The view is read-only (`dirty_edit_count() == 0`); the window holds its own
 ``BinaryInfo`` snapshot like every inspector view.
 """
 
-import os
+from __future__ import annotations
 
-from cheerleader.gui.app import (
-    STATUS_RESERVE,
-    TOOL_MIN_H,
-    TOOL_MIN_W,
-    GuiApp,
-    Tool,
-    _tool_window_closed,
-    find_inspector_tool,
-)
+import os
+from bisect import bisect_right
+from typing import TYPE_CHECKING
+
 from cheerleader.gui.callflow import open_call_flow, open_cfg
-from cheerleader.gui.const import (
-    DISASM_WIN_H,
-    DISASM_WIN_W,
-    KEY_ESCAPE,
-)
+from cheerleader.gui.const import DISASM_WIN_H, DISASM_WIN_W, KEY_ESCAPE
+from cheerleader.gui.dialogs import PromptDialog
 from cheerleader.gui.disasmgrid import DisasmGrid
+from cheerleader.gui.tooling import (
+    ReadOnlyController,
+    add_tool_menu,
+    build_tool_window,
+    ctrl_down,
+    find_tool,
+    focus_tool,
+)
+from cheerleader.gui.views import file_offset_of
 from cheerleader.gui.workers import BusyTracker, EventKind, WorkerHandle, start_worker
 from cheerleader.libs.cfg import (
     CallGraph,
@@ -52,6 +53,9 @@ from cheerleader.libs.cfg import (
 )
 from cheerleader.libs.disasm import disassemble_section
 from cheerleader.libs.types import BinaryInfo, DisasmInstruction
+
+if TYPE_CHECKING:
+    from cheerleader.gui.app import GuiApp
 
 try:
     import dearpygui.dearpygui as dpg
@@ -166,8 +170,10 @@ def auto_pick(sections: list[tuple[str, str]]) -> int | None:
 # ── combo-driven section selection ────────────────────────────────────────────
 
 
-class DisasmController:
+class DisasmController(ReadOnlyController):
     """One Disassembly tool window: section dropdown + virtualized grid."""
+
+    keys_prefix = "disasm"
 
     def __init__(
         self,
@@ -187,14 +193,19 @@ class DisasmController:
         self.grid = grid
         self.combo_tag = combo_tag
         self.ns = ns
-        self.view_kind = "disasm"  # focus-guard key (find_inspector_tool)
+        self.view_kind = "disasm"  # focus-guard key (find_tool)
         self.path = info.path
         self.sections: list[tuple[str, str]] = []
         self._labels: list[str] = []  # combo items, parallel to sections
         self.call_graph: CallGraph | None = None
         self._current_index: int | None = None
         self.busy = BusyTracker()  # exclusive in-flight disassembly
+        self._dialog: PromptDialog | None = None  # Go to address
+        self._ctx_tag = f"{ns}-disasm-ctx"
         self._install_keys()
+        self._install_menu()
+        self._build_context_menu()
+        grid.on_context_click = self._show_context_menu
 
     # ── setup ─────────────────────────────────────────────────────────────
 
@@ -235,11 +246,17 @@ class DisasmController:
 
         def _job(handle: WorkerHandle) -> None:
             engine = pick_engine()
-            if engine is None:
-                instrs: list[DisasmInstruction] = []
-            else:
-                instrs = disassemble_section(self.info, seg, sect, engine=engine)
-            graph = build_call_graph(self.info, instrs) if instrs else None
+            try:
+                if engine is None:
+                    instrs: list[DisasmInstruction] = []
+                else:
+                    instrs = disassemble_section(self.info, seg, sect, engine=engine)
+                graph = build_call_graph(self.info, instrs) if instrs else None
+            except Exception as e:  # noqa: BLE001 - never leave the view
+                # stuck on "Disassembling…": report the failure instead.
+                msg = f"Disassembly of {seg},{sect} failed: {e}"
+                self.app.bridge.post(0, EventKind.FAILED, msg, handle)
+                return
             self.app.bridge.post(
                 0, EventKind.DISASM_DONE, (seg, sect, instrs, graph), handle
             )
@@ -252,11 +269,14 @@ class DisasmController:
 
     def on_event(self, event) -> None:
         """Handle the disassembly worker's completion (stale runs dropped)."""
-        if event.kind is not EventKind.DISASM_DONE:
+        if event.kind not in (EventKind.DISASM_DONE, EventKind.FAILED):
             return
         if self.busy.is_stale(event.worker) or event.worker.cancel.cancelled:
             return  # superseded or Esc-cancelled run — never lands
         self.busy.clear()
+        if event.kind is EventKind.FAILED:
+            dpg.set_value(self.status_tag, str(event.payload))
+            return
         seg, sect, instrs, graph = event.payload
         self.call_graph = graph
         self.grid.set_instrs(instrs)
@@ -271,20 +291,139 @@ class DisasmController:
             return
         dpg.set_value(
             self.status_tag,
-            f"{seg},{sect}  {len(instrs):,} instructions  c → call flow   f → cfg",
+            f"{seg},{sect}  {len(instrs):,} instructions  │  C call flow · F cfg"
+            " · right-click for more",
         )
 
     # ── keys: Esc cancel, c call-flow, f CFG ──────────────────────────────
 
     def _install_keys(self) -> None:
-        with dpg.handler_registry(tag=f"disasm-keys-{self.ns}"):
-            dpg.add_key_press_handler(key=KEY_ESCAPE, callback=self._on_escape)
-            dpg.add_key_press_handler(key=dpg.mvKey_C, callback=self._open_call_flow)
-            dpg.add_key_press_handler(key=dpg.mvKey_F, callback=self._open_cfg)
+        self.install_keys(
+            [
+                (KEY_ESCAPE, self._on_escape),
+                (dpg.mvKey_C, self._open_call_flow),
+                (dpg.mvKey_F, self._open_cfg),
+                (dpg.mvKey_G, self._on_ctrl_g),
+            ]
+        )
+
+    def _install_menu(self) -> None:
+        add_tool_menu(
+            self.window,
+            [
+                (
+                    "Function",
+                    [
+                        ("Call flow", "C", self._open_call_flow),
+                        ("Control-flow graph", "F", self._open_cfg),
+                        None,
+                        ("Show in hex editor", "", self._show_in_hex),
+                        ("Copy address", "", self._copy_address),
+                    ],
+                ),
+                ("Go", [("Go to address…", "Ctrl+G", self.action_goto)]),
+            ],
+        )
+
+    def _build_context_menu(self) -> None:
+        """Right-click popup over the grid (row selected first)."""
+        with dpg.window(
+            tag=self._ctx_tag,
+            popup=True,
+            show=False,
+            no_title_bar=True,
+            autosize=True,
+            no_saved_settings=True,
+        ):
+            for label, action in (
+                ("Call flow   C", self._open_call_flow),
+                ("Control-flow graph   F", self._open_cfg),
+                ("Show in hex editor", self._show_in_hex),
+                ("Copy address", self._copy_address),
+            ):
+                dpg.add_menu_item(
+                    label=label, callback=lambda *_a, act=action: self._ctx_run(act)
+                )
+
+    def _show_context_menu(self) -> None:
+        if self._cursor_addr() is None:
+            return
+        dpg.configure_item(
+            self._ctx_tag, pos=dpg.get_mouse_pos(local=False), show=True
+        )
+
+    def _ctx_run(self, action) -> None:
+        dpg.configure_item(self._ctx_tag, show=False)
+        action()
+
+    def _on_ctrl_g(self, *_args) -> None:
+        if ctrl_down():
+            self.action_goto()
+
+    # ── go to address / show in hex / copy ────────────────────────────────
+
+    def action_goto(self, *_args) -> None:
+        """Ctrl+G: jump the cursor to the instruction covering an address."""
+        instrs = self.grid.instrs()
+        if not instrs:
+            dpg.set_value(self.status_tag, "Disassemble a section first")
+            return
+        lo, hi = instrs[0].addr, instrs[-1].addr
+
+        def validate(text: str) -> int:
+            t = text.strip().lower().removeprefix("0x")
+            try:
+                addr = int(t, 16)
+            except ValueError:
+                raise ValueError("enter a hex address, e.g. 0x100003f40") from None
+            if not lo <= addr <= hi + len(instrs[-1].raw):
+                raise ValueError(f"not in this section (0x{lo:x} – 0x{hi:x})")
+            return bisect_right([i.addr for i in instrs], addr) - 1
+
+        def accept(index: int) -> None:
+            self._close_dialog()
+            self.grid.move_to(index)
+            dpg.set_value(self.status_tag, f"at 0x{instrs[index].addr:x}")
+
+        self._close_dialog()
+        self._dialog = PromptDialog(
+            label="Go to address",
+            help_text=f"Section range: 0x{lo:x} – 0x{hi:x}",
+            hint="0x…",
+            validate=validate,
+            on_accept=accept,
+            on_cancel=self._close_dialog,
+            ok_label="Go",
+        )
+        self._dialog.open()
+
+    def _close_dialog(self) -> None:
+        if self._dialog is not None:
+            self._dialog.close()
+            self._dialog = None
+
+    def _show_in_hex(self, *_args) -> None:
+        """Open/focus the hex editor at the cursor instruction's bytes."""
+        addr = self._cursor_addr()
+        if addr is None:
+            dpg.set_value(self.status_tag, "Select an instruction row")
+            return
+        offset = file_offset_of(self.info, addr)
+        if offset is None:
+            dpg.set_value(self.status_tag, f"0x{addr:x} is not backed by file bytes")
+            return
+        self.app.show_in_editor(self.path, offset)
+
+    def _copy_address(self, *_args) -> None:
+        addr = self._cursor_addr()
+        if addr is not None:
+            dpg.set_clipboard_text(f"0x{addr:x}")
+            dpg.set_value(self.status_tag, f"copied 0x{addr:x}")
 
     def _on_escape(self, *_args) -> None:
         if self.busy.worker is not None:
             self.busy.worker.cancel.cancel()
+            self.busy.clear()
             dpg.set_value(self.status_tag, "Disassembly cancelled — pick a section")
 
     # ── c / f: call-flow + CFG windows (TUI DisasmTab parity) ─────────────
@@ -297,44 +436,40 @@ class DisasmController:
             return None
         return instrs[cursor].addr
 
-    def _open_call_flow(self, *_args) -> None:
-        """``c``: open the call-flow tree for the cursor's function."""
+    def _cursor_function(self) -> tuple[CallGraph, str, int] | None:
+        """``(graph, name, addr)`` of the function under the cursor, or
+        ``None`` after explaining in the status strip why there is none."""
         graph = self.call_graph
         if graph is None:
             dpg.set_value(self.status_tag, "Disassemble a section first")
-            return
+            return None
         addr = self._cursor_addr()
         if addr is None:
             dpg.set_value(self.status_tag, "Select an instruction row")
-            return
+            return None
         result = graph.func_at(addr)
         if result is None:
             dpg.set_value(
                 self.status_tag,
                 f"No function symbol found at 0x{addr:x} — binary may be stripped",
             )
-            return
-        func_name, _ = result
-        open_call_flow(self.app, self.path, graph, func_name)
+            return None
+        func_name, func_addr = result
+        return graph, func_name, func_addr
+
+    def _open_call_flow(self, *_args) -> None:
+        """``c``: open the call-flow tree for the cursor's function."""
+        found = self._cursor_function()
+        if found is not None:
+            graph, func_name, _ = found
+            open_call_flow(self.app, self.path, graph, func_name)
 
     def _open_cfg(self, *_args) -> None:
         """``f``: slice the cursor's function and open its CFG window."""
-        graph = self.call_graph
-        if graph is None:
-            dpg.set_value(self.status_tag, "Disassemble a section first")
+        found = self._cursor_function()
+        if found is None:
             return
-        addr = self._cursor_addr()
-        if addr is None:
-            dpg.set_value(self.status_tag, "Select an instruction row")
-            return
-        result = graph.func_at(addr)
-        if result is None:
-            dpg.set_value(
-                self.status_tag,
-                f"No function symbol at 0x{addr:x} — binary may be stripped",
-            )
-            return
-        func_name, func_addr = result
+        graph, func_name, func_addr = found
         _, next_addr = graph.func_range(func_addr)
         func_instrs = slice_function_instrs(self.grid.instrs(), func_addr, next_addr)
         if not func_instrs:
@@ -343,22 +478,11 @@ class DisasmController:
         cfg = build_cfg(func_instrs, func_name, func_addr)
         open_cfg(self.app, self.path, cfg)
 
-    # ── the shell's Controller protocol ───────────────────────────────────
-
-    def dirty_edit_count(self) -> int:
-        """Read-only view — never dirty."""
-        return 0
-
-    def window_close_requested(self) -> None:
-        self.app.close_tool_for(self)
-
     def shutdown(self) -> None:
-        """Teardown: keys. The disasm grid is
-        shut down by the shell via ``Tool.grids``."""
-        if dpg.does_item_exist(f"disasm-keys-{self.ns}"):
-            dpg.delete_item(f"disasm-keys-{self.ns}")
-        if self.busy.worker is not None:
-            self.busy.worker.cancel.cancel()
+        super().shutdown()
+        self._close_dialog()
+        if dpg.does_item_exist(self._ctx_tag):
+            dpg.delete_item(self._ctx_tag)  # a root window, not a child
 
 
 # ── opener ────────────────────────────────────────────────────────────────────
@@ -373,27 +497,13 @@ def open_disassembly(app: GuiApp, path: str) -> None:
     info = app.current_info
     if info is None or info.path != path:
         return
-    existing = find_inspector_tool(app, "disasm", path)
+    existing = find_tool(app, view_kind="disasm", path=path)
     if existing is not None:
-        dpg.configure_item(existing.window, show=True)
-        dpg.focus_item(existing.window)
+        focus_tool(existing)
         return
-    ns = app.next_ns()
-    window = f"gui-tool-{ns}"
-    content = f"{window}-content"
-    status_tag = f"{window}-status"
-    with dpg.window(
-        tag=window,
-        label=f"Disassembly — {os.path.basename(path)}",
-        width=DISASM_WIN_W,
-        height=DISASM_WIN_H,
-        min_size=[TOOL_MIN_W, TOOL_MIN_H],
-        no_collapse=True,
-        on_close=lambda *_a: _tool_window_closed(app, window),
-    ):
-        dpg.add_child_window(tag=content, border=False, height=-STATUS_RESERVE)
-        dpg.add_separator()
-        dpg.add_text("", tag=status_tag)
+    ns, window, content, status_tag = build_tool_window(
+        app, f"Disassembly — {os.path.basename(path)}", DISASM_WIN_W, DISASM_WIN_H
+    )
     combo_tag = f"{ns}-section-combo"
     pane_tag = f"{ns}-gridpane"
     dpg.add_combo(
@@ -427,21 +537,4 @@ def open_disassembly(app: GuiApp, path: str) -> None:
     )
     dpg.configure_item(combo_tag, callback=controller._on_section_selected)
     controller.load_sections()
-    app.tools.append(
-        Tool(
-            window=window,
-            status_tag=status_tag,
-            controller=controller,
-            grids=(grid,),
-            tick=grid.tick,
-        )
-    )
-
-
-def register_opener() -> None:
-    """Publish the opener into the shell's registry (idempotent)."""
-    from cheerleader.gui.app import _INSPECTOR_OPENERS
-
-    _INSPECTOR_OPENERS.setdefault(
-        "disasm", lambda app, path: open_disassembly(app, path)
-    )
+    app.register_tool(window, status_tag, controller, grids=(grid,), tick=grid.tick)

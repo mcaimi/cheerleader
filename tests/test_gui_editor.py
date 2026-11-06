@@ -68,7 +68,7 @@ def test_initial_status(editor) -> None:
     assert "4.0 KiB" in text
     assert "0x00000000" in text
     assert "= 0x00   0 '.'" in text
-    assert "Ctrl+Q quit" in text
+    assert "F1 shortcuts" in text
     assert "unsaved" not in text
 
 
@@ -78,7 +78,7 @@ def test_status_tracks_cursor_and_edits(editor) -> None:
     assert "= 0x01   1 '.'" in _status(editor)
     editor.ctl.type_hex_digit(0xF)
     editor.ctl.type_hex_digit(0xF)
-    assert "1 unsaved [modified]" in _status(editor)
+    assert "1 unsaved edit" in _status(editor)
 
 
 def test_note_only_shows_while_cursor_stays(editor) -> None:
@@ -313,7 +313,7 @@ def test_search_hex_found_then_n_and_upper_n(editor) -> None:
     assert editor.grid.cursor == 10
     assert editor.grid._match == (10, 2)
     assert "match at 0x0000000a" in _status(editor)
-    assert "n/N" in _status(editor)
+    assert "F3 / Shift+F3" in _status(editor)
 
     ctl.action_search_next(forward=True)
     _finish(editor)
@@ -534,3 +534,15 @@ def test_grid_keys_disabled_while_dialog_open(editor) -> None:
     assert editor.grid.input_enabled
     editor.grid._key_right()
     assert editor.grid.cursor == before + 1
+
+
+def test_escape_on_close_confirm_reshows_window(editor) -> None:
+    """Esc on the dirty-close confirm answers No: the window comes back."""
+    ctl = editor.ctl
+    ctl.type_hex_digit(0xA)  # dirty
+    dpg.configure_item(ctl.window, show=False)  # DPG hides before on_close
+    ctl.window_close_requested()
+    assert ctl._modal == "confirm"
+    ctl._on_escape_key()
+    assert ctl._modal is None
+    assert dpg.get_item_configuration(ctl.window)["show"] is True

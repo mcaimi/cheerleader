@@ -100,8 +100,8 @@ def test_final_status(compare) -> None:
     assert "right 1.0 KiB (1,026)" in text
     assert "7 differing bytes" in text
     assert "first at 0x00000100" in text
-    assert "n/p → next/prev diff" in text
-    assert "Ctrl+Q quit" in text
+    assert "N / P → next / prev diff" in text
+    assert "F1 shortcuts" in text
     assert compare.ctl.busy.op is None
 
 

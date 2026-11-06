@@ -6,17 +6,15 @@ The port of ``tui.tabs.StringsTab``: all printable-ASCII runs (≥ 4 chars,
 data-bearing segments, with the TUI's File Offset / Address / Section /
 String columns.
 
-Differences from the TUI (plan decision): the search box is an
-**always-visible** input above the table (the TUI's hidden ``s``/``/``
-input makes no sense with a mouse), filtering live as you type via the
-controller's per-frame :meth:`StringsController.tick` — DPG's
-``input_text`` callback only fires on Enter, and a one-string-compare
-tick is exactly as deterministic and testable. Clicking a row (single
-click, any cell — every cell is a selectable carrying the row's
-:class:`~cheerleader.libs.types.BinaryString`) jumps to the string's
-file offset **in an already-open hex editor** of the same file
-(focus + ``grid.move_to``); with no editor open the status strip says
-where the editor would go — the plan's no-auto-open decision.
+The window is a :class:`~cheerleader.gui.views.TableController` (search
+box, sortable columns, clickable rows) whose items come from a background
+worker instead of the parsed snapshot. Differences from the TUI: the
+search box is an **always-visible** input above the table (the TUI's
+hidden ``s``/``/`` input makes no sense with a mouse), filtering live as
+you type via the per-frame :meth:`~TableController.tick`. Clicking a row
+(any cell — every cell is a selectable carrying the row's
+:class:`~cheerleader.libs.types.BinaryString`) shows the string's bytes in
+the hex editor of the same file, opening one if needed.
 
 The extraction runs on a background worker (:class:`BusyTracker` +
 ``EventKind.STRINGS_DONE``) — large binaries hold megabytes of string
@@ -27,26 +25,19 @@ cancels; the window itself closes via its close button like every tool.
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING
 
 import dearpygui.dearpygui as dpg
 
-from cheerleader.gui.app import (
-    GuiApp,
-    Tool,
-    _tool_window_closed,
-    find_inspector_tool,
-)
-from cheerleader.gui.const import (
-    KEY_ESCAPE,
-    STATUS_RESERVE,
-    TABLE_WIN_H,
-    TABLE_WIN_W,
-    TOOL_MIN_H,
-    TOOL_MIN_W,
-)
+from cheerleader.gui.const import KEY_ESCAPE
+from cheerleader.gui.tooling import find_tool, focus_tool
+from cheerleader.gui.views import TableController, ViewSpec, open_table_view
 from cheerleader.gui.workers import BusyTracker, EventKind, WorkerHandle, start_worker
 from cheerleader.libs.disasm import extract_strings
 from cheerleader.libs.types import BinaryInfo, BinaryString
+
+if TYPE_CHECKING:
+    from cheerleader.gui.app import GuiApp
 
 
 def offset_cell(s: BinaryString) -> str:
@@ -64,8 +55,29 @@ def row_cells(s: BinaryString) -> tuple[str, str, str, str]:
     return (offset_cell(s), addr_cell(s), s.section, s.value)
 
 
-class StringsController:
-    """One Strings tool window: search input + table + worker."""
+STRINGS_SPEC = ViewSpec(
+    kind="strings",
+    title="Strings",
+    noun="strings",
+    columns=("File Offset", "Address", "Section", "String"),
+    items=lambda _info: [],  # loaded by the worker (StringsController._all)
+    row=lambda s, _i: row_cells(s),
+    weights=(0.9, 1.2, 1.1, 2.2),
+    search=lambda s: s.value,  # TUI parity: case-insensitive, value only
+    offset=lambda _info, s: s.file_offset,  # already absolute
+    sort_keys=(
+        lambda s: s.file_offset,
+        lambda s: s.addr,
+        None,
+        lambda s: s.value.lower(),
+    ),
+)
+
+
+class StringsController(TableController):
+    """One Strings tool window: search input + table + extraction worker."""
+
+    keys_prefix = "str"
 
     def __init__(
         self,
@@ -74,23 +86,16 @@ class StringsController:
         *,
         window: int | str,
         status_tag: int | str,
-        search_tag: int | str,
-        table_tag: int | str,
         ns: str,
     ) -> None:
-        self.app = app
-        self.info = info  # the view's private snapshot (plan decision 3)
-        self.window = window
-        self.status_tag = status_tag
-        self.search_tag = search_tag
-        self.table_tag = table_tag
-        self.ns = ns
-        self.view_kind = "strings"  # focus-guard key (find_inspector_tool)
-        self.path = info.path
+        super().__init__(
+            app, STRINGS_SPEC, info, window=window, status_tag=status_tag, ns=ns
+        )
         self.busy = BusyTracker()
         self._all: list[BinaryString] = []
-        self._visible: list[BinaryString] = []
-        self._query = ""  # last query applied by tick (avoids re-filtering)
+
+    def _items(self) -> list[BinaryString]:
+        return self._all
 
     # ── extraction worker ─────────────────────────────────────────────────
 
@@ -99,7 +104,14 @@ class StringsController:
         dpg.set_value(self.status_tag, "Extracting strings…")
 
         def _job(handle: WorkerHandle) -> None:
-            strings = extract_strings(self.info)
+            try:
+                strings = extract_strings(self.info)
+            except Exception as e:  # noqa: BLE001 - never leave the view
+                # stuck on "Extracting…": report the failure instead.
+                self.app.bridge.post(
+                    0, EventKind.FAILED, f"String extraction failed: {e}", handle
+                )
+                return
             self.app.bridge.post(0, EventKind.STRINGS_DONE, strings, handle)
 
         # Tracker ownership makes dispatch route the completion here; a
@@ -108,111 +120,41 @@ class StringsController:
 
     def on_event(self, event) -> None:
         """Handle the extraction worker's completion (stale runs dropped)."""
-        if event.kind is not EventKind.STRINGS_DONE:
+        if event.kind not in (EventKind.STRINGS_DONE, EventKind.FAILED):
             return
         if self.busy.is_stale(event.worker) or event.worker.cancel.cancelled:
             return  # superseded or Esc-cancelled run — never lands
         self.busy.clear()
+        if event.kind is EventKind.FAILED:
+            dpg.set_value(self.status_tag, str(event.payload))
+            return
         self._all = event.payload
         self._apply_search()
 
-    # ── search + table ────────────────────────────────────────────────────
-
-    def tick(self) -> None:
-        """Per-frame: re-filter when the search box changed (live typing)."""
-        query = dpg.get_value(self.search_tag)
-        if query != self._query:
-            self._query = query
-            self._apply_search()
+    # ── search + status ───────────────────────────────────────────────────
 
     def _apply_search(self) -> None:
-        """Re-run the substring filter and re-render (TUI parity: case-
-        insensitive match against the string value)."""
-        q = self._query.strip().lower()
+        """Re-run the filter/sort and re-render."""
+        self.refresh()
+
+    def _status_text(self, shown: int, total: int) -> str:
+        q = self._query.strip()
         if q:
-            self._visible = [s for s in self._all if q in s.value.lower()]
+            text = f"{shown:,} / {total:,} strings matching {q!r}"
         else:
-            self._visible = list(self._all)
-        self._populate()
-        self._update_status()
-
-    def _populate(self) -> None:
-        """(Re-)fill the table body; every cell is a row-jump selectable."""
-        dpg.delete_item(self.table_tag, children_only=True, slot=1)
-        for s in self._visible:
-            with dpg.table_row(parent=self.table_tag):
-                for text in row_cells(s):
-                    dpg.add_selectable(
-                        label=text,
-                        user_data=s,
-                        callback=self._on_row,
-                    )
-
-    def _update_status(self) -> None:
-        total = len(self._all)
-        shown = len(self._visible)
-        if self._query.strip():
-            dpg.set_value(
-                self.status_tag,
-                f"{shown:,} / {total:,} strings matching {self._query.strip()!r}"
-                "  ·  click a row to view it in the hex editor",
-            )
-        else:
-            dpg.set_value(
-                self.status_tag,
-                f"{total:,} strings found  ·  click a row to view it in the hex editor",
-            )
-
-    # ── row click → jump into an already-open hex editor ─────────────────
-
-    def _on_row(self, _sender, _app_data, user_data) -> None:
-        """Single click on any cell: jump to the string's file offset.
-
-        Only when the owning file is already open in a hex editor (plan
-        decision: no auto-open); otherwise the status strip says where the
-        editor would land.
-        """
-        s: BinaryString = user_data
-        for tool in self.app.tools:
-            doc = getattr(tool.controller, "doc", None)
-            if doc is not None and doc.path == self.path:
-                dpg.configure_item(tool.window, show=True)
-                dpg.focus_item(tool.window)
-                tool.controller.grid.move_to(s.file_offset)
-                dpg.set_value(
-                    self.status_tag,
-                    f"Jumped to 0x{s.file_offset:08x} in the hex editor",
-                )
-                return
-        dpg.set_value(
-            self.status_tag,
-            f"0x{s.file_offset:08x} — open the hex editor "
-            "(Tools ▸ Hex Editor…) to inspect this string",
-        )
+            text = f"{total:,} strings found"
+        return text + "  ·  click a row to view it in the hex editor"
 
     # ── keys: Esc cancels a running extraction ────────────────────────────
 
     def _install_keys(self) -> None:
-        with dpg.handler_registry(tag=f"str-keys-{self.ns}"):
-            dpg.add_key_press_handler(key=KEY_ESCAPE, callback=self._on_escape)
+        self.install_keys([(KEY_ESCAPE, self._on_escape)])
 
     def _on_escape(self, *_args) -> None:
         if self.busy.worker is not None:
             self.busy.worker.cancel.cancel()
+            self.busy.clear()
             dpg.set_value(self.status_tag, "String extraction cancelled")
-
-    # ── the shell's Controller protocol ───────────────────────────────────
-
-    def dirty_edit_count(self) -> int:
-        """Read-only view — never dirty."""
-        return 0
-
-    def window_close_requested(self, *_args) -> None:
-        self.app.close_tool_for(self)
-
-    def shutdown(self) -> None:
-        if dpg.does_item_exist(f"str-keys-{self.ns}"):
-            dpg.delete_item(f"str-keys-{self.ns}")
 
 
 def open_strings(app: GuiApp, path: str) -> None:
@@ -225,79 +167,16 @@ def open_strings(app: GuiApp, path: str) -> None:
     info = app.current_info
     if info is None or info.path != path:
         return
-    existing = find_inspector_tool(app, "strings", path)
+    existing = find_tool(app, view_kind="strings", path=path)
     if existing is not None:
-        dpg.configure_item(existing.window, show=True)
-        dpg.focus_item(existing.window)
+        focus_tool(existing)
         return
-    ns = app.next_ns()
-    window = f"gui-tool-{ns}"
-    content = f"{window}-content"
-    status_tag = f"{window}-status"
-    search_tag = f"{ns}-search"
-    table_tag = f"{ns}-tbl"
-    with dpg.window(
-        tag=window,
-        label=f"Strings — {os.path.basename(path)}",
-        width=TABLE_WIN_W,
-        height=TABLE_WIN_H,
-        min_size=[TOOL_MIN_W, TOOL_MIN_H],
-        no_collapse=True,
-        on_close=lambda *_a: _tool_window_closed(app, window),
-    ):
-        dpg.add_child_window(tag=content, border=False, height=-STATUS_RESERVE)
-        dpg.add_separator()
-        dpg.add_text("", tag=status_tag)
-    # Search box above the table (D2 filter-row layout); the table scrolls
-    # within the content child's remaining space.
-    dpg.add_input_text(
-        tag=search_tag,
-        parent=content,
-        hint="Search strings…",
-        width=-1,
-    )
-    with dpg.table(
-        tag=table_tag,
-        parent=content,
-        header_row=True,
-        row_background=True,
-        borders_innerH=True,
-        borders_outerH=True,
-        scrollY=True,
-        policy=dpg.mvTable_SizingStretchProp,
-    ):
-        dpg.add_table_column(label="File Offset", init_width_or_weight=0.9)
-        dpg.add_table_column(label="Address", init_width_or_weight=1.2)
-        dpg.add_table_column(label="Section", init_width_or_weight=1.1)
-        dpg.add_table_column(label="String", init_width_or_weight=2.2)
-    controller = StringsController(
+    controller = open_table_view(
         app,
-        info,
-        window=window,
-        status_tag=status_tag,
-        search_tag=search_tag,
-        table_tag=table_tag,
-        ns=ns,
+        lambda window, status_tag, ns: StringsController(
+            app, info, window=window, status_tag=status_tag, ns=ns
+        ),
+        f"Strings — {os.path.basename(path)}",
     )
     controller._install_keys()
     controller.start()
-    app.tools.append(
-        Tool(
-            window=window,
-            status_tag=status_tag,
-            controller=controller,
-            grids=(),
-            tick=controller.tick,
-        )
-    )
-
-
-def register_opener() -> None:
-    """Publish the Strings opener into the shell's registry (idempotent).
-
-    Strings is *not* a ``views._SPECS`` table (its data needs the
-    background worker) — it uses the same registry, different module.
-    """
-    from cheerleader.gui.app import _INSPECTOR_OPENERS
-
-    _INSPECTOR_OPENERS.setdefault("strings", open_strings)

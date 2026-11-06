@@ -31,11 +31,12 @@ the cursor. A cursor move clears the pending nibble; ``undo`` reverts a
 half-written byte like any other write.
 """
 
+from __future__ import annotations
+
 import os
 from functools import partial
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from cheerleader.gui.app import GuiApp, human_size
 from cheerleader.gui.dialogs import (
     ByteEditDialog,
     ConfirmDialog,
@@ -43,6 +44,13 @@ from cheerleader.gui.dialogs import (
     SearchDialog,
 )
 from cheerleader.gui.hexgrid import HexGrid, ascii_cell_text
+from cheerleader.gui.tooling import (
+    add_tool_menu,
+    ctrl_down,
+    delete_if_exists,
+    human_size,
+    install_keys,
+)
 from cheerleader.gui.workers import (
     BusyTracker,
     EventKind,
@@ -51,6 +59,9 @@ from cheerleader.gui.workers import (
     start_worker,
 )
 from cheerleader.libs.hexdoc import HexDocument
+
+if TYPE_CHECKING:
+    from cheerleader.gui.app import GuiApp
 
 try:
     import dearpygui.dearpygui as dpg
@@ -106,26 +117,68 @@ class EditorController:
         self._dialog: Any = None
         grid.on_cursor = self._cursor_moved
         self._install_keys()
+        self._install_menu()
 
     # ── global keys ────────────────────────────────────────────────────────
 
     def _install_keys(self) -> None:
-        """Register the editor's global key handlers (per-instance tag)."""
-        with dpg.handler_registry(tag=f"editor-keys-{self.ns}"):
-            dpg.add_key_press_handler(key=KEY_ENTER, callback=self._on_enter_key)
-            dpg.add_key_press_handler(key=dpg.mvKey_U, callback=self._on_undo_key)
-            dpg.add_key_press_handler(key=dpg.mvKey_S, callback=self._on_save_key)
-            dpg.add_key_press_handler(key=dpg.mvKey_Slash, callback=self._on_search_key)
+        """Register the editor's global key handlers (per-instance tag).
+
+        Every handler is focus-guarded: it fires only while this editor's
+        window is active — or while one of its own modals is up (the modal
+        then holds the focus, and the handlers already route on ``_modal``).
+        """
+        bindings = [
+            (KEY_ENTER, self._on_enter_key),
+            (dpg.mvKey_U, self._on_undo_key),
+            (dpg.mvKey_S, self._on_save_key),
+            (dpg.mvKey_Slash, self._on_search_key),
             # n and N differ only by the shift state (mvKey_N fires for both).
-            dpg.add_key_press_handler(key=dpg.mvKey_N, callback=self._on_next_key)
-            dpg.add_key_press_handler(key=dpg.mvKey_R, callback=self._on_reload_key)
-            dpg.add_key_press_handler(
-                key=dpg.mvKey_Escape, callback=self._on_escape_key
-            )
-            for code in _HEX_KEY_CODES:
-                dpg.add_key_press_handler(
-                    key=code, callback=partial(self._type_key, code)
-                )
+            (dpg.mvKey_N, self._on_next_key),
+            (dpg.mvKey_R, self._on_reload_key),
+            (dpg.mvKey_Escape, self._on_escape_key),
+            # Conventional aliases (Ctrl+S needs none: S fires with Ctrl too).
+            (dpg.mvKey_Z, self._on_ctrl_z),
+            (dpg.mvKey_G, self._on_ctrl_g),
+            (dpg.mvKey_F3, self._on_f3),
+            *((code, partial(self._type_key, code)) for code in _HEX_KEY_CODES),
+        ]
+        install_keys(
+            f"editor-keys-{self.ns}",
+            self.window,
+            bindings,
+            also=lambda: self._modal is not None,
+        )
+
+    def _install_menu(self) -> None:
+        """Window menu bar: every action with its shortcut (discoverability)."""
+        add_tool_menu(
+            self.window,
+            [
+                (
+                    "Edit",
+                    [
+                        ("Edit bytes…", "Enter", self.action_edit),
+                        ("Undo", "Ctrl+Z", self.action_undo),
+                        None,
+                        ("Save as…", "Ctrl+S", self.action_save),
+                        ("Reload from disk", "R", self.action_reload),
+                    ],
+                ),
+                (
+                    "Search",
+                    [
+                        ("Go to / search…", "Ctrl+F", self.action_search),
+                        ("Next match", "F3", partial(self.action_search_next, True)),
+                        (
+                            "Previous match",
+                            "Shift+F3",
+                            partial(self.action_search_next, False),
+                        ),
+                    ],
+                ),
+            ],
+        )
 
     def _shift_down(self) -> bool:
         return dpg.is_key_down(dpg.mvKey_LShift) or dpg.is_key_down(dpg.mvKey_RShift)
@@ -154,13 +207,34 @@ class EditorController:
         if self._modal is None:
             self.action_reload()
 
+    def _on_ctrl_z(self, *_args) -> None:
+        if self._modal is None and ctrl_down():
+            self.action_undo()
+
+    def _on_ctrl_g(self, *_args) -> None:
+        if self._modal is None and ctrl_down():
+            self.action_search()
+
+    def _on_f3(self, *_args) -> None:
+        if self._modal is None:
+            self.action_search_next(forward=not self._shift_down())
+
     def _type_key(self, code: int, *_args) -> None:
+        if ctrl_down():
+            # Ctrl+<digit/letter> is a shortcut, never a byte edit.
+            if code == getattr(dpg, "mvKey_F", None) and self._modal is None:
+                self.action_search()  # Ctrl+F
+            return
         self.type_hex_digit(_HEX_KEY_CODES[code])
 
     def _on_escape_key(self, *_args) -> None:
         if self._modal is not None:
-            # The save file dialog handles its own Esc (cancel_callback).
-            if self._modal != "save":
+            if self._modal == "confirm":
+                # Esc == No: the answer handler closes the dialog and, for a
+                # vetoed window close, re-shows the hidden editor window.
+                self._dialog._no()
+            elif self._modal != "save":
+                # The save file dialog handles its own Esc (cancel_callback).
                 self._close_dialog()
             return
         if self.busy.op == "searching":
@@ -195,22 +269,23 @@ class EditorController:
     def update_status(self, extra: str = "") -> None:
         """Recompose the status strip; *extra* overrides the cursor note."""
         doc = self.doc
-        parts = [f"{doc.path}  {human_size(doc.size)}"]
         cur = self.grid.cursor
         if not extra and self._note and self._note[0] == cur:
             extra = self._note[1]
+        # Cursor first: it is what changes as the user works.
         if doc.size:
             b = doc.read(cur, 1)[0]
-            parts.append(
-                f"0x{cur:08x} ({cur:,})  = 0x{b:02x} {b:3d} '{ascii_cell_text(b)}'"
-            )
+            ch = ascii_cell_text(b)
+            parts = [f"0x{cur:08x} ({cur:,})  = 0x{b:02x} {b:3d} '{ch}'"]
         else:
-            parts.append("empty file")
+            parts = ["empty file"]
+        parts.append(f"{os.path.basename(doc.path)}  {human_size(doc.size)}")
         if doc.modified:
-            parts.append(f"{doc.edit_count:,} unsaved [modified]")
+            n = doc.edit_count
+            parts.append(f"{n:,} unsaved edit{'s' if n != 1 else ''}")
         if extra:
             parts.append(extra)
-        parts.append("Ctrl+Q quit")
+        parts.append("F1 shortcuts")
         dpg.set_value(self.status_tag, "  │  ".join(parts))
 
     def _refuse_if_busy(self) -> bool:
@@ -491,9 +566,9 @@ class EditorController:
             return
         self._set_note(
             hit,
-            f"match at 0x{hit:08x}"
+            f"match at 0x{hit:08x} ({n} byte{'s' if n != 1 else ''})"
             + ("  (wrapped)" if wrapped else "")
-            + "  n/N → next/prev",
+            + "  F3 / Shift+F3 → next / prev",
         )
         self.grid.set_match((hit, n))
         self.grid.move_to(hit)
@@ -575,8 +650,7 @@ class EditorController:
             self.busy.worker.cancel.cancel()
         if self._modal is not None:
             self._close_dialog()
-        if dpg.does_item_exist(f"editor-keys-{self.ns}"):
-            dpg.delete_item(f"editor-keys-{self.ns}")
+        delete_if_exists(f"editor-keys-{self.ns}")
 
     # ── bridge events (frame loop dispatch) ────────────────────────────────
 

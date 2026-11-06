@@ -532,7 +532,7 @@ def test_disasm_c_and_f_open_windows(dpg_context, tmp_path) -> None:
     ctl = disasm.controller
     _settle(app, ctl)
     assert len(ctl.grid.instrs()) == 64
-    assert "c → call flow" in dpg.get_value(ctl.status_tag)
+    assert "C call flow" in dpg.get_value(ctl.status_tag)
     ctl.call_graph = _graph_at_base()  # the 64-NOP fixture has no symbols
 
     ctl._open_call_flow()
@@ -576,19 +576,19 @@ def test_disasm_c_f_guards(dpg_context, tmp_path) -> None:
     )
     ctl._open_cfg()
     assert dpg.get_value(ctl.status_tag) == (
-        "No function symbol at 0xabc — binary may be stripped"
+        "No function symbol found at 0xabc — binary may be stripped"
     )
 
 
 def test_key_handler_registries(dpg_context, tmp_path) -> None:
-    """Esc+c+f on disasm, Esc+b on callflow, Esc on cfg."""
+    """Esc+c+f+Ctrl-G on disasm, Esc+b on callflow, Esc on cfg."""
     path = _macho_text(tmp_path)
     app = GuiApp()
     app.current_file = path
     app.current_info = _info(path)
     open_disassembly(app, path)
     dctl = app.tools[0].controller
-    assert len(dpg.get_item_children(f"disasm-keys-{dctl.ns}")[1]) == 3
+    assert len(dpg.get_item_children(f"disasm-keys-{dctl.ns}")[1]) == 4
 
     open_call_flow(app, path, _graph(), "_main")
     fctl = app.tools[1].controller
@@ -603,9 +603,12 @@ def test_find_graph_tool_matching(dpg_context) -> None:
     app = GuiApp()
     open_call_flow(app, "/x/t.bin", _graph(), "_main")
     tool = app.tools[0]
-    from cheerleader.gui.callflow import _find_graph_tool
+    from cheerleader.gui.tooling import find_tool
 
-    assert _find_graph_tool(app, "callflow", "/x/t.bin", "_main") is tool
-    assert _find_graph_tool(app, "callflow", "/x/t.bin", "_helper") is None
-    assert _find_graph_tool(app, "callflow", "/x/other.bin", "_main") is None
-    assert _find_graph_tool(app, "cfg", "/x/t.bin", "_main") is None
+    def find(kind, path, func):
+        return find_tool(app, view_kind=kind, path=path, func_name=func)
+
+    assert find("callflow", "/x/t.bin", "_main") is tool
+    assert find("callflow", "/x/t.bin", "_helper") is None
+    assert find("callflow", "/x/other.bin", "_main") is None
+    assert find("cfg", "/x/t.bin", "_main") is None

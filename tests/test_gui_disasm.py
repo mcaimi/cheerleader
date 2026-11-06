@@ -21,11 +21,11 @@ import dearpygui.dearpygui as dpg
 from cheerleader.gui import disasm as disasm_mod
 from cheerleader.gui.app import (
     DLG_OPEN,
-    MI_DISASM,
     GuiApp,
     Tool,
     build_shell,
 )
+from cheerleader.gui.const import MI_DISASM
 from cheerleader.gui.disasm import (
     COMBO_RESERVE,
     auto_pick,
@@ -439,7 +439,7 @@ def test_open_auto_disassembles_text(dpg_context, tmp_path) -> None:
     assert ctl.grid.instrs()[0].addr == BASE
     assert ctl.call_graph is not None
     assert dpg.get_value(tool.status_tag) == (
-        "__TEXT,__text  64 instructions  c → call flow   f → cfg"
+        "__TEXT,__text  64 instructions  │  C call flow · F cfg · right-click for more"
     )
     assert isinstance(tool, Tool) and tool.tick is not None
 
@@ -572,9 +572,11 @@ def test_escape_key_cancels(dpg_context, tmp_path) -> None:
     app.current_file = path
     app.current_info = _info(path)
     ctl = _open(app, _info(path))
-    assert ctl.busy.worker is not None
+    handle = ctl.busy.worker
+    assert handle is not None
     ctl._on_escape()
-    assert ctl.busy.worker.cancel.cancelled
+    assert handle.cancel.cancelled
+    assert ctl.busy.op is None  # idle again: Esc fully cancels
     assert "cancelled" in dpg.get_value(ctl.status_tag)
 
 
@@ -676,3 +678,60 @@ def test_menu_item_opens_disassembly(dpg_context, tmp_path) -> None:
     dpg.get_item_callback(MI_DISASM)()  # lazy-registers the openers
     assert len(app.tools) == 1
     assert app.tools[0].controller.view_kind == "disasm"
+
+
+# ── Phase 3: go to address, show in hex, context menu ─────────────────────────
+
+
+def test_file_offset_of_maps_through_segments() -> None:
+    from cheerleader.gui.views import file_offset_of
+
+    info = _info(with_data=True)
+    assert file_offset_of(info, BASE + 0x18) == 0x18
+    assert file_offset_of(info, BASE + 0x4010) == 0x1010
+    assert file_offset_of(info, BASE + 0x4100) is None  # zero-fill tail
+    assert file_offset_of(info, 0x10) is None  # unmapped
+    info.slice_offset = 0x8000  # fat slice: offsets are absolute
+    assert file_offset_of(info, BASE + 0x18) == 0x8018
+
+
+def test_goto_address_moves_cursor(dpg_context, tmp_path) -> None:
+    app = GuiApp()
+    ctl = _open(app, _info(_macho_text(tmp_path)))
+    _settle(app, ctl)
+    ctl.grid.set_instrs(_insns(16))
+    ctl.action_goto()
+    dlg = ctl._dialog
+    dpg.set_value(dlg._input_tag, "zz")
+    dlg._try_apply()
+    assert "hex address" in dpg.get_value(dlg._error_tag)
+    dpg.set_value(dlg._input_tag, f"0x{BASE + 0x1000:x}")
+    dlg._try_apply()
+    assert "not in this section" in dpg.get_value(dlg._error_tag)
+    dpg.set_value(dlg._input_tag, f"{BASE + 0x22:x}")  # mid-instruction
+    dlg._try_apply()
+    assert ctl.grid.cursor == 8  # the instruction covering 0x…22
+    assert ctl._dialog is None and not dpg.does_item_exist(dlg.TAG)
+
+
+def test_show_in_hex_opens_editor_at_instruction(dpg_context, tmp_path) -> None:
+    path = _macho_text(tmp_path)
+    app = GuiApp()
+    ctl = _open(app, _info(path))
+    _settle(app, ctl)
+    ctl.grid.set_instrs(_insns(4, BASE + 0x10))
+    ctl.grid.move_to(2)
+    ctl._show_in_hex()
+    editor = next(t for t in app.tools if getattr(t.controller, "doc", None))
+    assert editor.controller.grid.cursor == 0x18
+    ctl._show_in_hex()  # again: focuses the same editor, no duplicate
+    assert sum(1 for t in app.tools if getattr(t.controller, "doc", None)) == 1
+
+
+def test_context_menu_wired_and_torn_down(dpg_context, tmp_path) -> None:
+    app = GuiApp()
+    ctl = _open(app, _info(_macho_text(tmp_path)))
+    assert ctl.grid.on_context_click == ctl._show_context_menu
+    assert dpg.does_item_exist(ctl._ctx_tag)
+    app.close_tool(app.tools[0])
+    assert not dpg.does_item_exist(ctl._ctx_tag)

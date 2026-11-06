@@ -215,8 +215,10 @@ def test_escape_cancels_extraction(dpg_context, tmp_path) -> None:
     app = GuiApp()
     ctl = _open_strings(app, path)
     assert dpg.does_item_exist(f"str-keys-{ctl.ns}")  # Esc handler installed
+    handle = ctl.busy.worker
     ctl._on_escape()
-    assert ctl.busy.worker.cancel.cancelled
+    assert handle.cancel.cancelled
+    assert ctl.busy.op is None  # idle again: Esc fully cancels
     assert dpg.get_value(ctl.status_tag) == "String extraction cancelled"
 
 
@@ -268,7 +270,7 @@ def test_search_no_match(dpg_context, tmp_path) -> None:
 # ── click → jump ──────────────────────────────────────────────────────────────
 
 
-def test_row_click_without_editor_hints(dpg_context, tmp_path) -> None:
+def test_row_click_without_editor_opens_one(dpg_context, tmp_path) -> None:
     path = _macho_strings(tmp_path)
     app = GuiApp()
     ctl = _open_strings(app, path)
@@ -276,9 +278,11 @@ def test_row_click_without_editor_hints(dpg_context, tmp_path) -> None:
         file_offset=0x1B8, addr=BASE + 0x1B8, section="—", value="hello strings"
     )
     ctl._on_row(None, None, s)
-    assert "0x000001b8" in dpg.get_value(ctl.status_tag)
-    assert "Hex Editor" in dpg.get_value(ctl.status_tag)
-    assert len(app.tools) == 1  # no auto-open
+    assert len(app.tools) == 2  # the hex editor was opened on demand
+    ed = next(t for t in app.tools if getattr(t.controller, "doc", None))
+    assert ed.controller.doc.path == path
+    assert ed.controller.grid.cursor == 0x1B8
+    assert dpg.get_value(ctl.status_tag) == "Jumped to 0x000001b8 in the hex editor"
 
 
 def test_row_click_jumps_into_open_editor(dpg_context, tmp_path) -> None:
@@ -299,7 +303,8 @@ def test_row_click_jumps_into_open_editor(dpg_context, tmp_path) -> None:
 
 
 def test_row_click_other_file_editor_no_jump(dpg_context, tmp_path) -> None:
-    """An editor open on a *different* file must not receive the jump."""
+    """An editor open on a *different* file must not receive the jump: the
+    click opens this file's own editor instead."""
     path = _macho_strings(tmp_path)
     other = str(tmp_path / "other.bin")
     with open(other, "wb") as fh:
@@ -312,9 +317,13 @@ def test_row_click_other_file_editor_no_jump(dpg_context, tmp_path) -> None:
     ctl = app.tools[-1].controller
     s = BinaryString(file_offset=0x1B8, addr=0, section="—", value="hello strings")
     ctl._on_row(None, None, s)
-    ed = next(t for t in app.tools if getattr(t.controller, "doc", None))
-    assert ed.controller.grid.cursor != 0x1B8
-    assert "Hex Editor" in dpg.get_value(ctl.status_tag)  # hint, not a jump
+    editors = {
+        t.controller.doc.path: t.controller
+        for t in app.tools
+        if getattr(t.controller, "doc", None)
+    }
+    assert editors[other].grid.cursor != 0x1B8
+    assert editors[path].grid.cursor == 0x1B8
 
 
 # ── focus guard + menu wiring + protocol ──────────────────────────────────────
@@ -330,7 +339,7 @@ def test_focus_guard(dpg_context, tmp_path) -> None:
 
 def test_menu_registry_opens_strings(dpg_context, tmp_path) -> None:
     """Disassembler ▸ Strings… drives the real registry → open_strings."""
-    from cheerleader.gui.app import MI_STRINGS
+    from cheerleader.gui.const import MI_STRINGS
 
     path = _macho_strings(tmp_path)
     app = GuiApp()
@@ -362,3 +371,24 @@ def test_open_strings_ignores_unparsed_path(dpg_context, tmp_path) -> None:
     app.current_info = BinaryInfo(path=path)
     open_strings(app, str(tmp_path / "nope.bin"))
     assert app.tools == []
+
+
+def test_extraction_failure_reports_instead_of_hanging(
+    dpg_context, tmp_path, monkeypatch
+) -> None:
+    """A crashing extractor posts FAILED; the status never sticks on
+    "Extracting…" and the controller goes idle."""
+    from cheerleader.gui import strings as strings_mod
+
+    def _boom(_info):
+        raise RuntimeError("corrupt section")
+
+    monkeypatch.setattr(strings_mod, "extract_strings", _boom)
+    path = _macho_strings(tmp_path)
+    app = GuiApp()
+    ctl = _open_strings(app, path)
+    ctl.busy.worker.thread.join(timeout=5)
+    for event in app.bridge.drain():
+        app.dispatch(event)
+    assert ctl.busy.op is None
+    assert "String extraction failed: corrupt section" in dpg.get_value(ctl.status_tag)

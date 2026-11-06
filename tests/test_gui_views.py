@@ -14,18 +14,17 @@ pytest.importorskip("dearpygui")
 import dearpygui.dearpygui as dpg
 
 from cheerleader.gui.app import (
-    MI_SEGMENTS,
     GuiApp,
     Tool,
-    _tool_window_closed,
     build_shell,
 )
+from cheerleader.gui.const import MI_SEGMENTS
+from cheerleader.gui.tooling import tool_window_closed
 from cheerleader.gui.views import (
     _SPECS,
     TableController,
     fmt_addr,
     open_inspector,
-    register_inspector_openers,
 )
 from cheerleader.libs.types import (
     BinaryInfo,
@@ -109,7 +108,6 @@ def app(dpg_context, info) -> GuiApp:
     app = GuiApp()
     app.current_file = PATH
     app.current_info = info
-    register_inspector_openers()
     return app
 
 
@@ -156,7 +154,7 @@ def test_open_view_registers_tool(app, kind) -> None:
     assert ctl.view_kind == kind
     assert ctl.path == PATH
     assert tool.grids == ()  # no hex grids in D2
-    assert tool.tick is None  # nothing to maintain per-frame
+    assert tool.tick == ctl.tick  # live search box maintenance
     assert dpg.get_item_label(tool.window).startswith(_SPECS[kind].title)
     assert dpg.get_value(tool.status_tag)  # status strip is populated
 
@@ -167,7 +165,7 @@ def test_open_view_row_count_matches_data(app, info) -> None:
     rows = dpg.get_item_children(table)[1]
     assert len(rows) == len(info.segments)
     # cells readable back from the widget tree
-    cells = [dpg.get_value(c) for c in dpg.get_item_children(rows[0])[1]]
+    cells = [_cell(c) for c in dpg.get_item_children(rows[0])[1]]
     assert cells[0] == "__TEXT"
     assert cells[6] == "2"  # section count
 
@@ -189,7 +187,6 @@ def test_open_unknown_kind_is_silent(app) -> None:
 
 def test_open_without_info_is_silent(dpg_context) -> None:
     app = GuiApp()
-    register_inspector_openers()
     open_inspector(app, "segments", PATH)
     assert app.tools == []
 
@@ -304,9 +301,14 @@ def test_fixup_row_values(info) -> None:
 # ── filters ───────────────────────────────────────────────────────────────────
 
 
+def _cell(tag) -> str:
+    """Cell text: a clickable row's selectable label, else the text value."""
+    return dpg.get_item_label(tag) or dpg.get_value(tag)
+
+
 def _table_rows(ctl: TableController) -> list[list[str]]:
     rows = dpg.get_item_children(ctl.table_tag)[1]
-    return [[dpg.get_value(c) for c in dpg.get_item_children(r)[1]] for r in rows]
+    return [[_cell(c) for c in dpg.get_item_children(r)[1]] for r in rows]
 
 
 def test_symbols_default_filter_is_no_stabs(app) -> None:
@@ -316,7 +318,9 @@ def test_symbols_default_filter_is_no_stabs(app) -> None:
     rows = _table_rows(ctl)
     assert len(rows) == 3  # the stab entry is hidden
     assert all(r[1] != "STAB" for r in rows)
-    assert dpg.get_value(ctl.status_tag) == "3 of 4 symbols — filter: No-stabs"
+    assert dpg.get_value(ctl.status_tag) == (
+        "3 of 4 symbols — filter: No-stabs  ·  click a row to view it in the hex editor"
+    )
 
 
 def test_symbols_filter_buttons(app) -> None:
@@ -355,14 +359,19 @@ def test_fixups_binds_rebases(app) -> None:
     dpg.get_item_callback(f"{ns}-flt-rebases")()
     rows = _table_rows(ctl)
     assert [r[3] for r in rows] == ["rebase"]
-    assert dpg.get_value(ctl.status_tag) == "1 of 3 fixups — filter: Rebases"
+    assert dpg.get_value(ctl.status_tag) == (
+        "1 of 3 fixups — filter: Rebases  ·  click a row to view it in the hex editor"
+    )
+
+
+HINT = "  ·  click a row to view it in the hex editor"
 
 
 def test_unfiltered_views_show_plain_status(app) -> None:
     open_inspector(app, "segments", PATH)
-    assert dpg.get_value(app.tools[0].status_tag) == "2 segments"
+    assert dpg.get_value(app.tools[0].status_tag) == "2 segments" + HINT
     open_inspector(app, "imports", PATH)
-    assert dpg.get_value(app.tools[1].status_tag) == "2 imports"
+    assert dpg.get_value(app.tools[1].status_tag) == "2 imports" + HINT
 
 
 # ── lifecycle / protocol ──────────────────────────────────────────────────────
@@ -411,7 +420,7 @@ def test_on_close_button_runs_controller(app) -> None:
     window = app.tools[0].window
     # on_close is not a plain callback; drive the same handler it is
     # wired to (headless stand-in for clicking the X).
-    _tool_window_closed(app, window)
+    tool_window_closed(app, window)
     assert app.tools == []
 
 
@@ -446,3 +455,99 @@ def test_disasm_menu_item_opens_view(dpg_context, info) -> None:
 def test_opened_view_is_a_tool_instance(app) -> None:
     open_inspector(app, "segments", PATH)
     assert isinstance(app.tools[0], Tool)
+
+
+# ── Phase 3: sort, search, clipper, row jump ──────────────────────────────────
+
+
+def test_tables_are_sortable_and_clipped(app) -> None:
+    open_inspector(app, "segments", PATH)
+    cfg = dpg.get_item_configuration(app.tools[0].controller.table_tag)
+    assert cfg["sortable"] is True
+    assert cfg["clipper"] is True
+
+
+def test_sort_by_column_header(app) -> None:
+    open_inspector(app, "symbols", PATH)
+    ctl = app.tools[0].controller
+    ctl._on_filter("all")
+    name_col = ctl._columns[4]
+    ctl._on_sort(ctl.table_tag, [[name_col, 1]])  # Name ascending
+    names = [r[4] for r in _table_rows(ctl)]
+    assert names == ["<stab>", "_extern", "_local_fn", "_main"]
+    ctl._on_sort(ctl.table_tag, [[name_col, -1]])  # descending
+    assert _table_rows(ctl)[0][4] == "_main"
+    addr_col = ctl._columns[0]
+    ctl._on_sort(ctl.table_tag, [[addr_col, -1]])  # numeric key, not text
+    assert _table_rows(ctl)[0][4] == "_local_fn"
+    ctl._on_sort(ctl.table_tag, None)  # cleared → snapshot order
+    assert _table_rows(ctl)[0][4] == "_main"
+
+
+def test_import_numbers_survive_sorting(app) -> None:
+    """``#`` is the snapshot position, not the on-screen row."""
+    open_inspector(app, "imports", PATH)
+    ctl = app.tools[0].controller
+    ctl._on_sort(ctl.table_tag, [[ctl._columns[1], 1]])  # Name ascending
+    rows = _table_rows(ctl)
+    assert [(r[0], r[1]) for r in rows] == [
+        ("2", "/usr/lib/libc.dylib"),
+        ("1", "/usr/lib/libSystem.dylib"),
+    ]
+
+
+def test_search_box_filters_live(app) -> None:
+    open_inspector(app, "symbols", PATH)
+    ctl = app.tools[0].controller
+    assert dpg.get_item_configuration(ctl.search_tag)["hint"] == "Search symbols…"
+    dpg.set_value(ctl.search_tag, "FN")
+    ctl.tick()
+    assert [r[4] for r in _table_rows(ctl)] == ["_local_fn"]
+    assert dpg.get_value(ctl.status_tag).startswith(
+        "1 of 4 symbols matching 'FN' — filter: No-stabs"
+    )
+
+
+def test_views_without_search_have_no_box(app) -> None:
+    open_inspector(app, "segments", PATH)
+    assert not dpg.does_item_exist(app.tools[0].controller.search_tag)
+
+
+def test_row_offsets_map_to_file_bytes(info) -> None:
+    seg_off = _SPECS["segments"].offset
+    assert seg_off(info, info.segments[1]) == 0x4000
+    sym_off = _SPECS["symbols"].offset
+    assert sym_off(info, info.symbols[1]) == 0x1000  # _local_fn
+    assert sym_off(info, info.symbols[2]) is None  # undefined → no bytes
+    assert _SPECS["imports"].offset(info, info.libraries[1]) == 0x280
+
+
+def test_row_click_without_bytes_says_so(app, info) -> None:
+    open_inspector(app, "symbols", PATH)
+    ctl = app.tools[0].controller
+    ctl._on_row(None, None, info.symbols[2])  # undefined symbol
+    assert dpg.get_value(ctl.status_tag) == "This row has no bytes in the file"
+    assert len(app.tools) == 1
+
+
+def test_row_click_opens_editor_at_offset(dpg_context, info, tmp_path) -> None:
+    path = tmp_path / "sample.bin"
+    path.write_bytes(bytes(0x6000))
+    info.path = str(path)
+    app = GuiApp()
+    app.current_file, app.current_info = str(path), info
+    open_inspector(app, "sections", str(path))
+    ctl = app.tools[0].controller
+    ctl._on_row(None, None, info.segments[0].sections[1])  # __cstring @ 0x1000
+    editor = app.tools[1].controller
+    assert editor.doc.path == str(path)
+    assert editor.grid.cursor == 0x1000
+    assert dpg.get_value(ctl.status_tag) == "Jumped to 0x00001000 in the hex editor"
+
+
+def test_sort_callback_after_close_is_ignored(app) -> None:
+    """DPG may deliver a queued sort callback after the window is gone."""
+    open_inspector(app, "segments", PATH)
+    ctl = app.tools[0].controller
+    app.close_tool(app.tools[0])
+    ctl._on_sort(None, [[0, 1]])  # must not raise

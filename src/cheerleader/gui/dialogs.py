@@ -1,4 +1,4 @@
-"""Modal dialogs for the Dear PyGui hex editor."""
+"""Modal dialogs and file pickers for the Dear PyGui front-end."""
 
 import itertools
 import os
@@ -9,7 +9,9 @@ try:
 except ImportError:
     dpg = None  # type: ignore[assignment]
 
-from cheerleader.gui.const import ERR_COLOR, INPUT_W
+from cheerleader.gui.const import INPUT_W, KEY_ESCAPE, SHORTCUTS
+from cheerleader.gui.theme import COL_BLUE, COL_YELLOW, ERR_COLOR
+from cheerleader.gui.tooling import focus_guard
 
 # Unique tags for transient popups (several tool windows may be open at
 # once so fixed class-level tags would collide).
@@ -56,18 +58,190 @@ def picked_path(app_data) -> str | None:
     return str(app_data) if app_data else None
 
 
-class ByteEditDialog:
+class ModalDialog:
+    """
+    Base of the modal dialogs: one modal, fixed-size window with a unique
+    tag (several tool windows may each have a dialog up, so fixed tags
+    would collide), centered on the viewport when shown.
+
+    The title-bar X calls :meth:`_dismissed` — subclasses map it onto
+    their cancel answer so a caller waiting for a reply is never left
+    hanging; the default just deletes the window.
+    """
+
+    PREFIX = "gui-dlg"
+    WIDTH: int | None = None  # None = auto-size to the content
+
+    def __init__(self, *, label: str, tag: str | None = None, show: bool = False):
+        self.TAG = tag or _unique_tag(self.PREFIX)
+        size = {"width": self.WIDTH} if self.WIDTH else {}
+        dpg.add_window(
+            tag=self.TAG,
+            label=label,
+            modal=True,
+            no_open_over_existing_popup=True,
+            no_collapse=True,
+            no_resize=True,
+            show=show,
+            on_close=self._dismissed,
+            **size,
+        )
+        if show:
+            _center(self.TAG)
+
+    def open(self) -> None:
+        _center(self.TAG)
+        dpg.configure_item(self.TAG, show=True)
+
+    def close(self, *_args) -> None:
+        if dpg.does_item_exist(self.TAG):
+            dpg.delete_item(self.TAG)
+
+    def _dismissed(self, *_args) -> None:
+        self.close()
+
+
+def _center(tag: str) -> None:
+    """Place window *tag* at the viewport center (best effort).
+
+    Auto-sized windows have no measured size before their first frame, so
+    an estimate (configured width, nominal height) stands in; headless (no
+    viewport) this is a no-op.
+    """
+    try:
+        vw = dpg.get_viewport_client_width()
+        vh = dpg.get_viewport_client_height()
+        w, h = dpg.get_item_rect_size(tag)
+    except Exception:  # noqa: BLE001 - no viewport / not laid out yet
+        return
+    if not vw or not vh:
+        return
+    w = w or dpg.get_item_configuration(tag).get("width") or 2 * INPUT_W
+    h = h or 140
+    dpg.set_item_pos(tag, [max((vw - w) // 2, 0), max((vh - h) // 3, 0)])
+
+
+class _PromptDialog(ModalDialog):
+    """A modal input prompt: text input + error label + OK/Cancel.
+
+    ``validate`` turns the input into a result (raising ``ValueError`` with
+    a message shown inline) which goes to ``on_accept``; OK is bound to the
+    button *and* to Enter inside the input. Cancel, Esc (routed by the
+    controller) and the title-bar X all end in ``on_cancel``.
+    """
+
+    def __init__(
+        self,
+        *,
+        label: str,
+        tag: str | None,
+        validate: Callable,
+        on_accept: Callable,
+        on_cancel: Callable[[], None],
+    ) -> None:
+        super().__init__(label=label, tag=tag)
+        self._validate = validate
+        self._on_accept = on_accept
+        self._on_cancel = on_cancel
+        self._input_tag = f"{self.TAG}-input"
+        self._error_tag = f"{self.TAG}-error"
+        # Esc cancels while this prompt has the focus.
+        self._keys_tag = f"{self.TAG}-keys"
+        with dpg.handler_registry(tag=self._keys_tag):
+            dpg.add_key_press_handler(
+                key=KEY_ESCAPE, callback=focus_guard(self.TAG, self._cancel)
+            )
+
+    def _add_input(self, default_value: str, hint: str = "") -> None:
+        dpg.add_input_text(
+            tag=self._input_tag,
+            parent=self.TAG,
+            default_value=default_value,
+            hint=hint,
+            on_enter=True,
+            callback=self._try_apply,
+            width=INPUT_W,
+        )
+
+    def _add_error_and_buttons(self, ok_label: str) -> None:
+        dpg.add_text("", tag=self._error_tag, parent=self.TAG, color=ERR_COLOR)
+        with dpg.group(horizontal=True, parent=self.TAG):
+            dpg.add_button(label=ok_label, callback=self._try_apply)
+            dpg.add_button(label="Cancel", callback=self._cancel)
+
+    def _validated(self):
+        return self._validate(dpg.get_value(self._input_tag))
+
+    def open(self) -> None:
+        super().open()
+        dpg.focus_item(self._input_tag)
+
+    def close(self, *_args) -> None:
+        super().close()
+        if dpg.does_item_exist(self._keys_tag):
+            dpg.delete_item(self._keys_tag)
+
+    def _cancel(self, *_args) -> None:
+        self._on_cancel()
+
+    def _dismissed(self, *_args) -> None:
+        self._cancel()  # title-bar X == Cancel
+
+    def _try_apply(self, *_args) -> None:
+        try:
+            result = self._validated()
+        except ValueError as e:
+            dpg.set_value(self._error_tag, str(e))
+            return
+        dpg.set_value(self._error_tag, "")
+        self._on_accept(result)
+
+
+class PromptDialog(_PromptDialog):
+    """A one-line prompt: optional help text, the input, OK/Cancel.
+
+    ``validate(text)`` returns the result handed to ``on_accept`` (or
+    raises ``ValueError``); ``on_cancel`` defaults to just closing.
+    """
+
+    PREFIX = "gui-dlg-prompt"
+
+    def __init__(
+        self,
+        *,
+        label: str,
+        validate: Callable[[str], object],
+        on_accept: Callable[[object], None],
+        on_cancel: Callable[[], None] | None = None,
+        help_text: str = "",
+        hint: str = "",
+        value: str = "",
+        ok_label: str = "OK",
+    ) -> None:
+        super().__init__(
+            label=label,
+            tag=None,
+            validate=validate,
+            on_accept=on_accept,
+            on_cancel=on_cancel or self.close,
+        )
+        if help_text:
+            dpg.add_text(help_text, parent=self.TAG)
+        self._add_input(value, hint=hint)
+        self._add_error_and_buttons(ok_label)
+
+
+class ByteEditDialog(_PromptDialog):
     """
     Edit-bytes prompt at a fixed offset (the Enter popup).
 
     Mirrors the TUI ``ByteEditPrompt``: shows the current byte, pre-fills the
     input with it, validates via ``validate(text) -> bytes`` (the controller
     supplies ``parse_byte_sequence`` plus the past-EOF check) and hands the
-    parsed bytes to ``on_accept``. Apply is bound to the button *and* to
-    Enter inside the input.
+    parsed bytes to ``on_accept``.
     """
 
-    TAG = "gui-dlg-edit"
+    PREFIX = "gui-dlg-edit"
 
     def __init__(
         self,
@@ -79,60 +253,24 @@ class ByteEditDialog:
         on_cancel: Callable[[], None],
         tag: str | None = None,
     ) -> None:
-        self.TAG = tag or type(self).TAG
-        self._validate = validate
-        self._on_accept = on_accept
-        self._on_cancel = on_cancel
-        self._input_tag = f"{self.TAG}-input"
-        self._error_tag = f"{self.TAG}-error"
-        dpg.add_window(
-            tag=self.TAG,
+        super().__init__(
             label=f"Edit at 0x{offset:08x}",
-            modal=True,
-            no_open_over_existing_popup=True,
-            no_collapse=True,
-            no_resize=True,
-            show=False,
+            tag=tag,
+            validate=validate,
+            on_accept=on_accept,
+            on_cancel=on_cancel,
         )
         c = current[0] if current else 0
         ch = chr(c) if 0x20 <= c < 0x7F else "."
         dpg.add_text(f"current: 0x{c:02x}  {c:3d}  '{ch}'", parent=self.TAG)
-        dpg.add_input_text(
-            tag=self._input_tag,
-            parent=self.TAG,
-            default_value=f"{c:02x}" if current else "",
+        self._add_input(
+            f"{c:02x}" if current else "",
             hint='de ad be ef · 0x7f · #127 · "text',
-            on_enter=True,
-            callback=self._try_apply,
-            width=INPUT_W,
         )
-        dpg.add_text("", tag=self._error_tag, parent=self.TAG, color=ERR_COLOR)
-        with dpg.group(horizontal=True, parent=self.TAG):
-            dpg.add_button(label="Apply", callback=self._try_apply)
-            dpg.add_button(label="Cancel", callback=self._cancel)
-
-    def open(self) -> None:
-        dpg.configure_item(self.TAG, show=True)
-        dpg.focus_item(self._input_tag)
-
-    def close(self) -> None:
-        dpg.delete_item(self.TAG)
-
-    def _cancel(self, *_args) -> None:
-        self._on_cancel()
-
-    def _try_apply(self, *_args) -> None:
-        text = dpg.get_value(self._input_tag)
-        try:
-            data = self._validate(text)
-        except ValueError as e:
-            dpg.set_value(self._error_tag, str(e))
-            return
-        dpg.set_value(self._error_tag, "")
-        self._on_accept(data)
+        self._add_error_and_buttons("Apply")
 
 
-class SearchDialog:
+class SearchDialog(_PromptDialog):
     """
     Go-to-offset / search prompt (the ``/`` popup).
 
@@ -142,7 +280,7 @@ class SearchDialog:
     ``(mode, value, raw)`` result handed to ``on_accept``.
     """
 
-    TAG = "gui-dlg-search"
+    PREFIX = "gui-dlg-search"
 
     def __init__(
         self,
@@ -154,34 +292,19 @@ class SearchDialog:
         on_cancel: Callable[[], None],
         tag: str | None = None,
     ) -> None:
-        self.TAG = tag or type(self).TAG
-        self._validate = validate
-        self._on_accept = on_accept
-        self._on_cancel = on_cancel
-        self._input_tag = f"{self.TAG}-input"
-        self._mode_tag = f"{self.TAG}-mode"
-        self._error_tag = f"{self.TAG}-error"
-        dpg.add_window(
-            tag=self.TAG,
+        super().__init__(
             label="Go to offset / search",
-            modal=True,
-            no_open_over_existing_popup=True,
-            no_collapse=True,
-            no_resize=True,
-            show=False,
+            tag=tag,
+            validate=validate,
+            on_accept=on_accept,
+            on_cancel=on_cancel,
         )
+        self._mode_tag = f"{self.TAG}-mode"
         dpg.add_text(
             'offset: 1a2b · 0x1a2b · #6699   hex: de ad be ef   text: "abc',
             parent=self.TAG,
         )
-        dpg.add_input_text(
-            tag=self._input_tag,
-            parent=self.TAG,
-            default_value=value,
-            on_enter=True,
-            callback=self._try_apply,
-            width=INPUT_W,
-        )
+        self._add_input(value)
         dpg.add_radio_button(
             ["offset", "hex", "text"],
             default_value=mode,
@@ -189,66 +312,57 @@ class SearchDialog:
             tag=self._mode_tag,
             parent=self.TAG,
         )
-        dpg.add_text("", tag=self._error_tag, parent=self.TAG, color=ERR_COLOR)
-        with dpg.group(horizontal=True, parent=self.TAG):
-            dpg.add_button(label="Go", callback=self._try_apply)
-            dpg.add_button(label="Cancel", callback=self._cancel)
+        self._add_error_and_buttons("Go")
 
-    def open(self) -> None:
-        dpg.configure_item(self.TAG, show=True)
-        dpg.focus_item(self._input_tag)
-
-    def close(self) -> None:
-        dpg.delete_item(self.TAG)
-
-    def _cancel(self, *_args) -> None:
-        self._on_cancel()
-
-    def _try_apply(self, *_args) -> None:
-        text = dpg.get_value(self._input_tag)
+    def _validated(self):
         mode = dpg.get_value(self._mode_tag)
-        try:
-            result = self._validate(mode, text)
-        except ValueError as e:
-            dpg.set_value(self._error_tag, str(e))
-            return
-        dpg.set_value(self._error_tag, "")
-        self._on_accept(result)
+        return self._validate(mode, dpg.get_value(self._input_tag))
 
-class InfoDialog:
-    """Simple Info Dialog."""
 
-    TAG = "gui-dlg-info"
+class InfoDialog(ModalDialog):
+    """Informational notice (message + OK); OK or X deletes the window."""
 
-    def __init__(
-        self,
-        *,
-        message: str,
-        tag: str | None = None,
-    ) -> None:
-        self.TAG = tag or type(self).TAG
+    PREFIX = "gui-dlg-info"
+
+    def __init__(self, *, message: str, tag: str | None = None) -> None:
+        super().__init__(label="Info", tag=tag)
         self.message = message
-        dpg.add_window(
-            tag=self.TAG,
-            label="Info",
-            modal=True,
-            no_open_over_existing_popup=True,
-            no_collapse=True,
-            no_resize=True,
-            show=False,
-        )
         dpg.add_text(message, parent=self.TAG)
+        dpg.add_button(label="OK", parent=self.TAG, callback=self.close)
 
-    def open(self) -> None:
-        dpg.configure_item(self.TAG, show=True)
 
-    def close(self) -> None:
-        dpg.delete_item(self.TAG)
+class ShortcutsDialog(ModalDialog):
+    """Help ▸ Keyboard shortcuts: :data:`~cheerleader.gui.const.SHORTCUTS`
+    as one two-column table per tool."""
 
-class ConfirmDialog:
+    PREFIX = "gui-dlg-keys"
+    WIDTH = 600
+
+    def __init__(self) -> None:
+        super().__init__(label="Keyboard shortcuts")
+        dpg.configure_item(self.TAG, height=520, no_resize=False)
+        with dpg.child_window(parent=self.TAG, height=-34, border=False):
+            for section, rows in SHORTCUTS:
+                dpg.add_text(section, color=COL_BLUE)
+                with dpg.table(
+                    header_row=False,
+                    row_background=True,
+                    policy=dpg.mvTable_SizingStretchProp,
+                ):
+                    dpg.add_table_column(init_width_or_weight=1.3)
+                    dpg.add_table_column(init_width_or_weight=1.0)
+                    for action, keys in rows:
+                        with dpg.table_row():
+                            dpg.add_text(action)
+                            dpg.add_text(keys, color=COL_YELLOW)
+                dpg.add_spacer(height=6)
+        dpg.add_button(label="Close", parent=self.TAG, callback=self.close)
+
+
+class ConfirmDialog(ModalDialog):
     """Yes/No confirmation (overwrite / discard / quit-without-saving)."""
 
-    TAG = "gui-dlg-confirm"
+    PREFIX = "gui-dlg-confirm"
 
     def __init__(
         self,
@@ -257,34 +371,22 @@ class ConfirmDialog:
         on_answer: Callable[[bool], None],
         tag: str | None = None,
     ) -> None:
-        self.TAG = tag or type(self).TAG
+        super().__init__(label="Confirm", tag=tag)
         self._on_answer = on_answer
         self.message = message
-        dpg.add_window(
-            tag=self.TAG,
-            label="Confirm",
-            modal=True,
-            no_open_over_existing_popup=True,
-            no_collapse=True,
-            no_resize=True,
-            show=False,
-        )
         dpg.add_text(message, parent=self.TAG)
         with dpg.group(horizontal=True, parent=self.TAG):
             dpg.add_button(label="Yes", callback=self._yes)
             dpg.add_button(label="No", callback=self._no)
-
-    def open(self) -> None:
-        dpg.configure_item(self.TAG, show=True)
-
-    def close(self) -> None:
-        dpg.delete_item(self.TAG)
 
     def _yes(self, *_args) -> None:
         self._on_answer(True)
 
     def _no(self, *_args) -> None:
         self._on_answer(False)
+
+    def _dismissed(self, *_args) -> None:
+        self._no()  # title-bar X == No (else the caller waits forever)
 
 
 class SaveDialog:
@@ -351,7 +453,9 @@ class CompareOpenDialog:
     :class:`ErrorPopup` when a file cannot be opened.
     """
 
-    def __init__(self, *, on_launch: Callable[[str, str], None]) -> None:
+    def __init__(
+        self, *, on_launch: Callable[[str, str], None], source: str = ""
+    ) -> None:
         self.TAG = _unique_tag("gui-dlg-cmp")
         self._on_launch = on_launch
         self._src_tag = f"{self.TAG}-src"
@@ -392,12 +496,14 @@ class CompareOpenDialog:
                 cancel_callback=lambda *_a: None,
             )
             add_all_files_filter(dlg_tag)
+        dpg.set_value(self._src_tag, source)  # e.g. the shell's loaded file
         dpg.add_text("", tag=self._error_tag, parent=self.TAG, color=ERR_COLOR)
         with dpg.group(horizontal=True, parent=self.TAG):
             dpg.add_button(label="Compare", callback=self._launch)
             dpg.add_button(label="Cancel", callback=self.close)
 
     def open(self) -> None:
+        _center(self.TAG)
         dpg.configure_item(self.TAG, show=True)
 
     def close(self, *_args) -> None:
@@ -432,28 +538,18 @@ class CompareOpenDialog:
         self._on_launch(src, tgt)
 
 
-class ErrorPopup:
+class ErrorPopup(ModalDialog):
     """
     Non-fatal error notice (message + OK), e.g. a file that vanished
-    between the file dialog and the open. Transient: the window deletes
-    itself on OK; the tag is unique per instance so several popups can
-    coexist.
+    between the file dialog and the open. Shown on construction; OK or the
+    title-bar X deletes the window.
     """
 
+    PREFIX = "gui-error"
+    WIDTH = 420
+
     def __init__(self, message: str) -> None:
-        self.TAG = _unique_tag("gui-error")
-        dpg.add_window(
-            tag=self.TAG,
-            label="Error",
-            modal=True,
-            no_open_over_existing_popup=True,
-            no_collapse=True,
-            no_resize=True,
-            width=420,
-        )
-        dpg.add_text(message, parent=self.TAG, wrap=390)
+        super().__init__(label="Error", show=True)
+        dpg.add_text(message, parent=self.TAG, wrap=self.WIDTH - 30)
         with dpg.group(horizontal=True, parent=self.TAG):
             dpg.add_button(label="OK", callback=self.close)
-
-    def close(self, *_args) -> None:
-        dpg.delete_item(self.TAG)

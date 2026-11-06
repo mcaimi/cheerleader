@@ -715,3 +715,30 @@ def test_scroll_mode_keys_scroll_without_cursor(grid_window, tmp_path):
     assert grid.cursor == 32  # row start
     grid._key_end()
     assert grid.cursor == 47  # row end
+
+
+def test_ctrl_home_end_move_cursor_to_file_bounds(grid_window, tmp_path, monkeypatch):
+    """Editor mode: Ctrl+Home/End jump the *cursor* to the first/last byte."""
+    from cheerleader.gui import hexgrid as hexgrid_mod
+
+    doc = _make_doc(tmp_path, size=4096)
+    grid = HexGrid(doc)
+    grid.build(grid_window)
+    grid._vis = 4
+    grid.move_to(100)
+    monkeypatch.setattr(hexgrid_mod, "ctrl_down", lambda: True)
+    grid._key_end()
+    assert grid.cursor == doc.size - 1
+    assert grid.top_row == grid._max_top()
+    grid._key_home()
+    assert grid.cursor == 0 and grid.top_row == 0
+
+
+def test_left_right_ignored_in_scroll_mode(grid_window, tmp_path):
+    doc = _make_doc(tmp_path)
+    grid = HexGrid(doc)
+    grid.build(grid_window)
+    grid.scroll_mode = True
+    grid._key_right()
+    grid._key_left()
+    assert grid.cursor == 0 and grid.top_row == 0

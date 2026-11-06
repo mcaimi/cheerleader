@@ -23,46 +23,40 @@ Both windows are built once from their snapshot and never re-rendered;
 there is no worker, no per-frame tick, and ``dirty_edit_count() == 0``.
 """
 
-from cheerleader.gui.app import (
-    STATUS_RESERVE,
-    TOOL_MIN_H,
-    TOOL_MIN_W,
-    GuiApp,
-    Tool,
-    _tool_window_closed,
-)
+from __future__ import annotations
+
+from collections import deque
+from typing import TYPE_CHECKING
+
 from cheerleader.gui.const import KEY_ESCAPE, TABLE_WIN_H, TABLE_WIN_W
+from cheerleader.gui.theme import (
+    COL_DIM,
+    COL_ENTRY,
+    COL_GRID_BG,
+    COL_GRID_LINE,
+    COL_TEXT,
+    EDGE_COLORS,
+)
+from cheerleader.gui.tooling import (
+    ReadOnlyController,
+    build_tool_window,
+    find_tool,
+    focus_tool,
+)
 from cheerleader.libs.cfg import CallGraph, ControlFlowGraph
 from cheerleader.libs.types import DisasmInstruction
+
+if TYPE_CHECKING:
+    from cheerleader.gui.app import GuiApp
 
 try:
     import dearpygui.dearpygui as dpg
 except ImportError:
     dpg = None  # type: ignore[assignment]
 
-# ── palette (TUI highlight._EDGE_STYLE parity) ───────────────────────────────
-
-COL_TEXT = (216, 216, 222, 255)
-COL_DIM = (140, 140, 148, 255)
-COL_BLOCK = (110, 210, 230, 255)  # cyan block headers
-COL_ENTRY = (255, 230, 120, 255)  # entry-block title bar
-COL_CALLS = (120, 200, 120, 255)  # green "Calls" node
-COL_CALLED_BY = (250, 210, 80, 255)  # yellow "Called by" node
-COL_GRID_BG = (24, 24, 30, 255)
-COL_GRID_LINE = (36, 36, 44, 255)
-
-_EDGE_COLORS = {
-    "fall": (120, 200, 120, 255),  # green
-    "cond": (250, 210, 80, 255),  # yellow
-    "jump": (110, 170, 255, 255),  # blue
-    "indirect": (140, 140, 148, 255),  # dim
-    "ret": (240, 120, 120, 255),  # red
-}
-
-
 def edge_color(etype: str) -> tuple[int, int, int, int]:
     """DPG color for a CFG edge type (TUI ``_EDGE_STYLE`` parity)."""
-    return _EDGE_COLORS.get(etype, COL_DIM)
+    return EDGE_COLORS.get(etype, COL_DIM)
 
 
 # ── CFG node-graph layout (pure; unit-tested without a display) ──────────────
@@ -89,18 +83,27 @@ def _insn_text(insn: DisasmInstruction) -> str:
     return f"  0x{insn.addr:x}  {hex_str:<20}  {insn.mnemonic:<8}  {insn.op_str}"
 
 
-def cfg_blocks_ordered(cfg: ControlFlowGraph) -> list[int]:
-    """Block addresses in display order: BFS depth from the entry, then
-    address; unreachable blocks land in one trailing column (address
-    order). Block ``#n`` is the *n*-th entry of this list (1-based)."""
+def _bfs_depths(cfg: ControlFlowGraph) -> dict[int, int]:
+    """BFS depth of every block reachable from the entry (entry = 0)."""
     depth: dict[int, int] = {cfg.entry: 0} if cfg.entry in cfg.blocks else {}
-    queue = [cfg.entry] if depth else []
+    queue = deque(depth)
     while queue:
-        addr = queue.pop(0)
+        addr = queue.popleft()
         for tgt, _ in cfg.blocks[addr].succs:
             if tgt in cfg.blocks and tgt not in depth:
                 depth[tgt] = depth[addr] + 1
                 queue.append(tgt)
+    return depth
+
+
+def cfg_blocks_ordered(cfg: ControlFlowGraph) -> list[int]:
+    """Block addresses in display order: BFS depth from the entry, then
+    address; unreachable blocks land in one trailing column (address
+    order). Block ``#n`` is the *n*-th entry of this list (1-based)."""
+    return _ordered(cfg, _bfs_depths(cfg))
+
+
+def _ordered(cfg: ControlFlowGraph, depth: dict[int, int]) -> list[int]:
     # unreachable blocks share the sort key "after every reached depth",
     # tie-broken by address (one trailing column, address order)
     return sorted(cfg.blocks, key=lambda a: (depth.get(a, len(depth)), a))
@@ -120,15 +123,8 @@ def cfg_layout(cfg: ControlFlowGraph) -> dict[int, tuple[int, int]]:
     same order as :func:`cfg_blocks_ordered`. Deterministic."""
     if not cfg.blocks:
         return {}
-    order = cfg_blocks_ordered(cfg)
-    depth = {cfg.entry: 0} if cfg.entry in cfg.blocks else {}
-    queue = [cfg.entry] if depth else []
-    while queue:
-        addr = queue.pop(0)
-        for tgt, _ in cfg.blocks[addr].succs:
-            if tgt in cfg.blocks and tgt not in depth:
-                depth[tgt] = depth[addr] + 1
-                queue.append(tgt)
+    depth = _bfs_depths(cfg)
+    order = _ordered(cfg, depth)
     max_d = max(depth.values(), default=-1)
     positions: dict[int, tuple[int, int]] = {}
     col_y: dict[int, int] = {}
@@ -141,31 +137,14 @@ def cfg_layout(cfg: ControlFlowGraph) -> dict[int, tuple[int, int]]:
     return positions
 
 
-# ── per-function focus guard ─────────────────────────────────────────────────
-
-
-def _find_graph_tool(
-    app: GuiApp, view_kind: str, path: str, func_name: str
-) -> Tool | None:
-    """The open window for (kind, path, function), or ``None``."""
-    for tool in app.tools:
-        ctl = tool.controller
-        if (
-            getattr(ctl, "view_kind", None) == view_kind
-            and getattr(ctl, "path", None) == path
-            and getattr(ctl, "func_name", None) == func_name
-        ):
-            return tool
-    return None
-
-
 # ── call-flow window ─────────────────────────────────────────────────────────
 
 
-class CallFlowController:
+class CallFlowController(ReadOnlyController):
     """One call-flow tool window over a ``CallGraph`` snapshot."""
 
     view_kind = "callflow"
+    keys_prefix = "callflow"
 
     def __init__(
         self,
@@ -252,36 +231,19 @@ class CallFlowController:
     # ── keys ───────────────────────────────────────────────────────────────
 
     def _install_keys(self) -> None:
-        with dpg.handler_registry(tag=f"callflow-keys-{self.ns}"):
-            dpg.add_key_press_handler(
-                key=KEY_ESCAPE, callback=self.window_close_requested
-            )
-            dpg.add_key_press_handler(key=dpg.mvKey_B, callback=self.back)
-
-    # ── the shell's Controller protocol ───────────────────────────────────
-
-    def dirty_edit_count(self) -> int:
-        """Read-only view — never dirty."""
-        return 0
-
-    def on_event(self, event) -> None:
-        """No workers — nothing to receive."""
-
-    def window_close_requested(self, *_args) -> None:
-        self.app.close_tool_for(self)
-
-    def shutdown(self) -> None:
-        if dpg.does_item_exist(f"callflow-keys-{self.ns}"):
-            dpg.delete_item(f"callflow-keys-{self.ns}")
+        self.install_keys(
+            [(KEY_ESCAPE, self.window_close_requested), (dpg.mvKey_B, self.back)]
+        )
 
 
 # ── CFG window ───────────────────────────────────────────────────────────────
 
 
-class CFGController:
+class CFGController(ReadOnlyController):
     """One CFG tool window over a ``ControlFlowGraph`` snapshot."""
 
     view_kind = "cfg"
+    keys_prefix = "cfg"
 
     def __init__(
         self,
@@ -449,62 +411,22 @@ class CFGController:
         dpg.bind_item_theme(link, self._link_theme(etype))
         self._links[link] = spec
 
-    # ── the shell's Controller protocol ───────────────────────────────────
-
-    def dirty_edit_count(self) -> int:
-        """Read-only view — never dirty."""
-        return 0
-
-    def on_event(self, event) -> None:
-        """No workers — nothing to receive."""
-
-    def window_close_requested(self, *_args) -> None:
-        self.app.close_tool_for(self)
-
-    def shutdown(self) -> None:
-        if dpg.does_item_exist(f"cfg-keys-{self.ns}"):
-            dpg.delete_item(f"cfg-keys-{self.ns}")
-
     def _install_keys(self) -> None:
-        with dpg.handler_registry(tag=f"cfg-keys-{self.ns}"):
-            dpg.add_key_press_handler(
-                key=KEY_ESCAPE, callback=self.window_close_requested
-            )
+        self.install_keys([(KEY_ESCAPE, self.window_close_requested)])
 
 
 # ── openers ──────────────────────────────────────────────────────────────────
 
 
-def _build_window(app: GuiApp, path: str, title: str):
-    """The shared D4 tool-window skeleton: content child + status strip."""
-    ns = app.next_ns()
-    window = f"gui-tool-{ns}"
-    content = f"{window}-content"
-    status_tag = f"{window}-status"
-    with dpg.window(
-        tag=window,
-        label=title,
-        width=TABLE_WIN_W,
-        height=TABLE_WIN_H,
-        min_size=[TOOL_MIN_W, TOOL_MIN_H],
-        no_collapse=True,
-        on_close=lambda *_a: _tool_window_closed(app, window),
-    ):
-        dpg.add_child_window(tag=content, border=False, height=-STATUS_RESERVE)
-        dpg.add_separator()
-        dpg.add_text("", tag=status_tag)
-    return ns, window, content, status_tag
-
-
 def open_call_flow(app: GuiApp, path: str, graph: CallGraph, func_name: str) -> None:
     """Open the call-flow window for *func_name* (focus-guarded per function)."""
-    existing = _find_graph_tool(app, "callflow", path, func_name)
+    # focus guard per (kind, path, function)
+    existing = find_tool(app, view_kind="callflow", path=path, func_name=func_name)
     if existing is not None:
-        dpg.configure_item(existing.window, show=True)
-        dpg.focus_item(existing.window)
+        focus_tool(existing)
         return
-    ns, window, content, status_tag = _build_window(
-        app, path, f"Call flow — {func_name}"
+    ns, window, content, status_tag = build_tool_window(
+        app, f"Call flow — {func_name}", TABLE_WIN_W, TABLE_WIN_H
     )
     tree_tag = f"{ns}-tree"
     dpg.add_group(tag=tree_tag, parent=content)
@@ -519,27 +441,20 @@ def open_call_flow(app: GuiApp, path: str, graph: CallGraph, func_name: str) -> 
         ns=ns,
     )
     controller.populate(func_name)
-    app.tools.append(
-        Tool(
-            window=window,
-            status_tag=status_tag,
-            controller=controller,
-            grids=(),
-            tick=None,
-        )
-    )
+    app.register_tool(window, status_tag, controller)
 
 
 def open_cfg(app: GuiApp, path: str, cfg: ControlFlowGraph) -> None:
     """Open the CFG window for *cfg* (focus-guarded per function)."""
-    existing = _find_graph_tool(app, "cfg", path, cfg.func_name)
+    existing = find_tool(app, view_kind="cfg", path=path, func_name=cfg.func_name)
     if existing is not None:
-        dpg.configure_item(existing.window, show=True)
-        dpg.focus_item(existing.window)
+        focus_tool(existing)
         return
     n = len(cfg.blocks)
     title = f"CFG — {cfg.func_name}  ·  {n} block{'s' if n != 1 else ''}"
-    ns, window, content, status_tag = _build_window(app, path, title)
+    ns, window, content, status_tag = build_tool_window(
+        app, title, TABLE_WIN_W, TABLE_WIN_H
+    )
     controller = CFGController(
         app,
         path,
@@ -549,12 +464,4 @@ def open_cfg(app: GuiApp, path: str, cfg: ControlFlowGraph) -> None:
         ns=ns,
     )
     controller.build_editor(content)
-    app.tools.append(
-        Tool(
-            window=window,
-            status_tag=status_tag,
-            controller=controller,
-            grids=(),
-            tick=None,
-        )
-    )
+    app.register_tool(window, status_tag, controller)
