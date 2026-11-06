@@ -115,6 +115,7 @@ class EventKind(enum.Enum):
     FAILED = "failed"  # payload: str error message
     BINARY_PARSED = "binary_parsed"  # payload: BinaryInfo (may carry .error)
     DISASM_DONE = "disasm_done"  # payload: (seg, sect, instrs, graph | None)
+    STRINGS_DONE = "strings_done"  # payload: list[BinaryString]
 
 
 class UiEvent(NamedTuple):

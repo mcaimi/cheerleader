@@ -18,6 +18,8 @@ Flow (TUI parity):
 * a newer section pick cancels the in-flight worker; stale completions
   are dropped (``BusyTracker``);
 * ``Esc`` cancels a running disassembly;
+* ``c`` opens the call-flow tree and ``f`` the control-flow graph for the
+  cursor's function (:mod:`cheerleader.gui.callflow`, D4);
 
 The view is read-only (`dirty_edit_count() == 0`); the window holds its own
 ``BinaryInfo`` snapshot like every inspector view.
@@ -34,6 +36,7 @@ from cheerleader.gui.app import (
     _tool_window_closed,
     find_inspector_tool,
 )
+from cheerleader.gui.callflow import open_call_flow, open_cfg
 from cheerleader.gui.const import (
     DISASM_WIN_H,
     DISASM_WIN_W,
@@ -41,7 +44,12 @@ from cheerleader.gui.const import (
 )
 from cheerleader.gui.disasmgrid import DisasmGrid
 from cheerleader.gui.workers import BusyTracker, EventKind, WorkerHandle, start_worker
-from cheerleader.libs.cfg import CallGraph, build_call_graph
+from cheerleader.libs.cfg import (
+    CallGraph,
+    build_call_graph,
+    build_cfg,
+    slice_function_instrs,
+)
 from cheerleader.libs.disasm import disassemble_section
 from cheerleader.libs.types import BinaryInfo, DisasmInstruction
 
@@ -52,6 +60,11 @@ except ImportError:
 
 _ENGINE: str | None = None  # None = not picked yet; "" = no engine available
 
+# Menu-selected engine: "auto" keeps the cached auto-pick
+# below; an explicit "capstone"/"objdump" forces that engine — or fails
+# soft (None) when the forced engine is unavailable in this process.
+_OVERRIDE: str = "auto"
+
 COMBO_RESERVE = 32  # px reserved above the grid pane for the section combo row
 
 
@@ -60,14 +73,53 @@ def section_label(seg: str, sect: str) -> str:
     return f"{seg},{sect}"
 
 
-def pick_engine() -> str | None:
-    """Auto-pick the disassembly engine once per process (plan v3 §5).
+def engine_available(name: str) -> bool:
+    """Whether *name* (``capstone``/``objdump``) works in this process.
 
-    capstone (in-process, no subprocess) is preferred; objdump is the
-    fallback; ``None`` means neither is available and views fail soft into
-    their status strip.
+    Both probes are cheap and cached downstream: a capstone import (OS
+    module cache after the first) and objdump's PATH scan
+    (:func:`~cheerleader.libs.objdump._detect_objdump` memoizes).
+    """
+    if name == "capstone":
+        try:
+            import capstone  # noqa: F401
+
+            return True
+        except ImportError:
+            return False
+    if name == "objdump":
+        from cheerleader.libs.objdump import _detect_objdump
+
+        return _detect_objdump() is not None
+    return False
+
+
+def set_engine_override(name: str) -> None:
+    """Set the Disassembler ▸ Engine radio choice (``auto``/``capstone``/
+    ``objdump``). Affects *future* ``pick_engine`` calls — open views keep
+    their rendered snapshot (close + reopen to re-run)."""
+    global _OVERRIDE
+    if name not in ("auto", "capstone", "objdump"):
+        raise ValueError(f"unknown engine override: {name!r}")
+    _OVERRIDE = name
+
+
+def engine_override() -> str:
+    """The current radio choice (``"auto"`` until the menu changes it)."""
+    return _OVERRIDE
+
+
+def pick_engine() -> str | None:
+    """Pick the disassembly engine.
+
+    With the menu's **Auto** choice: capstone (in-process, no subprocess)
+    is preferred, objdump is the fallback, ``None`` means neither is
+    available and views fail soft into their status strip. An explicit
+    override forces that engine, or ``None`` when it is unavailable.
     """
     global _ENGINE
+    if _OVERRIDE != "auto":
+        return _OVERRIDE if engine_available(_OVERRIDE) else None
     if _ENGINE is None:
         try:
             import capstone  # noqa: F401
@@ -219,19 +271,77 @@ class DisasmController:
             return
         dpg.set_value(
             self.status_tag,
-            f"{seg},{sect}  {len(instrs):,} instructions",
+            f"{seg},{sect}  {len(instrs):,} instructions  c → call flow   f → cfg",
         )
 
-    # ── keys: Esc cancel ─────────────────────
+    # ── keys: Esc cancel, c call-flow, f CFG ──────────────────────────────
 
     def _install_keys(self) -> None:
         with dpg.handler_registry(tag=f"disasm-keys-{self.ns}"):
             dpg.add_key_press_handler(key=KEY_ESCAPE, callback=self._on_escape)
+            dpg.add_key_press_handler(key=dpg.mvKey_C, callback=self._open_call_flow)
+            dpg.add_key_press_handler(key=dpg.mvKey_F, callback=self._open_cfg)
 
     def _on_escape(self, *_args) -> None:
         if self.busy.worker is not None:
             self.busy.worker.cancel.cancel()
             dpg.set_value(self.status_tag, "Disassembly cancelled — pick a section")
+
+    # ── c / f: call-flow + CFG windows (TUI DisasmTab parity) ─────────────
+
+    def _cursor_addr(self) -> int | None:
+        """The cursor row's instruction address, or None with no rows."""
+        instrs = self.grid.instrs()
+        cursor = self.grid.cursor
+        if not instrs or cursor < 0 or cursor >= len(instrs):
+            return None
+        return instrs[cursor].addr
+
+    def _open_call_flow(self, *_args) -> None:
+        """``c``: open the call-flow tree for the cursor's function."""
+        graph = self.call_graph
+        if graph is None:
+            dpg.set_value(self.status_tag, "Disassemble a section first")
+            return
+        addr = self._cursor_addr()
+        if addr is None:
+            dpg.set_value(self.status_tag, "Select an instruction row")
+            return
+        result = graph.func_at(addr)
+        if result is None:
+            dpg.set_value(
+                self.status_tag,
+                f"No function symbol found at 0x{addr:x} — binary may be stripped",
+            )
+            return
+        func_name, _ = result
+        open_call_flow(self.app, self.path, graph, func_name)
+
+    def _open_cfg(self, *_args) -> None:
+        """``f``: slice the cursor's function and open its CFG window."""
+        graph = self.call_graph
+        if graph is None:
+            dpg.set_value(self.status_tag, "Disassemble a section first")
+            return
+        addr = self._cursor_addr()
+        if addr is None:
+            dpg.set_value(self.status_tag, "Select an instruction row")
+            return
+        result = graph.func_at(addr)
+        if result is None:
+            dpg.set_value(
+                self.status_tag,
+                f"No function symbol at 0x{addr:x} — binary may be stripped",
+            )
+            return
+        func_name, func_addr = result
+        _, next_addr = graph.func_range(func_addr)
+        func_instrs = slice_function_instrs(self.grid.instrs(), func_addr, next_addr)
+        if not func_instrs:
+            dpg.set_value(self.status_tag, "No instructions found for this function")
+            return
+        cfg = build_cfg(func_instrs, func_name, func_addr)
+        open_cfg(self.app, self.path, cfg)
 
     # ── the shell's Controller protocol ───────────────────────────────────
 
@@ -329,7 +439,7 @@ def open_disassembly(app: GuiApp, path: str) -> None:
 
 
 def register_opener() -> None:
-    """Publish the D3 opener into the shell's registry (idempotent)."""
+    """Publish the opener into the shell's registry (idempotent)."""
     from cheerleader.gui.app import _INSPECTOR_OPENERS
 
     _INSPECTOR_OPENERS.setdefault(

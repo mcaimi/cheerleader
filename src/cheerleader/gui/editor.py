@@ -57,11 +57,7 @@ try:
 except ImportError:
     dpg = None  # type: ignore[assignment]
 
-# dearpygui 2.3.1 defines no mvKey_Enter constant (mvKey_Space/Backspace are
-# missing too); Enter is ImGui named key 525, between Space (524) and the
-# confirmed Escape (526). A raw constant is future-proof: a later mvKey_Enter
-# would carry the same value.
-KEY_ENTER = 525
+from cheerleader.gui.const import KEY_ENTER
 
 # mvKey_0..9 (536..545) / mvKey_A..F (546..551) → nibble value. Populated
 # only for constants the installed wheel actually defines.

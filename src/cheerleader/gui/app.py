@@ -49,6 +49,8 @@ from cheerleader.gui.const import (
     DLG_OPEN,
     EDITOR_WIN_H,
     EDITOR_WIN_W,
+    ENGINE_ITEMS,
+    ENGINE_MENU,
     FONT_CANDIDATES,
     FONT_ENV_VAR,
     FONT_SIZE,
@@ -61,6 +63,7 @@ from cheerleader.gui.const import (
     MI_INFO,
     MI_SECTIONS,
     MI_SEGMENTS,
+    MI_STRINGS,
     MI_SYMBOLS,
     MIN_VIEWPORT_H,
     MIN_VIEWPORT_W,
@@ -546,14 +549,42 @@ def _inspector_menu_opener(app: GuiApp, kind: str):
             return
         # First use: register the D2+ view openers (lazy — views.py
         # imports this module at module level; registration is idempotent).
-        from cheerleader.gui import views
+        from cheerleader.gui import strings, views
 
         views.register_inspector_openers()
+        strings.register_opener()
         opener = _INSPECTOR_OPENERS.get(kind)
         if opener is not None:
             opener(app, app.current_file)
 
     return _open
+
+
+def _engine_menu_pick(value: str):
+    """Disassembler ▸ Engine submenu callback factory: set the radio
+    choice and refresh the "● " markers."""
+
+    def _pick(*_args) -> None:
+        from cheerleader.gui import disasm as disasm_mod
+
+        disasm_mod.set_engine_override(value)
+        _mark_engine_items()
+
+    return _pick
+
+
+def _mark_engine_items() -> None:
+    """Engine submenu radio state: "● " prefix on the active choice;
+    capstone/objdump items grayed while unavailable in this process."""
+    from cheerleader.gui import disasm as disasm_mod
+
+    active = disasm_mod.engine_override()
+    for label, value, tag in ENGINE_ITEMS:
+        dpg.configure_item(
+            tag,
+            label=f"● {label}" if value == active else label,
+            enabled=value == "auto" or disasm_mod.engine_available(value),
+        )
 
 
 def find_inspector_tool(app: GuiApp, kind: str, path: str) -> Tool | None:
@@ -596,8 +627,9 @@ def _compare_dialog_opener(app: GuiApp):
 
     return _open
 
+
 def _info_opener(app: GuiApp):
-    """ Show Info Dialog """
+    """Show Info Dialog"""
 
     def _open(*_args) -> None:
         InfoDialog(
@@ -605,6 +637,7 @@ def _info_opener(app: GuiApp):
         ).open()
 
     return _open
+
 
 def build_shell(app: GuiApp) -> int | str:
     """Create the persistent chrome: theme, font, shell window + menus.
@@ -619,7 +652,7 @@ def build_shell(app: GuiApp) -> int | str:
         with dpg.menu(label="File"):
             dpg.add_menu_item(label="Open File…", callback=_show_dialog(DLG_OPEN))
             dpg.add_menu_item(label="Quit", callback=app.request_quit)
-        
+
         with dpg.menu(label="Disassembler", tag=DISASM_MENU):
             for label, tag, kind in (
                 ("Disassembly…", MI_DISASM, "disasm"),
@@ -629,6 +662,7 @@ def build_shell(app: GuiApp) -> int | str:
                 ("Symbols…", MI_SYMBOLS, "symbols"),
                 ("Exports…", MI_EXPORTS, "exports"),
                 ("Fixups…", MI_FIXUPS, "fixups"),
+                ("Strings…", MI_STRINGS, "strings"),
             ):
                 dpg.add_menu_item(
                     label=label,
@@ -636,6 +670,18 @@ def build_shell(app: GuiApp) -> int | str:
                     enabled=False,
                     callback=_inspector_menu_opener(app, kind),
                 )
+
+            # Engine radio submenu (plan v3 §5, D5): process-global
+            # preference, applies to newly opened/re-run views — kept
+            # enabled even without a loaded binary.
+            with dpg.menu(label="Engine", tag=ENGINE_MENU):
+                for label, value, tag in ENGINE_ITEMS:
+                    dpg.add_menu_item(
+                        label=label,
+                        tag=tag,
+                        callback=_engine_menu_pick(value),
+                    )
+            _mark_engine_items()
 
         with dpg.menu(label="Tools"):
             dpg.add_menu_item(
@@ -647,13 +693,10 @@ def build_shell(app: GuiApp) -> int | str:
             dpg.add_menu_item(
                 label="Hex Compare…", callback=_compare_dialog_opener(app)
             )
-        
+
         with dpg.menu(label="About"):
             dpg.add_menu_item(
-                label="Info",
-                tag=MI_INFO,
-                enabled=True,
-                callback=_info_opener(app)
+                label="Info", tag=MI_INFO, enabled=True, callback=_info_opener(app)
             )
 
     # Bottom bar: hidden until a file is loaded via File → Open File…; the

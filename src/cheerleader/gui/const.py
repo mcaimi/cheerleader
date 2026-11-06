@@ -48,6 +48,7 @@ MI_IMPORTS = "gui-mi-imports"
 MI_SYMBOLS = "gui-mi-symbols"
 MI_EXPORTS = "gui-mi-exports"
 MI_FIXUPS = "gui-mi-fixups"
+MI_STRINGS = "gui-mi-strings"
 MI_INFO = "gui-mi-info"
 DISASM_ITEMS: tuple[str, ...] = (
     MI_DISASM,
@@ -57,6 +58,22 @@ DISASM_ITEMS: tuple[str, ...] = (
     MI_SYMBOLS,
     MI_EXPORTS,
     MI_FIXUPS,
+    MI_STRINGS,
+)
+
+# Disassembler ▸ Engine radio submenu (plan v3 §5, D5). The submenu itself
+# stays enabled with or without a loaded binary — engine choice is a
+# process-global preference affecting *future* views. Radio state renders
+# as a "● " label prefix (menu items have no check state).
+ENGINE_MENU = "gui-engine-menu"
+MI_ENGINE_AUTO = "gui-mi-engine-auto"
+MI_ENGINE_CAPSTONE = "gui-mi-engine-capstone"
+MI_ENGINE_OBJDUMP = "gui-mi-engine-objdump"
+ENGINE_ITEMS: tuple[tuple[str, str, str], ...] = (
+    # (label, override value, menu-item tag)
+    ("Auto", "auto", MI_ENGINE_AUTO),
+    ("Capstone", "capstone", MI_ENGINE_CAPSTONE),
+    ("objdump", "objdump", MI_ENGINE_OBJDUMP),
 )
 
 # Floating tool windows. Tags are namespaced per tool:
@@ -102,3 +119,8 @@ INIT_GRID_W, INIT_GRID_H = 920, 480  # first-frame sizes before relayout
 KEY_PAGE_UP = 517
 KEY_PAGE_DOWN = 518
 KEY_ESCAPE = 526  # ImGui named key (dearpygui 2.3.1 ships no mvKey_Escape)
+# dearpygui 2.3.1 defines no mvKey_Enter constant (mvKey_Space/Backspace are
+# missing too); Enter is ImGui named key 525, between Space (524) and the
+# confirmed Escape (526). A raw constant is future-proof: a later mvKey_Enter
+# would carry the same value.
+KEY_ENTER = 525

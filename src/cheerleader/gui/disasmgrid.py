@@ -1,5 +1,5 @@
 """
-Virtualized disassembly grid for the Dear PyGui front-end (plan v3, D3).
+Virtualized disassembly grid for the Dear PyGui front-end.
 
 One :class:`~cheerleader.libs.types.DisasmInstruction` per row — four fixed-
 width text cells (address, bytes, mnemonic, operands) in a horizontal group.

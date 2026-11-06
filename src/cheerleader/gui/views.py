@@ -1,5 +1,5 @@
 """
-Read-only data-table views for the Dear PyGui front-end (plan v3, D2).
+Read-only data-table views for the Dear PyGui front-end.
 
 The Disassembler menu's six table views — Segments / Sections / Imports /
 Symbols / Exports / Fixups — port the TUI tabs of the same names onto the
@@ -403,8 +403,7 @@ class TableController:
 def open_inspector(app: GuiApp, kind: str, path: str) -> None:
     """Open the *kind* view for *path* in a floating tool window.
 
-    Fails soft (silent return) when the kind is unknown (D3's "disasm"
-    lands later) or *path* is not the shell's currently parsed binary —
+    Fails soft (silent return) when the kind is unknown or *path* is not the shell's currently parsed binary —
     the menu gating makes both unreachable in practice. An already-open
     view of the same kind for the same file is focused, not duplicated.
     """
@@ -497,8 +496,7 @@ def register_inspector_openers() -> None:
 
     for kind in _SPECS:
         _INSPECTOR_OPENERS.setdefault(kind, _opener_for(kind))
-    # D3: the Disassembly window lives in its own module (it pulls in the
-    # grid + worker stack); registration is idempotent.
+    
     from cheerleader.gui import disasm as _disasm
 
     _disasm.register_opener()
