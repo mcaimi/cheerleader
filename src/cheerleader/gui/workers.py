@@ -1,29 +1,29 @@
 """
-    Main-thread / worker-thread bridge for the Dear PyGui hex UI.
+Main-thread / worker-thread bridge for the Dear PyGui hex UI.
 
-    Dear PyGui widgets are manipulated from the main (render) thread. Long-running
-    hex operations (search, diff, save) therefore run on plain ``threading.Thread``
-    workers and report their results as events on a :class:`UiBridge` queue; the
-    frame loop drains the queue once per frame and dispatches each event to the
-    active controller (see :mod:`cheerleader.gui.app`).
+Dear PyGui widgets are manipulated from the main (render) thread. Long-running
+hex operations (search, diff, save) therefore run on plain ``threading.Thread``
+workers and report their results as events on a :class:`UiBridge` queue; the
+frame loop drains the queue once per frame and dispatches each event to the
+active controller (see :mod:`cheerleader.gui.app`).
 
-    Concurrency contracts (ported from the Textual hex tabs):
+Concurrency contracts (ported from the Textual hex tabs):
 
-    * **FIFO** — events are observed in post order.
-    * **Generations** — every event carries the controller-state generation it
-    belongs to; controllers drop events whose generation no longer matches
-    (:class:`Generation`, the port of the TUI ``_gen`` counter). A bumped
-    generation also means "the worker of the old generation is obsolete"; its
-    I/O failures (document closed underneath it) are treated as cancellation,
-    not errors — the worker decides via its own ``cancelled`` check.
-    * **Exclusive operations** — an operation that must not run concurrently
-    (saving) is tracked with a :class:`BusyTracker` (the port of the TUI
-    ``_Busy`` pattern): completion events carry the :class:`WorkerHandle` that
-    produced them, and :meth:`BusyTracker.is_stale` drops completions from a
-    superseded or cancelled run.
-    * **Cancellation** — workers poll :attr:`WorkerHandle.cancel
-    <WorkerHandle>`; :class:`CancelFlag.cancelled` plugs directly into the
-    ``cancelled`` callable of ``HexDocument.find`` / ``rfind`` / ``iter_diff``.
+* **FIFO** — events are observed in post order.
+* **Generations** — every event carries the controller-state generation it
+belongs to; controllers drop events whose generation no longer matches
+(:class:`Generation`, the port of the TUI ``_gen`` counter). A bumped
+generation also means "the worker of the old generation is obsolete"; its
+I/O failures (document closed underneath it) are treated as cancellation,
+not errors — the worker decides via its own ``cancelled`` check.
+* **Exclusive operations** — an operation that must not run concurrently
+(saving) is tracked with a :class:`BusyTracker` (the port of the TUI
+``_Busy`` pattern): completion events carry the :class:`WorkerHandle` that
+produced them, and :meth:`BusyTracker.is_stale` drops completions from a
+superseded or cancelled run.
+* **Cancellation** — workers poll :attr:`WorkerHandle.cancel
+<WorkerHandle>`; :class:`CancelFlag.cancelled` plugs directly into the
+``cancelled`` callable of ``HexDocument.find`` / ``rfind`` / ``iter_diff``.
 """
 
 import enum
@@ -56,11 +56,11 @@ class CancelFlag:
 
 class WorkerHandle:
     """
-        Identity + cancellation flag for one background operation run.
+    Identity + cancellation flag for one background operation run.
 
-        Completion events carry the handle so the receiving controller can
-        recognize stale completions of superseded runs (see :class:`BusyTracker`).
-        ``thread`` is set by :func:`start_worker` and may be joined on shutdown.
+    Completion events carry the handle so the receiving controller can
+    recognize stale completions of superseded runs (see :class:`BusyTracker`).
+    ``thread`` is set by :func:`start_worker` and may be joined on shutdown.
     """
 
     def __init__(self) -> None:
@@ -74,14 +74,14 @@ def start_worker(
     name: str = "gui-worker",
 ) -> WorkerHandle:
     """
-        Run ``target(handle)`` on a daemon thread; return the handle immediately.
+    Run ``target(handle)`` on a daemon thread; return the handle immediately.
 
-        The worker must poll ``handle.cancel`` between chunks. Errors are reported
-        to the UI by the worker itself (post a FAILED event); an exception escaping
-        *target* is printed to stderr instead of vanishing silently inside the
-        thread. Daemon threads die with the process, so a shutdown may interrupt a
-        run mid-chunk — safe by design: documents are read via ``os.pread`` and
-        saves go through temp-file + atomic rename.
+    The worker must poll ``handle.cancel`` between chunks. Errors are reported
+    to the UI by the worker itself (post a FAILED event); an exception escaping
+    *target* is printed to stderr instead of vanishing silently inside the
+    thread. Daemon threads die with the process, so a shutdown may interrupt a
+    run mid-chunk — safe by design: documents are read via ``os.pread`` and
+    saves go through temp-file + atomic rename.
     """
     handle = WorkerHandle()
 
@@ -100,10 +100,10 @@ def start_worker(
 
 class EventKind(enum.Enum):
     """
-        Kinds of events a worker posts to the UI thread.
+    Kinds of events a worker posts to the UI thread.
 
-        Payloads are controller-specific; the kinds below cover the hex editor
-        and hex-compare flows.
+    Payloads are controller-specific; the kinds below cover the hex editor
+    and hex-compare flows.
     """
 
     OPEN_FAILED = "open_failed"  # payload: str error message
@@ -113,15 +113,17 @@ class EventKind(enum.Enum):
     FOUND = "found"  # payload: (hit | None, pattern_len, wrapped)
     SAVE_DONE = "save_done"  # payload: str path written
     FAILED = "failed"  # payload: str error message
+    BINARY_PARSED = "binary_parsed"  # payload: BinaryInfo (may carry .error)
+    DISASM_DONE = "disasm_done"  # payload: (seg, sect, instrs, graph | None)
 
 
 class UiEvent(NamedTuple):
     """
-        One worker→UI message.
+    One worker→UI message.
 
-        *generation* is the controller-state generation the event belongs to;
-        *worker* identifies the producing run for stale-drop (may be ``None``
-        for events posted synchronously by the controller itself).
+    *generation* is the controller-state generation the event belongs to;
+    *worker* identifies the producing run for stale-drop (may be ``None``
+    for events posted synchronously by the controller itself).
     """
 
     generation: int
@@ -158,10 +160,10 @@ class UiBridge:
 
 class Generation:
     """
-        Monotonic generation counter for stale-callback dropping.
+    Monotonic generation counter for stale-callback dropping.
 
-        The port of the Textual ``_gen`` pattern: bump on every (re)load; events
-        from an older generation are dropped by the controller.
+    The port of the Textual ``_gen`` pattern: bump on every (re)load; events
+    from an older generation are dropped by the controller.
     """
 
     def __init__(self) -> None:
@@ -182,13 +184,13 @@ class Generation:
 
 class BusyTracker:
     """
-        Exclusive-operation marker (the port of the TUI ``_Busy`` pattern).
+    Exclusive-operation marker (the port of the TUI ``_Busy`` pattern).
 
-        A controller keeps one tracker. *op* names the in-flight operation
-        (``"saving"``, ``"searching"``); completion events carry the
-        :class:`WorkerHandle` that produced them, and :meth:`is_stale` drops
-        completions from a superseded run — e.g. a search cancelled and
-        restarted while an old completion message was still in flight.
+    A controller keeps one tracker. *op* names the in-flight operation
+    (``"saving"``, ``"searching"``); completion events carry the
+    :class:`WorkerHandle` that produced them, and :meth:`is_stale` drops
+    completions from a superseded run — e.g. a search cancelled and
+    restarted while an old completion message was still in flight.
     """
 
     def __init__(self) -> None:

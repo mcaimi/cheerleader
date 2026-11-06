@@ -2,11 +2,14 @@
 Dear PyGui application shell for the cheerleader hex UI.
 
 ``cheerleader-gui`` takes no CLI switches: launching shows an empty shell
-window with a **File** / **Tools** menu bar. ``File → Open File…`` (Ctrl+O)
-loads a file; ``Tools → Hex Editor…`` — grayed out until a file is loaded —
-displays it in a floating editor window, and ``Tools → Hex Compare…`` opens
-a two-file picker (Source/Target). Tools show in **floating windows** —
-several may be open at once, each with its own status strip.
+window with a **File** / **Tools** / **Disassembler** menu bar.
+``File → Open File…`` (Ctrl+O) loads a file (parsed in the background);
+``Tools → Hex Editor…`` — grayed out until a file is loaded — displays it
+in a floating editor window, ``Tools → Hex Compare…`` opens a two-file
+picker (Source/Target), and the **Disassembler** menu — grayed until a
+*supported binary* (Mach-O/ELF) is loaded — opens binary-inspection views
+(plan v3). Tools show in **floating windows** — several may be open at
+once, each with its own status strip.
 
 Frame loop::
 
@@ -35,9 +38,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
+from cheerleader.formats import parse as parse_binary
 from cheerleader.gui.const import (
     COMPARE_WIN_H,
     COMPARE_WIN_W,
+    DISASM_ITEMS,
+    DISASM_MENU,
     DLG_OPEN,
     EDITOR_WIN_H,
     EDITOR_WIN_W,
@@ -45,7 +51,15 @@ from cheerleader.gui.const import (
     FONT_ENV_VAR,
     FONT_SIZE,
     MENU_TAG,
+    MI_DISASM,
     MI_EDITOR,
+    MI_EXPORTS,
+    MI_FIXUPS,
+    MI_IMPORTS,
+    MI_SECTIONS,
+    MI_SEGMENTS,
+    MI_SYMBOLS,
+    MI_INFO,
     MIN_VIEWPORT_H,
     MIN_VIEWPORT_W,
     SHELL_FILL,
@@ -59,17 +73,28 @@ from cheerleader.gui.const import (
     VIEWPORT_TITLE,
     VIEWPORT_W,
     WIN_TAG,
+    APP_TITLE,
+    APP_VERSION,
+    SRC_URL
 )
 from cheerleader.gui.dialogs import (
     CompareOpenDialog,
     ConfirmDialog,
+    InfoDialog,
     ErrorPopup,
     add_all_files_filter,
     picked_path,
 )
 from cheerleader.gui.hexgrid import HexGrid
-from cheerleader.gui.workers import UiBridge, UiEvent
+from cheerleader.gui.workers import (
+    EventKind,
+    UiBridge,
+    UiEvent,
+    WorkerHandle,
+    start_worker,
+)
 from cheerleader.libs.hexdoc import HexDocument
+from cheerleader.libs.types import BinaryInfo
 
 try:
     import dearpygui.dearpygui as dpg
@@ -129,6 +154,11 @@ class GuiApp:
         # None until the first successful open. Closing an editor window
         # does not unload it.
         self.current_file: str | None = None
+        # Parsed model of current_file (plan v3): set by the background
+        # parse worker; gates the Disassembler menu. None for files that
+        # are not supported executables (hex tools still work).
+        self.current_info: BinaryInfo | None = None
+        self._parse_worker: WorkerHandle | None = None
 
     def next_ns(self) -> str:
         """Unique per-app namespace for a new tool's tags/registries."""
@@ -139,8 +169,12 @@ class GuiApp:
 
         Strict worker identity: with several tools alive, broadcasting would
         leak one tool's generations into another's; events of tools closed
-        mid-flight (and handle-less events) are dropped.
+        mid-flight (and handle-less events) are dropped. Shell-level events
+        (the Open File… parse worker) are handled first, by the shell.
         """
+        if self._parse_worker is not None and event.worker is self._parse_worker:
+            self._on_binary_parsed(event)
+            return
         for tool in self.tools:
             busy = getattr(tool.controller, "busy", None)
             if (
@@ -156,6 +190,52 @@ class GuiApp:
         for tool in self.tools:
             if tool.tick is not None:
                 tool.tick()
+
+    def _start_parse(self, path: str) -> None:
+        """Parse *path* on a worker thread (plan v3, D1).
+
+        `formats.parse` reads the whole file, so — like the TUI's load — it
+        runs off the render thread. The completion event is owned by this
+        shell (dispatch routes it by worker identity); a newer parse
+        supersedes an in-flight one purely by handle identity.
+        """
+
+        def _job(_handle: WorkerHandle) -> None:
+            try:
+                info = parse_binary(path)
+            except Exception as e:  # noqa: BLE001 - defensive: parsers are
+                # non-fatal by design (they return .error); never crash the
+                # shell on a malformed file.
+                info = BinaryInfo(path=path, error=str(e))
+            # Posted with *this* run's handle; a superseded parse is dropped
+            # by dispatch's identity check.
+            self.bridge.post(0, EventKind.BINARY_PARSED, info, _handle)
+
+        self._parse_worker = start_worker(_job, name="gui-parse")
+
+    def _on_binary_parsed(self, event: UiEvent) -> None:
+        """Shell handler for the Open File… parse worker's completion."""
+        self._parse_worker = None
+        info = event.payload
+        if info is None:  # pragma: no cover - job always posts an info
+            return
+        if info.error is not None:
+            # Not a supported executable (or unparseable): the hex flow is
+            # already live for this file; the Disassembler menu stays grayed.
+            self.current_info = None
+            _set_disasm_enabled(False)
+            ErrorPopup(f"Cannot disassemble {self.current_file}:\n{info.error}")
+            return
+        self.current_info = info
+        _set_disasm_enabled(True)
+        # Plan v3 decision 4: a successful open shows the Disassembly view
+        # in a new window (focus guard dedupes same-file re-opens).
+        from cheerleader.gui import views
+
+        views.register_inspector_openers()
+        opener = _INSPECTOR_OPENERS.get("disasm")
+        if opener is not None and self.current_file is not None:
+            opener(self, self.current_file)
 
     def request_quit(self) -> None:
         """
@@ -444,6 +524,53 @@ def _file_picked(app: GuiApp, app_data) -> None:
     dpg.configure_item(MI_EDITOR, enabled=True)
     dpg.configure_item(SHELL_STATUS_BAR, show=True)
     dpg.set_value(SHELL_STATUS, path)
+    app._start_parse(path)
+
+
+def _set_disasm_enabled(enabled: bool) -> None:
+    """Gray in/out every Disassembler menu item (binary loaded or not)."""
+    for tag in DISASM_ITEMS:
+        dpg.configure_item(tag, enabled=enabled)
+
+
+# View openers by kind ("segments", "sections", …), registered by D2/D3;
+# an unregistered kind makes its menu item a silent no-op.
+_INSPECTOR_OPENERS: dict[str, Callable[[GuiApp, str], None]] = {}
+
+
+def _inspector_menu_opener(app: GuiApp, kind: str):
+    """Disassembler menu-item callback factory"""
+
+    def _open(*_args) -> None:
+        if app.current_file is None:
+            return
+        # First use: register the D2+ view openers (lazy — views.py
+        # imports this module at module level; registration is idempotent).
+        from cheerleader.gui import views
+
+        views.register_inspector_openers()
+        opener = _INSPECTOR_OPENERS.get(kind)
+        if opener is not None:
+            opener(app, app.current_file)
+
+    return _open
+
+
+def find_inspector_tool(app: GuiApp, kind: str, path: str) -> Tool | None:
+    """The open view of *kind* for *path*, if any (focus-guard helper).
+
+    Inspector controllers expose ``view_kind`` and ``path``; used to focus
+    an existing window instead of opening a duplicate (the ``open_editor``
+    duplicate-open guard, generalized to (kind, path)).
+    """
+    for tool in app.tools:
+        ctl = tool.controller
+        if (
+            getattr(ctl, "view_kind", None) == kind
+            and getattr(ctl, "path", None) == path
+        ):
+            return tool
+    return None
 
 
 def _editor_menu_opener(app: GuiApp):
@@ -469,13 +596,22 @@ def _compare_dialog_opener(app: GuiApp):
 
     return _open
 
+def _info_opener(app: GuiApp):
+    """ Show Info Dialog """
+
+    def _open(*_args) -> None:
+        InfoDialog(
+            message=f"{APP_TITLE} - {APP_VERSION}\nSource here: {SRC_URL}"
+        ).open()
+
+    return _open
 
 def build_shell(app: GuiApp) -> int | str:
-    """Create the persistent chrome: theme, font, shell window + Tools menu.
+    """Create the persistent chrome: theme, font, shell window + menus.
 
-    The shell itself is empty (menu bar only); tools open in floating
-    windows. The open-file dialogs are pre-built top-level items, shown by
-    the menu entries.
+    The shell itself is empty (menu bar + bottom bar); tools open in
+    floating windows. The open-file dialog is a pre-built top-level item,
+    shown by the File menu entry.
     """
     _build_theme()
     _build_font()
@@ -483,6 +619,24 @@ def build_shell(app: GuiApp) -> int | str:
         with dpg.menu(label="File"):
             dpg.add_menu_item(label="Open File…", callback=_show_dialog(DLG_OPEN))
             dpg.add_menu_item(label="Quit", callback=app.request_quit)
+        
+        with dpg.menu(label="Disassembler", tag=DISASM_MENU):
+            for label, tag, kind in (
+                ("Disassembly…", MI_DISASM, "disasm"),
+                ("Segments…", MI_SEGMENTS, "segments"),
+                ("Sections…", MI_SECTIONS, "sections"),
+                ("Imports…", MI_IMPORTS, "imports"),
+                ("Symbols…", MI_SYMBOLS, "symbols"),
+                ("Exports…", MI_EXPORTS, "exports"),
+                ("Fixups…", MI_FIXUPS, "fixups"),
+            ):
+                dpg.add_menu_item(
+                    label=label,
+                    tag=tag,
+                    enabled=False,
+                    callback=_inspector_menu_opener(app, kind),
+                )
+
         with dpg.menu(label="Tools"):
             dpg.add_menu_item(
                 label="Hex Editor…",
@@ -492,6 +646,14 @@ def build_shell(app: GuiApp) -> int | str:
             )
             dpg.add_menu_item(
                 label="Hex Compare…", callback=_compare_dialog_opener(app)
+            )
+        
+        with dpg.menu(label="About"):
+            dpg.add_menu_item(
+                label="Info",
+                tag=MI_INFO,
+                enabled=True,
+                callback=_info_opener(app)
             )
 
     # Bottom bar: hidden until a file is loaded via File → Open File…; the

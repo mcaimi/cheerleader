@@ -215,6 +215,35 @@ class SearchDialog:
         dpg.set_value(self._error_tag, "")
         self._on_accept(result)
 
+class InfoDialog:
+    """Simple Info Dialog."""
+
+    TAG = "gui-dlg-info"
+
+    def __init__(
+        self,
+        *,
+        message: str,
+        tag: str | None = None,
+    ) -> None:
+        self.TAG = tag or type(self).TAG
+        self.message = message
+        dpg.add_window(
+            tag=self.TAG,
+            label="Info",
+            modal=True,
+            no_open_over_existing_popup=True,
+            no_collapse=True,
+            no_resize=True,
+            show=False,
+        )
+        dpg.add_text(message, parent=self.TAG)
+
+    def open(self) -> None:
+        dpg.configure_item(self.TAG, show=True)
+
+    def close(self) -> None:
+        dpg.delete_item(self.TAG)
 
 class ConfirmDialog:
     """Yes/No confirmation (overwrite / discard / quit-without-saving)."""

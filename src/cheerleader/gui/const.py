@@ -4,7 +4,7 @@ Dear PyGui application shell for the cheerleader hex UI.
 Constants
 """
 
-VIEWPORT_TITLE = "cheerleader — hex"
+VIEWPORT_TITLE = "Cheerleader: Your Friendly Binary Inspector"
 VIEWPORT_W, VIEWPORT_H = 1280, 800
 MIN_VIEWPORT_W, MIN_VIEWPORT_H = 640, 420
 
@@ -13,7 +13,9 @@ INPUT_W = 300
 
 FONT_ENV_VAR = "CHEERLEADER_GUI_FONT"
 FONT_SIZE = 15
-APP_TITLE = "CHEERLEADER - GUI"
+APP_TITLE = "CHEERLEADER"
+APP_VERSION = "0.3.0"
+SRC_URL = "https://github.com/mcaimi/cheerleader"
 
 # Reserve below the content child window for separator + status strip.
 STATUS_RESERVE = 36
@@ -35,10 +37,35 @@ DLG_OPEN = "gui-dlg-open-file"
 # Tools menu items that change enabled-state at runtime.
 MI_EDITOR = "gui-mi-hex-editor"
 
+# Disassembler menu (plan v3, docs/gui-disasm-plan.md). Every item is grayed
+# until a *supported binary* (Mach-O / ELF, parseable without error) is
+# loaded via File → Open File…; see GuiApp.current_info.
+DISASM_MENU = "gui-disasm-menu"
+MI_DISASM = "gui-mi-disasm"
+MI_SEGMENTS = "gui-mi-segments"
+MI_SECTIONS = "gui-mi-sections"
+MI_IMPORTS = "gui-mi-imports"
+MI_SYMBOLS = "gui-mi-symbols"
+MI_EXPORTS = "gui-mi-exports"
+MI_FIXUPS = "gui-mi-fixups"
+MI_INFO = "gui-mi-info"
+DISASM_ITEMS: tuple[str, ...] = (
+    MI_DISASM,
+    MI_SEGMENTS,
+    MI_SECTIONS,
+    MI_IMPORTS,
+    MI_SYMBOLS,
+    MI_EXPORTS,
+    MI_FIXUPS,
+)
+
 # Floating tool windows. Tags are namespaced per tool:
 # gui-tool-{ns} / gui-tool-{ns}-content / gui-tool-{ns}-status.
 EDITOR_WIN_W, EDITOR_WIN_H = 960, 620
 COMPARE_WIN_W, COMPARE_WIN_H = 1180, 620
+TABLE_WIN_W, TABLE_WIN_H = 900, 520  # D2 data-table views (segments, …)
+DISASM_WIN_W, DISASM_WIN_H = 1180, 620  # D3 Disassembly window
+DISASM_LIST_W = 230  # left executable-section list width (px)
 TOOL_MIN_W, TOOL_MIN_H = 560, 320
 
 # Monospace candidates, first existing wins (env override → linux → macos →
@@ -68,9 +95,11 @@ MAX_POOL_ROWS = 400  # hard cap: a degenerate measurement must not explode
 FALLBACK_CHAR_W = 9.0  # px, when font metrics are unavailable
 FALLBACK_CHAR_H = 16.0
 INIT_GRID_W, INIT_GRID_H = 920, 480  # first-frame sizes before relayout
+
 # dearpygui 2.3.1 ships mvKey_Prior/mvKey_Next with stale GLFW codes (266/267)
 # that never match its internal ImGui key enum (upstream issue #2658); the
 # real PageUp/PageDown codes continue the enum between Down (516) and Home
 # (519). Both spellings are registered — the wrong one is inert.
 KEY_PAGE_UP = 517
 KEY_PAGE_DOWN = 518
+KEY_ESCAPE = 526  # ImGui named key (dearpygui 2.3.1 ships no mvKey_Escape)
