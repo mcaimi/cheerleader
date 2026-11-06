@@ -1,46 +1,46 @@
 """
-    Virtualized hex + ASCII grid widget for the Dear PyGui front-end.
+Virtualized hex + ASCII grid widget for the Dear PyGui front-end.
 
-    Renders a :class:`~cheerleader.libs.hexdoc.HexDocument` in the classic hex row
-    layout shared with the terminal UI (``tui.hexrender``)::
+Renders a :class:`~cheerleader.libs.hexdoc.HexDocument` in the classic hex row
+layout shared with the terminal UI (``tui.hexrender``)::
 
-        offset(8) + 2 + hex bytes in 3-char slots (one extra gap column before
-        each subsequent 8-byte group) + "  |" + ascii(1 char per byte) + "|"
+    offset(8) + 2 + hex bytes in 3-char slots (one extra gap column before
+    each subsequent 8-byte group) + "  |" + ascii(1 char per byte) + "|"
 
-    Rendering is *virtualized*: a fixed pool of Dear PyGui text items covers only
-    the visible window (one offset + bpl hex cells + bpl ASCII cells per row).
-    The pool is re-painted only when the visible state changes (scroll, cursor,
-    matches, edits) — never per frame — so a multi-GB file costs the same as a
-    4 KiB one.
+Rendering is *virtualized*: a fixed pool of Dear PyGui text items covers only
+the visible window (one offset + bpl hex cells + bpl ASCII cells per row).
+The pool is re-painted only when the visible state changes (scroll, cursor,
+matches, edits) — never per frame — so a multi-GB file costs the same as a
+4 KiB one.
 
-    Design notes:
+Design notes:
 
-    * **Pure geometry** — the row layout math and pixel hit-testing live in
-    module-level pure functions (:func:`hit_test`, :func:`hex_col_x`, ...),
-    unit-tested without a display. Parity with the terminal renderer is
-    enforced by a test composing the cell texts against
-    ``tui.hexrender.hex_line``.
-    * **Measured hit-testing** — clicks resolve against cell positions
-    *measured from the live widgets* (:class:`GridGeometry`), so hit-testing
-    stays correct even when font metrics or spacing differ from the ideal
-    character grid. ``get_item_rect_min`` and ``get_mouse_pos(local=False)``
-    are assumed to share one coordinate frame (DPG "screen" space); if that
-    ever proves wrong on-screen, only :meth:`HexGrid._measure_geometry` and
-    :meth:`HexGrid._on_click` need adjusting.
-    * **Threading** — key/mouse/slider callbacks may run on Dear PyGui's
-    callback thread; they only mutate plain Python state and mark pool slots
-    dirty. *All* Dear PyGui item mutations happen in :meth:`HexGrid.tick`,
-    which the app shell calls once per frame on the main thread.
-    * **Colors** — Dear PyGui text items carry no background, so the TUI's
-    white-on-blue cursor and black-on-magenta match map to bright foreground
-    colors for now; a drawlist background underlay is deferred until
-    its z-order can be verified on screen.
-    * **Scrollbar mapping** — DPG's vertical slider puts min at the bottom, so
-    the scrollbar stores ``max_top - _top`` (thumb at the widget top ≙ top of
-    the file) and its value text is hidden (``format=" "``). PageUp/PageDown
-    handlers are registered under both the correct ImGui codes (517/518) and
-    the stale ``mvKey_Prior``/``mvKey_Next`` constants (266/267 — dearpygui
-    2.3.1 bug, upstream issue #2658); the wrong spelling is inert.
+* **Pure geometry** — the row layout math and pixel hit-testing live in
+module-level pure functions (:func:`hit_test`, :func:`hex_col_x`, ...),
+unit-tested without a display. Parity with the terminal renderer is
+enforced by a test composing the cell texts against
+``tui.hexrender.hex_line``.
+* **Measured hit-testing** — clicks resolve against cell positions
+*measured from the live widgets* (:class:`GridGeometry`), so hit-testing
+stays correct even when font metrics or spacing differ from the ideal
+character grid. ``get_item_rect_min`` and ``get_mouse_pos(local=False)``
+are assumed to share one coordinate frame (DPG "screen" space); if that
+ever proves wrong on-screen, only :meth:`HexGrid._measure_geometry` and
+:meth:`HexGrid._on_click` need adjusting.
+* **Threading** — key/mouse/slider callbacks may run on Dear PyGui's
+callback thread; they only mutate plain Python state and mark pool slots
+dirty. *All* Dear PyGui item mutations happen in :meth:`HexGrid.tick`,
+which the app shell calls once per frame on the main thread.
+* **Colors** — Dear PyGui text items carry no background, so the TUI's
+white-on-blue cursor and black-on-magenta match map to bright foreground
+colors for now; a drawlist background underlay is deferred until
+its z-order can be verified on screen.
+* **Scrollbar mapping** — DPG's vertical slider puts min at the bottom, so
+the scrollbar stores ``max_top - _top`` (thumb at the widget top ≙ top of
+the file) and its value text is hidden (``format=" "``). PageUp/PageDown
+handlers are registered under both the correct ImGui codes (517/518) and
+the stale ``mvKey_Prior``/``mvKey_Next`` constants (266/267 — dearpygui
+2.3.1 bug, upstream issue #2658); the wrong spelling is inert.
 """
 
 import bisect
@@ -55,10 +55,20 @@ except ImportError:
     dpg = None  # type: ignore[assignment]
 
 from cheerleader.gui.const import (
-    BPL, OFFSET_W, WHEEL_ROWS, SLIDER_RESERVE, DEFAULT_VISIBLE_ROWS, MAX_POOL_ROWS,
-    FALLBACK_CHAR_H, FALLBACK_CHAR_W, INIT_GRID_H, INIT_GRID_W, KEY_PAGE_DOWN,
-    KEY_PAGE_UP
+    BPL,
+    DEFAULT_VISIBLE_ROWS,
+    FALLBACK_CHAR_H,
+    FALLBACK_CHAR_W,
+    INIT_GRID_H,
+    INIT_GRID_W,
+    KEY_PAGE_DOWN,
+    KEY_PAGE_UP,
+    MAX_POOL_ROWS,
+    OFFSET_W,
+    SLIDER_RESERVE,
+    WHEEL_ROWS,
 )
+
 
 def hex_col_x(bpl: int, i: int) -> int:
     """Char column of the first hex digit of byte *i* (mirrors tui.hexrender)."""
@@ -239,6 +249,11 @@ class HexGrid:
         # While a modal dialog is open the editor controller turns the grid's
         # key/click/wheel handlers off so popup typing never leaks through.
         self.input_enabled = True
+        # Compare mode: per-byte color override, shared scroll
+        # range and row-scrolling keys. All default to the editor behavior.
+        self.color_for: Callable[[int], tuple[int, int, int, int]] | None = None
+        self.max_top_rows: Callable[[], int] | None = None
+        self.scroll_mode = False
         self._pool: list[_PoolRow] = []
         self._dirty_all = True
         self._dirty: set[int] = set()
@@ -353,37 +368,55 @@ class HexGrid:
             dpg.add_key_press_handler(key=dpg.mvKey_Home, callback=self._key_home)
             dpg.add_key_press_handler(key=dpg.mvKey_End, callback=self._key_end)
 
-    # ── keyboard (parity: HexEditorView bindings) ──────────────────────────
+    # ── keyboard (parity: HexEditorView bindings; scroll_mode = compare) ───
 
     def _key_left(self, *_args) -> None:
         if not self.input_enabled:
             return
-        self.move_to(self._cursor - 1)
+        if self.scroll_mode:
+            self.scroll_by(0)  # left/right have no row meaning in compare
+        else:
+            self.move_to(self._cursor - 1)
 
     def _key_right(self, *_args) -> None:
         if not self.input_enabled:
             return
-        self.move_to(self._cursor + 1)
+        if self.scroll_mode:
+            self.scroll_by(0)
+        else:
+            self.move_to(self._cursor + 1)
 
     def _key_up(self, *_args) -> None:
         if not self.input_enabled:
             return
-        self.move_to(self._cursor - self._bpl)
+        if self.scroll_mode:
+            self.scroll_by(-1)
+        else:
+            self.move_to(self._cursor - self._bpl)
 
     def _key_down(self, *_args) -> None:
         if not self.input_enabled:
             return
-        self.move_to(self._cursor + self._bpl)
+        if self.scroll_mode:
+            self.scroll_by(1)
+        else:
+            self.move_to(self._cursor + self._bpl)
 
     def _key_page_up(self, *_args) -> None:
         if not self.input_enabled:
             return
-        self.move_to(self._cursor - self._vis * self._bpl)
+        if self.scroll_mode:
+            self.scroll_by(-self._vis)
+        else:
+            self.move_to(self._cursor - self._vis * self._bpl)
 
     def _key_page_down(self, *_args) -> None:
         if not self.input_enabled:
             return
-        self.move_to(self._cursor + self._vis * self._bpl)
+        if self.scroll_mode:
+            self.scroll_by(self._vis)
+        else:
+            self.move_to(self._cursor + self._vis * self._bpl)
 
     def _ctrl_down(self) -> bool:
         return dpg.is_key_down(dpg.mvKey_LControl) or dpg.is_key_down(
@@ -393,15 +426,17 @@ class HexGrid:
     def _key_home(self, *_args) -> None:
         if not self.input_enabled:
             return
-        if self._ctrl_down():
-            self.move_to(0)
+        if self.scroll_mode or self._ctrl_down():
+            self.set_top(0)
         else:
             self.move_to(self._cursor - self._cursor % self._bpl)
 
     def _key_end(self, *_args) -> None:
         if not self.input_enabled:
             return
-        if self._ctrl_down():
+        if self.scroll_mode or self._ctrl_down():
+            self.set_top(self._max_top())  # bottom of the (shared) range
+        elif self._ctrl_down():
             self.move_to(max(self._doc.size - 1, 0))
         else:
             self.move_to(self._cursor - self._cursor % self._bpl + self._bpl - 1)
@@ -493,7 +528,19 @@ class HexGrid:
         return (self._doc.size + self._bpl - 1) // self._bpl
 
     def _max_top(self) -> int:
+        if self.max_top_rows is not None:
+            # Compare mode: both panes share the longest document's range
+            # (the shorter pane renders blank tail rows).
+            return max(0, self.max_top_rows() - self._vis)
         return max(0, self._total_rows() - self._vis)
+
+    def set_top(self, row: int) -> None:
+        """Scroll so *row* is the top visible row (clamped, no cursor move)."""
+        new = max(0, min(int(row), self._max_top()))
+        if new != self._top:
+            self._top = new
+            self._dirty_all = True
+            self._push_slider()
 
     def move_to(self, offset: int, *, top: bool = False) -> None:
         """Move the cursor, scrolling only as needed (or placing its row on top)."""
@@ -546,6 +593,20 @@ class HexGrid:
             self._top = new
             self._dirty_all = True
             self._push_slider()
+
+    def set_scrollbar_visible(self, visible: bool) -> None:
+        """Show/hide the vertical scrollbar (compare hides the right pane's)."""
+        dpg.configure_item(self._scroll_tag, show=visible)
+
+    def shutdown(self) -> None:
+        """Delete the grid's global input handler registry.
+
+        The registry is *not* a child of the grid's widgets, so removing the
+        grid's container (e.g. closing a tool window) leaves it behind —
+        explicit teardown is required.
+        """
+        if dpg.does_item_exist(self._input_tag):
+            dpg.delete_item(self._input_tag)
 
     def refresh(self) -> None:
         """Force a full repaint on the next :meth:`tick`."""
@@ -678,6 +739,10 @@ class HexGrid:
         self._cache[tag] = (text, color)
 
     def _byte_color(self, offset: int) -> tuple[int, int, int, int]:
+        if self.color_for is not None:
+            # Compare mode: the controller decides per byte (live same/diff
+            # comparison of both documents).
+            return self.color_for(offset)
         if offset == self._cursor:
             return COL_CURSOR
         m = self._match

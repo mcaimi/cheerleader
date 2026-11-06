@@ -1,44 +1,76 @@
 """
-    Dear PyGui application shell for the cheerleader hex UI.
+Dear PyGui application shell for the cheerleader hex UI.
 
-    Owns the DPG context, viewport, theme, monospace font, and the frame
-    loop::
+``cheerleader-gui`` takes no CLI switches: launching shows an empty shell
+window with a **Tools** menu bar; ``Tools → Hex Editor…`` opens a file
+dialog and ``Tools → Hex Compare…`` a two-file picker (Source/Target);
+tools show in **floating windows** — several may be open at once, each
+with its own status strip.
 
-        while running:
-            for event in bridge.drain():      # worker results → controller
-                dispatch(event)
-            app.tick()                        # per-frame widget maintenance
-            dpg.render_dearpygui_frame()
+Frame loop::
 
-    Threading model: controller state is owned by the main frame loop. DPG
-    widget callbacks run inside ``render_dearpygui_frame()`` on the main thread,
-    so callbacks may mutate plain controller state directly; worker threads only touch 
-    :class:`~cheerleader.gui.workers.UiBridge`.
+    while running:
+        for event in bridge.drain():      # worker results → owning tool
+            dispatch(event)               # routed by worker identity
+        app.tick()                        # every tool's per-frame maintenance
+        dpg.render_dearpygui_frame()
 
-    The viewport is created with ``disable_close=True``: DPG offers no way to veto
-    the native close button, so it is removed and *every* quit path goes through
-    :meth:`GuiApp.request_quit` (Ctrl+Q); with unsaved edits the editor
-    controller shows a confirmation modal first.
+Threading model: tool/controller state is owned by the main frame loop. DPG
+widget callbacks run inside ``render_dearpygui_frame()`` on the main thread;
+worker threads only touch :class:`~cheerleader.gui.workers.UiBridge`.
+
+Quit paths: the viewport is created with ``disable_close=True`` (no close
+veto exists) and tool windows route their X through
+``Controller.window_close_requested`` (confirm + reshow-veto when dirty);
+Ctrl+Q funnels through :meth:`GuiApp.request_quit` — one aggregate confirm
+when any tool has unsaved edits.
 """
 
+from __future__ import annotations
+
+import itertools
 import os
 from collections.abc import Callable
-from typing import TYPE_CHECKING, NamedTuple, Protocol
+from dataclasses import dataclass
+from typing import Protocol
 
+from cheerleader.gui.const import (
+    COMPARE_WIN_H,
+    COMPARE_WIN_W,
+    DLG_EDITOR,
+    EDITOR_WIN_H,
+    EDITOR_WIN_W,
+    FONT_CANDIDATES,
+    FONT_ENV_VAR,
+    FONT_SIZE,
+    MENU_TAG,
+    MIN_VIEWPORT_H,
+    MIN_VIEWPORT_W,
+    SLIDER_RESERVE,
+    STATUS_RESERVE,
+    TOOL_MIN_H,
+    TOOL_MIN_W,
+    VIEWPORT_H,
+    VIEWPORT_TITLE,
+    VIEWPORT_W,
+    WIN_TAG,
+)
+from cheerleader.gui.dialogs import (
+    CompareOpenDialog,
+    ConfirmDialog,
+    ErrorPopup,
+    add_all_files_filter,
+    picked_path,
+)
 from cheerleader.gui.hexgrid import HexGrid
 from cheerleader.gui.workers import UiBridge, UiEvent
 from cheerleader.libs.hexdoc import HexDocument
-
-if TYPE_CHECKING:  # pragma: no cover - import cycle guard only
-    from cheerleader.gui.editor import EditorController
-
-# import settings
-from cheerleader.gui.const import *
 
 try:
     import dearpygui.dearpygui as dpg
 except ImportError:  # pragma: no cover - main() prints the install hint first
     dpg = None  # type: ignore[assignment]
+
 
 def human_size(size: int) -> str:
     """Human-readable byte size: '300 bytes', '1.0 KiB', '336.5 MiB'."""
@@ -51,72 +83,114 @@ def human_size(size: int) -> str:
     return f"{size} bytes"
 
 
-def set_status(text: str) -> None:
-    """Update the status strip text."""
-    dpg.set_value(STATUS_TAG, text)
-
-
-class Shell(NamedTuple):
-    """Handles of the persistent UI chrome."""
-
-    window: int | str
-    content: int | str
-    status: int | str
-
-
 class Controller(Protocol):
-    """What the app shell needs from the active phase controller."""
+    """What the shell needs from a tool's controller."""
 
     def on_event(self, event: UiEvent) -> None: ...
 
-    def request_quit(self) -> None: ...
+    def dirty_edit_count(self) -> int: ...
+
+    def window_close_requested(self) -> None: ...
+
+    def shutdown(self) -> None: ...
+
+
+@dataclass(eq=False)
+class Tool:
+    """One open floating tool window (editor or compare) and its parts."""
+
+    window: int | str
+    status_tag: int | str
+    controller: Controller
+    grids: tuple[HexGrid, ...]
+    tick: Callable[[], None] | None
 
 
 class GuiApp:
     """
-        Application state shared by all GUI controllers.
+    Application state shared by all GUI tools.
 
-        The active controller is installed via :meth:`set_controller`; the frame 
-        loop forwards drained worker events to its ``on_event``. Per-frame widget
-        maintenance (the hex grid's repaint/relayout) goes through :meth:`set_tick` / :meth:`tick`.
+    Tools self-register in :attr:`tools` when opened; the frame loop
+    dispatches drained worker events to the tool whose busy worker posted
+    them and runs every tool's per-frame maintenance.
     """
 
     def __init__(self) -> None:
         self.bridge = UiBridge()
-        self.dirty = False
-        self.grid: HexGrid | None = None
-        self.controller: Controller | None = None
-        self._tick: Callable[[], None] | None = None
+        self.tools: list[Tool] = []
+        self._quit_dlg: ConfirmDialog | None = None
+        self._ns_counter = itertools.count(1)
 
-    def set_controller(self, controller: Controller | None) -> None:
-        """Install the active controller (``None`` detaches)."""
-        self.controller = controller
+    def next_ns(self) -> str:
+        """Unique per-app namespace for a new tool's tags/registries."""
+        return f"t{next(self._ns_counter)}"
 
     def dispatch(self, event: UiEvent) -> None:
-        if self.controller is not None:
-            self.controller.on_event(event)
+        """Route a worker event to the tool whose busy worker posted it.
 
-    def set_tick(self, on_tick: Callable[[], None] | None) -> None:
-        """Install the per-frame maintenance callable (``None`` detaches)."""
-        self._tick = on_tick
+        Strict worker identity: with several tools alive, broadcasting would
+        leak one tool's generations into another's; events of tools closed
+        mid-flight (and handle-less events) are dropped.
+        """
+        for tool in self.tools:
+            busy = getattr(tool.controller, "busy", None)
+            if (
+                busy is not None
+                and busy.worker is not None
+                and busy.worker is event.worker
+            ):
+                tool.controller.on_event(event)
+                return
 
     def tick(self) -> None:
-        """Run per-frame widget maintenance (no-op without a handler)."""
-        if self._tick is not None:
-            self._tick()
+        """Run per-frame widget maintenance for every open tool."""
+        for tool in self.tools:
+            if tool.tick is not None:
+                tool.tick()
 
     def request_quit(self) -> None:
         """
-            Quit the app via the active controller.
+        Quit the app — the funnel for Ctrl+Q and the Tools → Quit item.
 
-            The viewport is created with ``disable_close=True`` so every quit
-            path (Ctrl+Q, dialogs) funnels through here; with unsaved edits the
-            editor controller shows the confirmation modal first.
+        With unsaved edits anywhere, show **one** aggregate confirmation
+        instead of per-tool dialogs; answering No keeps the app up.
         """
-        if self.controller is not None:
-            self.controller.request_quit()
+        if self._quit_dlg is not None:
+            return  # already confirming
+        total = sum(tool.controller.dirty_edit_count() for tool in self.tools)
+        if total == 0:
+            dpg.stop_dearpygui()
             return
-        dpg.stop_dearpygui()
+        self._quit_dlg = ConfirmDialog(
+            message=(
+                f"{total} unsaved edit{'s' if total != 1 else ''}"
+                " — quit without saving?"
+            ),
+            on_answer=self._quit_answer,
+        )
+        self._quit_dlg.open()
+
+    def _quit_answer(self, ok: bool) -> None:
+        dlg, self._quit_dlg = self._quit_dlg, None
+        dlg.close()
+        if ok:
+            dpg.stop_dearpygui()
+
+    def close_tool_for(self, controller: Controller) -> None:
+        """Close the tool owned by *controller* (its X / confirm answered)."""
+        for tool in self.tools:
+            if tool.controller is controller:
+                self.close_tool(tool)
+                return
+
+    def close_tool(self, tool: Tool) -> None:
+        """Full teardown of one tool: worker, modals, registries, window."""
+        tool.controller.shutdown()
+        for grid in tool.grids:
+            grid.shutdown()
+        if dpg.does_item_exist(tool.window):
+            dpg.delete_item(tool.window)
+        self.tools[:] = [t for t in self.tools if t is not tool]
 
 
 def _find_font_file() -> str | None:
@@ -147,10 +221,10 @@ def _build_theme() -> None:
 
 def _build_font() -> None:
     """
-        Bind the first available monospace font; skip on any failure.
+    Bind the first available monospace font; skip on any failure.
 
-        The built-in DPG font is fixed-width, so the hex grid stays aligned even
-        when no candidate font exists on the system.
+    The built-in DPG font is fixed-width, so the hex grid stays aligned even
+    when no candidate font exists on the system.
     """
     path = _find_font_file()
     if path is None:
@@ -163,20 +237,6 @@ def _build_font() -> None:
         # Corrupt or unsupported font file — the default font is fine.
         pass
 
-def _placeholder_content(binary: str | None, hex_compare: str | None) -> None:
-    dpg.add_spacer(height=12)
-    if binary is None:
-        dpg.add_text("cheerleader-gui")
-        dpg.add_text("usage:  cheerleader-gui FILE  [--hex-compare TARGET]")
-        return
-    dpg.add_text(os.path.basename(binary))
-    dpg.add_text(binary, color=(140, 140, 148))
-    dpg.add_text(human_size(os.path.getsize(binary)))
-    if hex_compare is not None:
-        dpg.add_spacer(height=6)
-        dpg.add_text(f"⇄ {os.path.basename(hex_compare)}")
-        dpg.add_text(hex_compare, color=(140, 140, 148))
-    dpg.add_spacer(height=6)
 
 def _on_quit_key(app: GuiApp):
     """Global Ctrl+Q handler factory (Q alone would clash with popup typing)."""
@@ -187,66 +247,217 @@ def _on_quit_key(app: GuiApp):
 
     return _handler
 
-def build_shell(app: GuiApp, *, binary: str | None, hex_compare: str | None) -> Shell:
-    """Create the persistent chrome: theme, font, primary window, status bar."""
+
+def _tool_window_closed(app: GuiApp, window: int | str) -> None:
+    """``on_close`` of a tool window (X clicked): the controller decides."""
+    for tool in app.tools:
+        if tool.window == window:
+            tool.controller.window_close_requested()
+            return
+
+
+def open_editor(app: GuiApp, path: str) -> None:
+    """Open *path* in a floating hex-editor tool window.
+
+    Fails soft: an unreadable path (vanished between the file dialog and
+    here) shows an :class:`~cheerleader.gui.dialogs.ErrorPopup`. Opening an
+    already-open file focuses the existing window instead.
+    """
+    try:
+        doc = HexDocument(path)
+    except OSError as e:
+        ErrorPopup(f"Cannot open {path}:\n{e}")
+        return
+    for tool in app.tools:
+        existing = getattr(tool.controller, "doc", None)
+        if existing is not None and existing.path == path:
+            doc.close()
+            dpg.configure_item(tool.window, show=True)
+            dpg.focus_item(tool.window)
+            return
+    ns = app.next_ns()
+    window = f"gui-tool-{ns}"
+    content = f"{window}-content"
+    status_tag = f"{window}-status"
+    with dpg.window(
+        tag=window,
+        label=f"hex editor — {os.path.basename(path)}",
+        width=EDITOR_WIN_W,
+        height=EDITOR_WIN_H,
+        min_size=[TOOL_MIN_W, TOOL_MIN_H],
+        no_collapse=True,
+        on_close=lambda *_a: _tool_window_closed(app, window),
+    ):
+        dpg.add_child_window(tag=content, border=False, height=-STATUS_RESERVE)
+        dpg.add_separator()
+        dpg.add_text("", tag=status_tag)
+    grid = HexGrid(doc, name=ns)
+    grid.build(content)
+    # Lazy import: this module must stay importable on its own (the editor
+    # imports this module's helpers).
+    from cheerleader.gui.editor import EditorController
+
+    controller = EditorController(
+        app, grid, doc, window=window, status_tag=status_tag, ns=ns
+    )
+    controller.update_status()
+    app.tools.append(
+        Tool(
+            window=window,
+            status_tag=status_tag,
+            controller=controller,
+            grids=(grid,),
+            tick=grid.tick,
+        )
+    )
+
+
+def open_compare(app: GuiApp, left_path: str, right_path: str) -> None:
+    """Open two files in a floating side-by-side compare tool window.
+
+    The diff scan starts immediately (TUI on_mount parity). Fails soft with
+    an :class:`~cheerleader.gui.dialogs.ErrorPopup` when either file cannot
+    be opened.
+    """
+    try:
+        left = HexDocument(left_path)
+        try:
+            right = HexDocument(right_path)
+        except OSError:
+            left.close()
+            raise
+    except OSError as e:
+        ErrorPopup(f"Cannot compare:\n{e}")
+        return
+    ns = app.next_ns()
+    window = f"gui-tool-{ns}"
+    content = f"{window}-content"
+    status_tag = f"{window}-status"
+    with dpg.window(
+        tag=window,
+        label=(
+            f"hex compare — {os.path.basename(left_path)}"
+            f" ⇄ {os.path.basename(right_path)}"
+        ),
+        width=COMPARE_WIN_W,
+        height=COMPARE_WIN_H,
+        min_size=[TOOL_MIN_W, TOOL_MIN_H],
+        no_collapse=True,
+        on_close=lambda *_a: _tool_window_closed(app, window),
+    ):
+        dpg.add_child_window(tag=content, border=False, height=-STATUS_RESERVE)
+        dpg.add_separator()
+        dpg.add_text("", tag=status_tag)
+    # Dual panes: each grid gets its own container so its measured relayout
+    # covers one half of the window.
+    pane_l, pane_r = f"{ns}-cmp-l-pane", f"{ns}-cmp-r-pane"
+    with dpg.group(horizontal=True, parent=content):
+        dpg.add_child_window(
+            tag=pane_l,
+            border=False,
+            width=(COMPARE_WIN_W - 2 * SLIDER_RESERVE) // 2,
+            height=COMPARE_WIN_H - STATUS_RESERVE - 2,
+        )
+        dpg.add_child_window(
+            tag=pane_r,
+            border=False,
+            width=(COMPARE_WIN_W - 2 * SLIDER_RESERVE) // 2,
+            height=COMPARE_WIN_H - STATUS_RESERVE - 2,
+        )
+    left_grid = HexGrid(left, name=f"{ns}-cmp-l")
+    right_grid = HexGrid(right, name=f"{ns}-cmp-r")
+    left_grid.build(pane_l)
+    right_grid.build(pane_r)
+    # TUI parity: one scrollbar; the left pane's drives both.
+    right_grid.set_scrollbar_visible(False)
+    # Lazy import (compare imports this module's helpers).
+    from cheerleader.gui.compare import CompareController
+
+    controller = CompareController(
+        app,
+        left_grid,
+        right_grid,
+        left,
+        right,
+        window=window,
+        status_tag=status_tag,
+        ns=ns,
+    )
+    controller.start()  # initial diff scan
+    app.tools.append(
+        Tool(
+            window=window,
+            status_tag=status_tag,
+            controller=controller,
+            grids=(left_grid, right_grid),
+            tick=controller.tick,
+        )
+    )
+
+
+def _show_dialog(tag: int | str):
+    """Menu-item callback factory: show a pre-built file dialog."""
+
+    def _open(*_args) -> None:
+        dpg.configure_item(tag, show=True)
+
+    return _open
+
+
+def _editor_picked(app: GuiApp, app_data) -> None:
+    path = picked_path(app_data)
+    if path:
+        open_editor(app, path)
+
+
+def _compare_dialog_opener(app: GuiApp):
+    """Menu-item callback factory: open the two-file compare picker."""
+
+    def _open(*_args) -> None:
+        CompareOpenDialog(on_launch=lambda src, tgt: open_compare(app, src, tgt)).open()
+
+    return _open
+
+
+def build_shell(app: GuiApp) -> int | str:
+    """Create the persistent chrome: theme, font, shell window + Tools menu.
+
+    The shell itself is empty (menu bar only); tools open in floating
+    windows. The open-file dialogs are pre-built top-level items, shown by
+    the menu entries.
+    """
     _build_theme()
     _build_font()
+    with dpg.window(tag=WIN_TAG), dpg.menu_bar(tag=MENU_TAG), dpg.menu(label="Tools"):
+        dpg.add_menu_item(label="Hex Editor…", callback=_show_dialog(DLG_EDITOR))
+        dpg.add_menu_item(label="Hex Compare…", callback=_compare_dialog_opener(app))
+        dpg.add_menu_item(label="Quit", callback=app.request_quit)
 
-    grid: HexGrid | None = None
-    controller: EditorController | None = None
-    with dpg.window(tag=WIN_TAG):
-        with dpg.child_window(tag=CONTENT_TAG, border=False, height=-STATUS_RESERVE):
-            if binary is not None and hex_compare is None:
-                doc = HexDocument(binary)
-                grid = HexGrid(doc)
-                grid.build(parent=CONTENT_TAG)
-                app.grid = grid
-                app.set_tick(grid.tick)
-                # Lazy import: this module must stay importable on its own
-                # (the editor imports this module's helpers).
-                from cheerleader.gui.editor import EditorController
-
-                controller = EditorController(app, grid, doc)
-                app.set_controller(controller)
-            else:
-                _placeholder_content(binary, hex_compare)
-        dpg.add_separator()
-        with dpg.group(horizontal=True):
-            dpg.add_text(_status_line(binary, hex_compare), tag=STATUS_TAG)
-
-    if controller is not None:
-        # The controller owns the status line from here on (cursor offset,
-        # byte value, unsaved count, notes); show the full line from the start.
-        controller.update_status()
+    # Open-file dialog (all-files filter + dict payload).
+    dpg.add_file_dialog(
+        tag=DLG_EDITOR,
+        directory_selector=False,
+        show=False,
+        modal=True,
+        file_count=1,
+        width=560,
+        height=400,
+        default_path=os.getcwd(),
+        callback=lambda _s, a: _editor_picked(app, a),
+        cancel_callback=lambda *_a: None,
+    )
+    add_all_files_filter(DLG_EDITOR)
 
     with dpg.handler_registry(tag="gui-global-keys"):
         dpg.add_key_press_handler(key=dpg.mvKey_Q, callback=_on_quit_key(app))
 
-    return Shell(window=WIN_TAG, content=CONTENT_TAG, status=STATUS_TAG)
+    return WIN_TAG
 
 
-def _file_entry(binary: str, hex_compare: str | None) -> str:
-    entry = f"{os.path.basename(binary)} — {human_size(os.path.getsize(binary))}"
-    if hex_compare is not None:
-        entry += (
-            f"  ⇄  {os.path.basename(hex_compare)}"
-            f" ({human_size(os.path.getsize(hex_compare))})"
-        )
-    return entry
-
-
-def _status_line(binary: str | None, hex_compare: str | None) -> str:
-    parts: list[str] = []
-    if binary is not None:
-        parts.append(_file_entry(binary, hex_compare))
-    parts.append("Ctrl+Q quit")
-    return "  │  ".join(parts)
-
-
-def run_gui(*, binary: str | None = None, hex_compare: str | None = None) -> None:
+def run_gui() -> None:
     """Create the context, build the shell, and run the frame loop.
 
-    Each frame: drain worker events into the active controller, then render.
+    Each frame: drain worker events into their owning tools, then render.
     """
     if dpg is None:  # pragma: no cover - main() checks first
         raise RuntimeError(
@@ -255,7 +466,7 @@ def run_gui(*, binary: str | None = None, hex_compare: str | None = None) -> Non
     dpg.create_context()
     try:
         app = GuiApp()
-        shell = build_shell(app, binary=binary, hex_compare=hex_compare)
+        window = build_shell(app)
         dpg.create_viewport(
             title=VIEWPORT_TITLE,
             width=VIEWPORT_W,
@@ -266,7 +477,7 @@ def run_gui(*, binary: str | None = None, hex_compare: str | None = None) -> Non
         )
         dpg.setup_dearpygui()
         dpg.show_viewport()
-        dpg.set_primary_window(shell.window, True)
+        dpg.set_primary_window(window, True)
         while dpg.is_dearpygui_running():
             for event in app.bridge.drain():
                 app.dispatch(event)

@@ -1,8 +1,9 @@
 """
-    Dear PyGui application shell for the cheerleader hex UI.
+Dear PyGui application shell for the cheerleader hex UI.
 
-    Constants
+Constants
 """
+
 VIEWPORT_TITLE = "cheerleader — hex"
 VIEWPORT_W, VIEWPORT_H = 1280, 800
 MIN_VIEWPORT_W, MIN_VIEWPORT_H = 640, 420
@@ -18,8 +19,17 @@ APP_TITLE = "CHEERLEADER - GUI"
 STATUS_RESERVE = 36
 
 WIN_TAG = "gui-main-window"
-CONTENT_TAG = "gui-content"
-STATUS_TAG = "gui-status"
+MENU_TAG = "gui-menubar"
+
+# Shell-level open-file dialog (shown from the Tools menu); the compare
+# picker owns its two file dialogs privately (see dialogs.CompareOpenDialog).
+DLG_EDITOR = "gui-dlg-open-editor"
+
+# Floating tool windows. Tags are namespaced per tool:
+# gui-tool-{ns} / gui-tool-{ns}-content / gui-tool-{ns}-status.
+EDITOR_WIN_W, EDITOR_WIN_H = 960, 620
+COMPARE_WIN_W, COMPARE_WIN_H = 1180, 620
+TOOL_MIN_W, TOOL_MIN_H = 560, 320
 
 # Monospace candidates, first existing wins (env override → linux → macos →
 # windows). Missing entirely? The built-in default font (fixed-width) is used.

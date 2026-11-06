@@ -1,41 +1,41 @@
 """
-    Editor controller for the Dear PyGui hex front-end.
+Editor controller for the Dear PyGui hex front-end.
 
-    Owns every hex-editor flow: inline hex typing, the Enter byte-edit popup,
-    undo, save (file dialog → background worker → reopen), goto/search with
-    wrap + ``n``/``N`` + Esc-cancel, reload, and the dirty-quit confirmation.
-    This is the port of ``tui.tabs.HexEditorTab`` onto the GUI worker pattern
-    (``workers.start_worker`` + :class:`~cheerleader.gui.workers.UiBridge`).
+Owns every hex-editor flow: inline hex typing, the Enter byte-edit popup,
+undo, save (file dialog → background worker → reopen), goto/search with
+wrap + ``n``/``N`` + Esc-cancel, reload, and the dirty-quit confirmation.
+This is the port of ``tui.tabs.HexEditorTab`` onto the GUI worker pattern
+(``workers.start_worker`` + :class:`~cheerleader.gui.workers.UiBridge`).
 
-    Concurrency (mirrors the TUI tab):
+Concurrency (mirrors the TUI tab):
 
-    * one :class:`~cheerleader.gui.workers.BusyTracker` marks the exclusive
-    in-flight operation (``"saving"`` / ``"searching"``); busy paths refuse
-    conflicting actions with a status note, like ``_refuse_if_busy``.
-    * starting a search while one runs cancels the old worker first (the TUI's
-    exclusive worker group); completion events carry the producing
-    :class:`~cheerleader.gui.workers.WorkerHandle` and stale completions are
-    dropped via ``BusyTracker.is_stale``.
-    * long operations run on daemon threads and report through the bridge; the
-    frame loop drains it and calls :meth:`on_event`.
+* one :class:`~cheerleader.gui.workers.BusyTracker` marks the exclusive
+in-flight operation (``"saving"`` / ``"searching"``); busy paths refuse
+conflicting actions with a status note, like ``_refuse_if_busy``.
+* starting a search while one runs cancels the old worker first (the TUI's
+exclusive worker group); completion events carry the producing
+:class:`~cheerleader.gui.workers.WorkerHandle` and stale completions are
+dropped via ``BusyTracker.is_stale``.
+* long operations run on daemon threads and report through the bridge; the
+frame loop drains it and calls :meth:`on_event`.
 
-    Key handling: the controller registers its own global handler registry. All
-    editor keys are no-ops while a dialog is open (the dialog's input owns the
-    keyboard), and the grid's key/click/wheel handlers are switched off via
-    ``grid.input_enabled`` for the same reason.
+Key handling: the controller registers its own global handler registry. All
+editor keys are no-ops while a dialog is open (the dialog's input owns the
+keyboard), and the grid's key/click/wheel handlers are switched off via
+``grid.input_enabled`` for the same reason.
 
-    Inline typing model: the first hex digit replaces the high nibble of the
-    byte at the cursor (written immediately — visible feedback, and standard
-    hex-editor behavior), the second digit replaces the low nibble and advances
-    the cursor. A cursor move clears the pending nibble; ``undo`` reverts a
-    half-written byte like any other write.
+Inline typing model: the first hex digit replaces the high nibble of the
+byte at the cursor (written immediately — visible feedback, and standard
+hex-editor behavior), the second digit replaces the low nibble and advances
+the cursor. A cursor move clears the pending nibble; ``undo`` reverts a
+half-written byte like any other write.
 """
 
 import os
 from functools import partial
 from typing import Any
 
-from cheerleader.gui.app import GuiApp, human_size, set_status
+from cheerleader.gui.app import GuiApp, human_size
 from cheerleader.gui.dialogs import (
     ByteEditDialog,
     ConfirmDialog,
@@ -74,12 +74,31 @@ if dpg is not None:  # pragma: no branch - always set outside the stub test
 
 
 class EditorController:
-    """Hex-editor flows over one :class:`HexDocument` + :class:`HexGrid`."""
+    """Hex-editor flows over one :class:`HexDocument` + :class:`HexGrid`.
 
-    def __init__(self, app: GuiApp, grid: HexGrid, doc: HexDocument) -> None:
+    several editor windows may coexist, so *everything* the
+    controller registers globally is namespaced with *ns* — the key
+    registry, the modal dialog tags and the grid's own registries (the grid
+    gets ``name=ns`` from the opener). *window* and *status_tag* point at
+    this tool's floating window and its private status strip.
+    """
+
+    def __init__(
+        self,
+        app: GuiApp,
+        grid: HexGrid,
+        doc: HexDocument,
+        *,
+        window: int | str,
+        status_tag: int | str,
+        ns: str,
+    ) -> None:
         self.app = app
         self.grid = grid
         self.doc = doc
+        self.window = window
+        self.status_tag = status_tag
+        self.ns = ns
         self.busy = BusyTracker()
         self._pending: int | None = None  # first typed hex nibble (high)
         self._mode = "offset"
@@ -95,8 +114,8 @@ class EditorController:
     # ── global keys ────────────────────────────────────────────────────────
 
     def _install_keys(self) -> None:
-        """Register the editor's global key handlers."""
-        with dpg.handler_registry(tag="editor-keys"):
+        """Register the editor's global key handlers (per-instance tag)."""
+        with dpg.handler_registry(tag=f"editor-keys-{self.ns}"):
             dpg.add_key_press_handler(key=KEY_ENTER, callback=self._on_enter_key)
             dpg.add_key_press_handler(key=dpg.mvKey_U, callback=self._on_undo_key)
             dpg.add_key_press_handler(key=dpg.mvKey_S, callback=self._on_save_key)
@@ -196,7 +215,7 @@ class EditorController:
         if extra:
             parts.append(extra)
         parts.append("Ctrl+Q quit")
-        set_status("  │  ".join(parts))
+        dpg.set_value(self.status_tag, "  │  ".join(parts))
 
     def _refuse_if_busy(self) -> bool:
         if self.busy.op is None:
@@ -269,6 +288,7 @@ class EditorController:
                 validate=validate,
                 on_accept=apply,
                 on_cancel=self._close_dialog,
+                tag=f"gui-dlg-edit-{self.ns}",
             ),
         )
 
@@ -293,6 +313,7 @@ class EditorController:
             SaveDialog(
                 default_path=f"{self.doc.path}.patched",
                 on_chosen=self._on_save_chosen,
+                tag=f"gui-dlg-save-{self.ns}",
             ),
         )
 
@@ -306,6 +327,7 @@ class EditorController:
                 ConfirmDialog(
                     message=f"{path} exists. Overwrite?",
                     on_answer=lambda ok: self._overwrite_answer(ok, path),
+                    tag=f"gui-dlg-confirm-{self.ns}",
                 ),
             )
             return
@@ -385,6 +407,7 @@ class EditorController:
                 validate=validate,
                 on_accept=accept,
                 on_cancel=self._close_dialog,
+                tag=f"gui-dlg-search-{self.ns}",
             ),
         )
 
@@ -493,6 +516,7 @@ class EditorController:
             ConfirmDialog(
                 message="Discard unsaved edits and reload?",
                 on_answer=self._reload_answer,
+                tag=f"gui-dlg-confirm-{self.ns}",
             ),
         )
 
@@ -515,28 +539,48 @@ class EditorController:
         self.grid.move_to(self.grid.cursor)  # clamps to the (new) size
         self.update_status()
 
-    def request_quit(self) -> None:
-        """Quit path for Ctrl+Q: confirm first when there are unsaved edits."""
+    # ── window lifecycle ────────
+
+    def dirty_edit_count(self) -> int:
+        """Unsaved edit count for the shell's aggregate quit confirm."""
+        return self.doc.edit_count
+
+    def window_close_requested(self) -> None:
+        """The tool window's X was clicked: confirm when dirty, else close.
+
+        DPG hides the window before this runs; answering *No* re-shows it
+        (the veto-by-reshow pattern — DPG has no close veto).
+        """
         if not self.doc.modified:
-            dpg.stop_dearpygui()
+            self.app.close_tool_for(self)
             return
-        if self._modal is not None:
-            return  # a dialog is already up; a second Ctrl+Q changes nothing
         n = self.doc.edit_count
         self._open_dialog(
             "confirm",
             ConfirmDialog(
                 message=(
-                    f"{n} unsaved edit{'s' if n != 1 else ''} — quit without saving?"
+                    f"{n} unsaved edit{'s' if n != 1 else ''} — close without saving?"
                 ),
-                on_answer=self._quit_answer,
+                on_answer=self._close_answer,
+                tag=f"gui-dlg-confirm-{self.ns}",
             ),
         )
 
-    def _quit_answer(self, ok: bool) -> None:
+    def _close_answer(self, ok: bool) -> None:
         self._close_dialog()
         if ok:
-            dpg.stop_dearpygui()
+            self.app.close_tool_for(self)
+        else:
+            dpg.configure_item(self.window, show=True)  # veto: bring it back
+
+    def shutdown(self) -> None:
+        """Teardown before the tool window is deleted: worker + modals + keys."""
+        if self.busy.op is not None and self.busy.worker is not None:
+            self.busy.worker.cancel.cancel()
+        if self._modal is not None:
+            self._close_dialog()
+        if dpg.does_item_exist(f"editor-keys-{self.ns}"):
+            dpg.delete_item(f"editor-keys-{self.ns}")
 
     # ── bridge events (frame loop dispatch) ────────────────────────────────
 
