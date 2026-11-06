@@ -593,6 +593,23 @@ def test_desktop_click_maps_to_byte(desktop_grid):
     assert grid.cursor == 5
 
 
+def test_desktop_click_survives_missing_rect_state(desktop_grid, monkeypatch):
+    """Hidden/not-yet-laid-out items carry no rect state in their item
+    state — the click guard must treat that as "not over the grid"
+    (same live KeyError('rect_min') report as the disasm grid)."""
+
+    def _no_rect(_item):
+        raise KeyError("rect_min")
+
+    grid, screen = desktop_grid
+    grid.tick()  # geometry established from a rendered frame
+    monkeypatch.setattr(dpg, "get_item_rect_min", _no_rect)
+    monkeypatch.setattr(dpg, "get_item_rect_max", _no_rect)
+    screen.mouse = [GRID_ORIGIN[0] + PAD[0], GRID_ORIGIN[1] + PAD[1] + SIM_ROW_H / 2]
+    grid._on_click(None, None)  # must not raise
+    assert grid.cursor == 0
+
+
 def test_page_keys_registered_under_both_spellings(grid_window, tmp_path):
     """dearpygui 2.3.1's mvKey_Prior/Next constants are stale GLFW codes that
     never fire (upstream #2658); the grid also registers the correct ImGui

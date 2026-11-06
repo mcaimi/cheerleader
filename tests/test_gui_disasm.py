@@ -26,10 +26,12 @@ from cheerleader.gui.app import (
     build_shell,
 )
 from cheerleader.gui.disasm import (
+    COMBO_RESERVE,
     auto_pick,
     exec_sections,
     open_disassembly,
     pick_engine,
+    section_label,
 )
 from cheerleader.gui.disasmgrid import (
     ADDR_W,
@@ -293,6 +295,36 @@ def test_grid_click_ignores_empty_rows(dpg_context, monkeypatch) -> None:
     assert grid.cursor == 0  # past-EOF click ignored
 
 
+def test_grid_click_survives_missing_rect_state(dpg_context, monkeypatch) -> None:
+    """Clicking while the grid is hidden/not laid out must not crash.
+
+    Live report: a hidden item's state dict carries no ``rect_min``, so
+    ``get_item_rect_min`` raised ``KeyError`` out of the global click
+    handler (hex-pane shown → grid area hidden → click anywhere).
+    """
+
+    def _no_rect(_item):
+        raise KeyError("rect_min")
+
+    grid = _built_grid(_insns(10))
+    grid._geometry = DisasmGeometry(cw=9.0, row_h=18.0, origin_y=6.0)
+    monkeypatch.setattr(dpg, "is_item_hovered", lambda _item: False)
+    monkeypatch.setattr(dpg, "get_item_rect_min", _no_rect)
+    monkeypatch.setattr(dpg, "get_item_rect_max", _no_rect)
+    monkeypatch.setattr(dpg, "get_mouse_pos", lambda local=False: [10.0, 10.0])
+    grid._on_click()
+    assert grid.cursor == 0  # quiet no-op, no exception
+
+
+def test_grid_click_after_delete_is_quiet(dpg_context) -> None:
+    """A deleted grid (window-close race) ignores clicks instead of raising."""
+    grid = _built_grid(_insns(10))
+    grid._geometry = DisasmGeometry(cw=9.0, row_h=18.0, origin_y=6.0)
+    dpg.delete_item(grid._grid_tag)
+    grid._on_click()
+    assert grid.cursor == 0
+
+
 def test_grid_shutdown_removes_registry(dpg_context) -> None:
     grid = _built_grid(_insns(3))
     assert dpg.does_item_exist(grid._input_tag)
@@ -319,9 +351,7 @@ def test_open_auto_disassembles_text(dpg_context, tmp_path) -> None:
     assert len(ctl.grid.instrs()) == 64  # the 64 NOPs, capstone-disassembled
     assert ctl.grid.instrs()[0].addr == BASE
     assert ctl.call_graph is not None
-    assert dpg.get_value(tool.status_tag) == (
-        "__TEXT,__text  64 instructions"
-    )
+    assert dpg.get_value(tool.status_tag) == ("__TEXT,__text  64 instructions")
     assert isinstance(tool, Tool) and tool.tick is not None
 
 
@@ -332,9 +362,14 @@ def test_section_switch(dpg_context, tmp_path) -> None:
     app.current_info = _info(path)
     ctl = _open(app, _info(path))
     _settle(app, ctl)
-    dpg.get_item_callback(f"{ctl.ns}-sect-1")()  # click __cstring
+    # user picks __cstring in the dropdown (DPG sets the value, then fires)
+    dpg.set_value(ctl.combo_tag, section_label("__TEXT", "__cstring"))
+    dpg.get_item_callback(ctl.combo_tag)(
+        ctl.combo_tag, section_label("__TEXT", "__cstring")
+    )
     _settle(app, ctl)
     assert ctl._current_index == 1
+    assert dpg.get_value(ctl.combo_tag) == section_label("__TEXT", "__cstring")
     assert len(ctl.grid.instrs()) == 8  # 0x20 bytes of the cstring section
     assert "counters" not in dpg.get_value(ctl.status_tag)
 
@@ -348,7 +383,9 @@ def test_stale_disasm_dropped(dpg_context, tmp_path) -> None:
     ctl = _open(app, _info(path))
     first = ctl.busy.worker
     first.thread.join(timeout=10.0)  # done, but not drained yet
-    dpg.get_item_callback(f"{ctl.ns}-sect-1")()  # switch while pending
+    dpg.get_item_callback(ctl.combo_tag)(
+        ctl.combo_tag, section_label("__TEXT", "__cstring")
+    )  # switch while pending
     second = ctl.busy.worker
     second.thread.join(timeout=10.0)
     for event in app.bridge.drain():
@@ -400,7 +437,44 @@ def test_no_exec_sections_is_idle(dpg_context) -> None:
     ctl = _open(app, info)
     assert ctl.sections == []
     assert ctl.busy.worker is None
+    assert dpg.get_item_configuration(ctl.combo_tag)["enabled"] is False
+    assert dpg.get_value(ctl.combo_tag) == "(no executable sections)"
     assert dpg.get_value(ctl.status_tag) == "Select a section to disassemble"
+    # a placeholder pick on the disabled combo is a no-op
+    dpg.get_item_callback(ctl.combo_tag)(ctl.combo_tag, "(no executable sections)")
+    assert ctl.busy.worker is None
+
+
+def test_combo_populated_and_auto_picked(dpg_context, tmp_path) -> None:
+    """The dropdown lists the exec sections; the auto-pick is preselected."""
+    path = _macho_text(tmp_path)  # real file: the worker reads section bytes
+    app = GuiApp()
+    info = _info(path, with_data=True)
+    info.segments[0].initprot = 5  # __TEXT executable
+    info.segments[1].initprot = 3  # __DATA not executable
+    ctl = _open(app, info)
+    assert dpg.get_item_configuration(ctl.combo_tag)["items"] == [
+        section_label("__TEXT", "__text"),
+        section_label("__TEXT", "__cstring"),
+    ]
+    assert dpg.get_value(ctl.combo_tag) == section_label("__TEXT", "__text")
+    assert ctl._current_index == 0
+    assert ctl.busy.worker is not None  # auto-disassembly started
+    _settle(app, ctl)
+    assert len(ctl.grid.instrs()) == 64
+
+
+def test_window_layout_combo_and_pane(dpg_context) -> None:
+    """Combo row on top, grid pane below it (parent-relative height)."""
+    app = GuiApp()
+    info = _info()
+    ctl = _open(app, info)
+    assert dpg.get_item_configuration(ctl.combo_tag)["enabled"] is True
+    # the pane fills the rest of the content area via a parent-relative
+    # (negative) height → window resizes track without an explicit re-fit
+    pane_cfg = dpg.get_item_configuration(ctl.grid._parent)
+    assert pane_cfg["height"] == -COMBO_RESERVE
+    assert dpg.does_item_exist(ctl.grid._grid_tag)
 
 
 def test_escape_key_cancels(dpg_context, tmp_path) -> None:
