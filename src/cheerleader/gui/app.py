@@ -40,6 +40,8 @@ from typing import Protocol
 
 from cheerleader.formats import parse as parse_binary
 from cheerleader.gui.const import (
+    APP_TITLE,
+    APP_VERSION,
     COMPARE_WIN_H,
     COMPARE_WIN_W,
     DISASM_ITEMS,
@@ -56,16 +58,17 @@ from cheerleader.gui.const import (
     MI_EXPORTS,
     MI_FIXUPS,
     MI_IMPORTS,
+    MI_INFO,
     MI_SECTIONS,
     MI_SEGMENTS,
     MI_SYMBOLS,
-    MI_INFO,
     MIN_VIEWPORT_H,
     MIN_VIEWPORT_W,
     SHELL_FILL,
     SHELL_STATUS,
     SHELL_STATUS_BAR,
     SLIDER_RESERVE,
+    SRC_URL,
     STATUS_RESERVE,
     TOOL_MIN_H,
     TOOL_MIN_W,
@@ -73,15 +76,12 @@ from cheerleader.gui.const import (
     VIEWPORT_TITLE,
     VIEWPORT_W,
     WIN_TAG,
-    APP_TITLE,
-    APP_VERSION,
-    SRC_URL
 )
 from cheerleader.gui.dialogs import (
     CompareOpenDialog,
     ConfirmDialog,
-    InfoDialog,
     ErrorPopup,
+    InfoDialog,
     add_all_files_filter,
     picked_path,
 )

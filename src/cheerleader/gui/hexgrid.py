@@ -446,15 +446,23 @@ class HexGrid:
     def _pointer_over_grid(self) -> bool:
         """True when the mouse is over the grid area.
 
-        ``is_item_hovered`` alone is not reliable over a child window's items,
-        so a plain mouse-in-rect test (same coordinate functions the
-        hit-tester uses) backs it up.
+        ``is_item_hovered`` alone is not reliable over a child window's
+        items, so a plain mouse-in-rect test (same coordinate functions the
+        hit-tester uses) backs it up. Items that are hidden or not yet laid
+        out carry no ``rect_min``/``rect_max`` in their state (and
+        ``is_item_visible`` raises the same way) — any state-fetch failure
+        means "not over the grid".
         """
+        if not dpg.does_item_exist(self._grid_tag):
+            return False  # deleted mid-frame (window close race)
         if dpg.is_item_hovered(self._grid_tag):
             return True
-        mx, my = dpg.get_mouse_pos(local=False)
-        rmin = dpg.get_item_rect_min(self._grid_tag)
-        rmax = dpg.get_item_rect_max(self._grid_tag)
+        try:
+            mx, my = dpg.get_mouse_pos(local=False)
+            rmin = dpg.get_item_rect_min(self._grid_tag)
+            rmax = dpg.get_item_rect_max(self._grid_tag)
+        except (SystemError, ValueError, TypeError, KeyError):
+            return False
         return bool(rmin[0] <= mx < rmax[0] and rmin[1] <= my < rmax[1])
 
     def _on_click(self, *_args) -> None:
@@ -702,7 +710,7 @@ class HexGrid:
             ascii_x = tuple(float(dpg.get_item_rect_min(t)[0]) for t in r0.asciis)
             y0 = float(dpg.get_item_rect_min(r0.offset)[1])
             y1 = float(dpg.get_item_rect_min(r1.offset)[1])
-        except (SystemError, ValueError, TypeError):
+        except (SystemError, ValueError, TypeError, KeyError):
             return
         ts = self._text_size()
         if ts and ts[0] > 0:

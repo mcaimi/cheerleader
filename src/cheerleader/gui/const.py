@@ -65,7 +65,6 @@ EDITOR_WIN_W, EDITOR_WIN_H = 960, 620
 COMPARE_WIN_W, COMPARE_WIN_H = 1180, 620
 TABLE_WIN_W, TABLE_WIN_H = 900, 520  # D2 data-table views (segments, …)
 DISASM_WIN_W, DISASM_WIN_H = 1180, 620  # D3 Disassembly window
-DISASM_LIST_W = 230  # left executable-section list width (px)
 TOOL_MIN_W, TOOL_MIN_H = 560, 320
 
 # Monospace candidates, first existing wins (env override → linux → macos →

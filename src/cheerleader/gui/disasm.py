@@ -2,9 +2,9 @@
 Disassembly window controller for the Dear PyGui front-end.
 
 The port of ``tui.tabs.DisasmTab``: a floating tool window with an
-executable-section list on the left (TUI rule: segments with
+executable-section dropdown at the top (TUI rule: segments with
 ``initprot & 0x4``, sections with ``size > 0`` and ``offset > 0``) and a
-virtualized instruction grid on the right
+virtualized instruction grid filling the rest
 (:class:`~cheerleader.gui.disasmgrid.DisasmGrid`).
 
 Flow (TUI parity):
@@ -15,8 +15,8 @@ Flow (TUI parity):
   (``EventKind.DISASM_DONE``; the engine is auto-picked once per process:
   capstone if importable, else objdump via
   :func:`cheerleader.libs.objdump._detect_objdump`);
-* a newer section pick bumps a :class:`~cheerleader.gui.workers.Generation`
-  and cancels the in-flight worker; stale completions are dropped;
+* a newer section pick cancels the in-flight worker; stale completions
+  are dropped (``BusyTracker``);
 * ``Esc`` cancels a running disassembly;
 
 The view is read-only (`dirty_edit_count() == 0`); the window holds its own
@@ -24,7 +24,6 @@ The view is read-only (`dirty_edit_count() == 0`); the window holds its own
 """
 
 import os
-from functools import partial
 
 from cheerleader.gui.app import (
     STATUS_RESERVE,
@@ -36,10 +35,8 @@ from cheerleader.gui.app import (
     find_inspector_tool,
 )
 from cheerleader.gui.const import (
-    DISASM_LIST_W,
     DISASM_WIN_H,
     DISASM_WIN_W,
-    SLIDER_RESERVE,
     KEY_ESCAPE,
 )
 from cheerleader.gui.disasmgrid import DisasmGrid
@@ -54,6 +51,13 @@ except ImportError:
     dpg = None  # type: ignore[assignment]
 
 _ENGINE: str | None = None  # None = not picked yet; "" = no engine available
+
+COMBO_RESERVE = 32  # px reserved above the grid pane for the section combo row
+
+
+def section_label(seg: str, sect: str) -> str:
+    """Combo-item text for one executable section."""
+    return f"{seg},{sect}"
 
 
 def pick_engine() -> str | None:
@@ -106,8 +110,12 @@ def auto_pick(sections: list[tuple[str, str]]) -> int | None:
             return i
     return None
 
+
+# ── combo-driven section selection ────────────────────────────────────────────
+
+
 class DisasmController:
-    """One Disassembly tool window: section list + virtualized grid."""
+    """One Disassembly tool window: section dropdown + virtualized grid."""
 
     def __init__(
         self,
@@ -117,8 +125,7 @@ class DisasmController:
         window: int | str,
         status_tag: int | str,
         grid: DisasmGrid,
-        sectlist_tag: int | str,
-        right_tag: int | str,
+        combo_tag: int | str,
         ns: str,
     ) -> None:
         self.app = app
@@ -126,12 +133,12 @@ class DisasmController:
         self.window = window
         self.status_tag = status_tag
         self.grid = grid
-        self.sectlist_tag = sectlist_tag
-        self.right_tag = right_tag
+        self.combo_tag = combo_tag
         self.ns = ns
         self.view_kind = "disasm"  # focus-guard key (find_inspector_tool)
         self.path = info.path
         self.sections: list[tuple[str, str]] = []
+        self._labels: list[str] = []  # combo items, parallel to sections
         self.call_graph: CallGraph | None = None
         self._current_index: int | None = None
         self.busy = BusyTracker()  # exclusive in-flight disassembly
@@ -140,38 +147,35 @@ class DisasmController:
     # ── setup ─────────────────────────────────────────────────────────────
 
     def load_sections(self) -> None:
-        """Fill the section list and auto-disassemble the default pick."""
+        """Fill the section dropdown and auto-disassemble the default pick."""
         self.sections = exec_sections(self.info)
-        dpg.delete_item(self.sectlist_tag, children_only=True)
-        for i, (seg, sect) in enumerate(self.sections):
-            dpg.add_selectable(
-                label=f" {seg},{sect}",
-                tag=f"{self.ns}-sect-{i}",
-                callback=partial(self._on_section_selected, i),
-                parent=self.sectlist_tag,
-            )
+        self._labels = [section_label(seg, sect) for seg, sect in self.sections]
+        if not self.sections:
+            dpg.configure_item(self.combo_tag, items=[], enabled=False)
+            dpg.set_value(self.combo_tag, "(no executable sections)")
+            dpg.set_value(self.status_tag, "Select a section to disassemble")
+            return
+        dpg.configure_item(self.combo_tag, items=self._labels, enabled=True)
         pick = auto_pick(self.sections)
         if pick is not None:
-            self._mark_selected(pick)
+            # runtime set_value: selects the item without firing the callback
+            dpg.set_value(self.combo_tag, self._labels[pick])
             self._start_disasm(pick)
         else:
             dpg.set_value(self.status_tag, "Select a section to disassemble")
 
-    def _mark_selected(self, index: int) -> None:
-        self._current_index = index
-        for i in range(len(self.sections)):
-            # A selectable's *value* carries its selected state (DPG 2.3.1
-            # has no `selected=` configuration keyword).
-            dpg.set_value(f"{self.ns}-sect-{i}", i == index)
-
-    def _on_section_selected(self, index: int, *_args) -> None:
-        if 0 <= index < len(self.sections):
-            self._mark_selected(index)
-            self._start_disasm(index)
+    def _on_section_selected(self, _sender, app_data) -> None:
+        """Combo callback: *app_data* is the selected ``seg,sect`` label."""
+        try:
+            index = self._labels.index(app_data)
+        except ValueError:
+            return  # placeholder text (no sections) — nothing to load
+        self._start_disasm(index)
 
     # ── disassembly worker ────────────────────────────────────────────────
 
     def _start_disasm(self, index: int) -> None:
+        self._current_index = index
         seg, sect = self.sections[index]
         if self.busy.worker is not None:
             self.busy.worker.cancel.cancel()  # superseded run
@@ -246,6 +250,7 @@ class DisasmController:
         if self.busy.worker is not None:
             self.busy.worker.cancel.cancel()
 
+
 # ── opener ────────────────────────────────────────────────────────────────────
 
 
@@ -279,35 +284,38 @@ def open_disassembly(app: GuiApp, path: str) -> None:
         dpg.add_child_window(tag=content, border=False, height=-STATUS_RESERVE)
         dpg.add_separator()
         dpg.add_text("", tag=status_tag)
-    sectlist_tag = f"{ns}-sectlist"
-    right_tag = f"{ns}-right"
-    right_w = DISASM_WIN_W - DISASM_LIST_W - SLIDER_RESERVE - 24
-    with dpg.group(horizontal=True, parent=content):
-        dpg.add_child_window(
-            tag=sectlist_tag,
-            width=DISASM_LIST_W,
-            height=DISASM_WIN_H - STATUS_RESERVE - 2,
-            border=False,
-        )
-        dpg.add_child_window(
-            tag=right_tag,
-            width=right_w,
-            height=DISASM_WIN_H - STATUS_RESERVE - 2,
-            border=False,
-        )
+    combo_tag = f"{ns}-section-combo"
+    pane_tag = f"{ns}-gridpane"
+    dpg.add_combo(
+        tag=combo_tag,
+        items=[],
+        default_value="(no sections)",
+        width=-1,
+        parent=content,
+        enabled=False,
+        callback=None,  # bound in the controller below
+    )
+    # The grid pane fills the rest of the content area; the negative height
+    # is parent-relative, so it keeps tracking window resizes on its own.
+    dpg.add_child_window(
+        tag=pane_tag,
+        parent=content,
+        border=False,
+        height=-COMBO_RESERVE,
+    )
 
     grid = DisasmGrid(name=ns)
-    grid.build(right_tag)
+    grid.build(pane_tag)
     controller = DisasmController(
         app,
         info,
         window=window,
         status_tag=status_tag,
         grid=grid,
-        sectlist_tag=sectlist_tag,
-        right_tag=right_tag,
+        combo_tag=combo_tag,
         ns=ns,
     )
+    dpg.configure_item(combo_tag, callback=controller._on_section_selected)
     controller.load_sections()
     app.tools.append(
         Tool(

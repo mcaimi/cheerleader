@@ -308,11 +308,25 @@ class DisasmGrid:
     # ── pointer / scrollbar ────────────────────────────────────────────────
 
     def _pointer_over_grid(self) -> bool:
+        """True when the mouse is over the grid area.
+
+        ``is_item_hovered`` alone is not reliable over a child window's
+        items, so a plain mouse-in-rect test (same coordinate functions the
+        hit-tester uses) backs it up. Items that are hidden or not yet laid
+        out carry no ``rect_min``/``rect_max`` in their state (and
+        ``is_item_visible`` raises the same way) — any state-fetch failure
+        means "not over the grid".
+        """
+        if not dpg.does_item_exist(self._grid_tag):
+            return False  # deleted mid-frame (window close race)
         if dpg.is_item_hovered(self._grid_tag):
             return True
-        mx, my = dpg.get_mouse_pos(local=False)
-        rmin = dpg.get_item_rect_min(self._grid_tag)
-        rmax = dpg.get_item_rect_max(self._grid_tag)
+        try:
+            mx, my = dpg.get_mouse_pos(local=False)
+            rmin = dpg.get_item_rect_min(self._grid_tag)
+            rmax = dpg.get_item_rect_max(self._grid_tag)
+        except (SystemError, ValueError, TypeError, KeyError):
+            return False
         return bool(rmin[0] <= mx < rmax[0] and rmin[1] <= my < rmax[1])
 
     def _on_click(self, *_args) -> None:
@@ -402,7 +416,7 @@ class DisasmGrid:
             y0 = float(dpg.get_item_rect_min(self._pool[0][0])[1])
             y1 = float(dpg.get_item_rect_min(self._pool[1][0])[1])
             cw = float(dpg.get_text_size("0")[0]) or 9.0
-        except (SystemError, ValueError, TypeError):
+        except (SystemError, ValueError, TypeError, KeyError):
             return
         geom = DisasmGeometry(cw=cw, row_h=y1 - y0, origin_y=y0)
         if geom.is_sane():
