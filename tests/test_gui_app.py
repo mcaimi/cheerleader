@@ -66,10 +66,17 @@ def _popup_message(tag: str) -> str:
 def _menu_labels() -> list[str]:
     items = dpg.get_item_children(MENU_TAG)[1]  # slot 1: the "Tools" menu
     labels: list[str] = []
-    for menu in items:
+
+    def _walk(menu) -> None:
         labels.append(dpg.get_item_label(menu))
         for item in dpg.get_item_children(menu)[1]:
-            labels.append(dpg.get_item_label(item))
+            if dpg.get_item_label(item) and dpg.get_item_children(item)[1]:
+                _walk(item)  # submenu (Engine ▸ …)
+            else:
+                labels.append(dpg.get_item_label(item))
+
+    for menu in items:
+        _walk(menu)
     return labels
 
 
@@ -128,11 +135,16 @@ def test_build_shell_minimal(dpg_context) -> None:
         "Symbols…",
         "Exports…",
         "Fixups…",
+        "Strings…",
+        "Engine",
+        "● Auto",
+        "Capstone",
+        "objdump",
         "Tools",
         "Hex Editor…",
         "Hex Compare…",
         "About",
-        "Info"
+        "Info",
     ]
     # File → Open File… dialog exists, hidden until the menu shows it.
     assert dpg.does_item_exist(DLG_OPEN)

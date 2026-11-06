@@ -18,6 +18,7 @@ pytest.importorskip("dearpygui")
 
 import dearpygui.dearpygui as dpg
 
+from cheerleader.gui import disasm as disasm_mod
 from cheerleader.gui.app import (
     DLG_OPEN,
     MI_DISASM,
@@ -28,10 +29,13 @@ from cheerleader.gui.app import (
 from cheerleader.gui.disasm import (
     COMBO_RESERVE,
     auto_pick,
+    engine_available,
+    engine_override,
     exec_sections,
     open_disassembly,
     pick_engine,
     section_label,
+    set_engine_override,
 )
 from cheerleader.gui.disasmgrid import (
     ADDR_W,
@@ -162,6 +166,89 @@ def test_auto_pick_prefers_macho_text() -> None:
 
 def test_pick_engine_returns_known_kind() -> None:
     assert pick_engine() in ("capstone", "objdump", None)
+
+
+# ── engine override (D5: Disassembler ▸ Engine radio submenu) ─────────────────
+
+
+@pytest.fixture()
+def auto_engine():
+    """Reset the process-global engine override after each test."""
+    yield
+    set_engine_override("auto")
+
+
+def test_engine_override_roundtrip(auto_engine) -> None:
+    assert engine_override() == "auto"  # default
+    set_engine_override("capstone")
+    assert engine_override() == "capstone"
+    set_engine_override("objdump")
+    assert engine_override() == "objdump"
+    set_engine_override("auto")
+    assert engine_override() == "auto"
+    with pytest.raises(ValueError):
+        set_engine_override("ghidra")
+
+
+def test_pick_engine_forced_engine(auto_engine) -> None:
+    """A forced engine flows straight through when available."""
+    if not engine_available("capstone"):  # pragma: no cover - env-dependent
+        pytest.skip("capstone not importable")
+    set_engine_override("capstone")
+    assert pick_engine() == "capstone"
+
+
+def test_pick_engine_forced_unavailable(auto_engine, monkeypatch) -> None:
+    """Forced-but-unavailable → None (views fail soft into their status)."""
+    set_engine_override("capstone")
+    monkeypatch.setattr(disasm_mod, "engine_available", lambda name: False)
+    assert pick_engine() is None
+    # auto ignores the monkeypatched availability shape? no — auto uses the
+    # real cached pick; restore override and check it applies again
+    set_engine_override("objdump")
+    assert pick_engine() is None
+
+
+def test_pick_engine_auto_cached(auto_engine) -> None:
+    """Auto keeps the pre-D5 cached auto-pick semantics."""
+    assert pick_engine() == pick_engine()  # stable across calls
+    assert pick_engine() in ("capstone", "objdump", None)
+
+
+def test_engine_menu_radio(dpg_context, auto_engine, monkeypatch) -> None:
+    """The submenu's "● " marker follows the override; unavailable
+    engines gray out; callbacks set the module override."""
+    from cheerleader.gui.app import _mark_engine_items
+    from cheerleader.gui.const import (
+        MI_ENGINE_AUTO,
+        MI_ENGINE_CAPSTONE,
+        MI_ENGINE_OBJDUMP,
+    )
+
+    app = GuiApp()
+    build_shell(app)
+    assert dpg.get_item_label(MI_ENGINE_AUTO) == "● Auto"
+    assert dpg.get_item_label(MI_ENGINE_CAPSTONE) == "Capstone"
+    # availability gating is stubbed for determinism
+    monkeypatch.setattr(
+        disasm_mod,
+        "engine_available",
+        lambda name: name == "capstone",
+    )
+    _mark_engine_items()
+    assert dpg.get_item_configuration(MI_ENGINE_AUTO)["enabled"] is True
+    assert dpg.get_item_configuration(MI_ENGINE_CAPSTONE)["enabled"] is True
+    assert dpg.get_item_configuration(MI_ENGINE_OBJDUMP)["enabled"] is False
+    # radio: clicking objdump moves the marker (bypasses its disabled state
+    # by invoking the callback directly — headless menus don't route clicks)
+    dpg.get_item_callback(MI_ENGINE_OBJDUMP)()
+    assert engine_override() == "objdump"
+    assert dpg.get_item_label(MI_ENGINE_OBJDUMP) == "● objdump"
+    assert dpg.get_item_label(MI_ENGINE_AUTO) == "Auto"
+    assert dpg.get_item_label(MI_ENGINE_CAPSTONE) == "Capstone"
+    dpg.get_item_callback(MI_ENGINE_AUTO)()
+    assert engine_override() == "auto"
+    assert dpg.get_item_label(MI_ENGINE_AUTO) == "● Auto"
 
 
 def test_bytes_text_truncates_and_marks() -> None:
@@ -351,7 +438,9 @@ def test_open_auto_disassembles_text(dpg_context, tmp_path) -> None:
     assert len(ctl.grid.instrs()) == 64  # the 64 NOPs, capstone-disassembled
     assert ctl.grid.instrs()[0].addr == BASE
     assert ctl.call_graph is not None
-    assert dpg.get_value(tool.status_tag) == ("__TEXT,__text  64 instructions")
+    assert dpg.get_value(tool.status_tag) == (
+        "__TEXT,__text  64 instructions  c → call flow   f → cfg"
+    )
     assert isinstance(tool, Tool) and tool.tick is not None
 
 
