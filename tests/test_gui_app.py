@@ -19,14 +19,18 @@ pytest.importorskip("dearpygui")
 import dearpygui.dearpygui as dpg
 
 from cheerleader.gui.app import (
+    DISASM_ITEMS,
     DLG_OPEN,
     MENU_TAG,
+    MI_DISASM,
     MI_EDITOR,
+    MI_SEGMENTS,
     SHELL_STATUS,
     SHELL_STATUS_BAR,
     WIN_TAG,
     GuiApp,
     build_shell,
+    find_inspector_tool,
     open_compare,
     open_editor,
 )
@@ -54,6 +58,11 @@ def _error_popups() -> list[str]:
     ]
 
 
+def _popup_message(tag: str) -> str:
+    """An ErrorPopup's message (its first child is the wrapped text)."""
+    return dpg.get_value(dpg.get_item_children(tag)[1][0])
+
+
 def _menu_labels() -> list[str]:
     items = dpg.get_item_children(MENU_TAG)[1]  # slot 1: the "Tools" menu
     labels: list[str] = []
@@ -76,6 +85,32 @@ def _menu_item(label: str):
     return None
 
 
+def _macho_minimal() -> bytes:
+    """A structurally valid, empty 64-bit Mach-O (arm64, no load commands)."""
+    import struct
+
+    return b"\xcf\xfa\xed\xfe" + struct.pack(
+        "<IIIIIII",
+        0x0100000D,  # cputype: arm64
+        0,  # cpusubtype
+        2,  # filetype: MH_EXECUTE
+        0,  # ncmds
+        0,  # sizeofcmds
+        0,  # flags
+        0,  # reserved
+    )
+
+
+def _pick_file(app: GuiApp, path) -> None:
+    """Drive File → Open File… and settle its background parse."""
+    dpg.get_item_callback(DLG_OPEN)(DLG_OPEN, {"selections": {"file_1": str(path)}})
+    worker = app._parse_worker
+    if worker is not None and worker.thread is not None:
+        worker.thread.join(timeout=10.0)
+    for event in app.bridge.drain():
+        app.dispatch(event)
+
+
 def test_build_shell_minimal(dpg_context) -> None:
     app = GuiApp()
     build_shell(app)
@@ -85,9 +120,19 @@ def test_build_shell_minimal(dpg_context) -> None:
         "File",
         "Open File…",
         "Quit",
+        "Disassembler",
+        "Disassembly…",
+        "Segments…",
+        "Sections…",
+        "Imports…",
+        "Symbols…",
+        "Exports…",
+        "Fixups…",
         "Tools",
         "Hex Editor…",
         "Hex Compare…",
+        "About",
+        "Info"
     ]
     # File → Open File… dialog exists, hidden until the menu shows it.
     assert dpg.does_item_exist(DLG_OPEN)
@@ -96,6 +141,10 @@ def test_build_shell_minimal(dpg_context) -> None:
     # Hex Editor… starts grayed out — no file loaded yet.
     assert dpg.get_item_configuration(MI_EDITOR)["enabled"] is False
     assert app.current_file is None
+    # Every Disassembler item starts grayed out — no binary parsed yet.
+    for tag in DISASM_ITEMS:
+        assert dpg.get_item_configuration(tag)["enabled"] is False
+    assert app.current_info is None
     # Bottom bar exists but stays hidden until a file is loaded.
     assert dpg.does_item_exist(SHELL_STATUS_BAR)
     assert dpg.get_item_configuration(SHELL_STATUS_BAR)["show"] is False
@@ -480,3 +529,129 @@ def test_error_popup_dismisses(dpg_context) -> None:
     assert dpg.does_item_exist(popup.TAG)
     popup.close()
     assert not dpg.does_item_exist(popup.TAG)
+
+
+# ── disassembler shell plumbing (plan v3, D1) ─────────────────────────────────
+
+
+def test_open_file_parses_binary_and_enables_disasm(dpg_context, tmp_path) -> None:
+    """A supported binary parses in the background; the menu un-grays."""
+    path = tmp_path / "macho.bin"
+    path.write_bytes(_macho_minimal())
+    app = GuiApp()
+    build_shell(app)
+    _pick_file(app, path)
+    assert app.current_info is not None
+    assert app.current_info.path == str(path)
+    assert app.current_info.error is None
+    for tag in DISASM_ITEMS:
+        assert dpg.get_item_configuration(tag)["enabled"] is True
+    assert app._parse_worker is None  # settled
+    # D3: a valid binary auto-opens the Disassembly view (focus-guarded).
+    assert len(app.tools) == 1
+    assert app.tools[0].controller.view_kind == "disasm"
+    assert len(_error_popups()) == 0
+
+
+def test_open_file_garbage_pops_error_disasm_stays_grayed(
+    dpg_context, tmp_path
+) -> None:
+    """An unrecognized file keeps the hex flow live but grays the menu."""
+    path = tmp_path / "raw.bin"
+    path.write_bytes(DATA)
+    app = GuiApp()
+    build_shell(app)
+    _pick_file(app, path)
+    # Hex flow unaffected (current_file + bottom bar + editor item).
+    assert app.current_file == str(path)
+    assert dpg.get_item_configuration(MI_EDITOR)["enabled"] is True
+    assert dpg.get_item_configuration(SHELL_STATUS_BAR)["show"] is True
+    assert dpg.get_value(SHELL_STATUS) == str(path)
+    # …but no binary model and the Disassembler menu stays grayed.
+    assert app.current_info is None
+    for tag in DISASM_ITEMS:
+        assert dpg.get_item_configuration(tag)["enabled"] is False
+    popups = _error_popups()
+    assert len(popups) == 1
+    message = _popup_message(popups[0])
+    assert "Cannot disassemble" in message
+    assert str(path) in message
+
+
+def test_reopen_file_replaces_and_clears_current_info(dpg_context, tmp_path) -> None:
+    """good → garbage → good: current_info tracks the latest pick."""
+    a = tmp_path / "a.bin"
+    g = tmp_path / "g.bin"
+    b = tmp_path / "b.bin"
+    a.write_bytes(_macho_minimal())
+    g.write_bytes(DATA)
+    b.write_bytes(_macho_minimal())
+    app = GuiApp()
+    build_shell(app)
+    _pick_file(app, a)
+    assert app.current_info is not None and app.current_info.path == str(a)
+    _pick_file(app, g)
+    assert app.current_info is None
+    for tag in DISASM_ITEMS:
+        assert dpg.get_item_configuration(tag)["enabled"] is False
+    _pick_file(app, b)
+    assert app.current_info is not None and app.current_info.path == str(b)
+    for tag in DISASM_ITEMS:
+        assert dpg.get_item_configuration(tag)["enabled"] is True
+
+
+def test_superseded_parse_dropped_by_worker_identity(dpg_context, tmp_path) -> None:
+    """Two rapid picks: only the latest parse's event reaches the shell."""
+    a = tmp_path / "a.bin"
+    b = tmp_path / "b.bin"
+    a.write_bytes(_macho_minimal())
+    b.write_bytes(_macho_minimal())
+    app = GuiApp()
+    build_shell(app)
+    # Pick twice without settling: two parse workers now exist.
+    dpg.get_item_callback(DLG_OPEN)(DLG_OPEN, {"selections": {"file_1": str(a)}})
+    worker_a = app._parse_worker
+    dpg.get_item_callback(DLG_OPEN)(DLG_OPEN, {"selections": {"file_1": str(b)}})
+    worker_b = app._parse_worker
+    assert worker_a is not None and worker_b is not None
+    assert worker_a is not worker_b
+    worker_a.thread.join(timeout=10.0)
+    worker_b.thread.join(timeout=10.0)
+    for event in app.bridge.drain():
+        app.dispatch(event)  # identity check drops worker_a's stale event
+    assert app._parse_worker is None
+    assert app.current_info is not None
+    assert app.current_info.path == str(b)
+
+
+def test_inspector_menu_items_inert_without_file(dpg_context) -> None:
+    """D1: with no file loaded, even a fired inspector callback returns
+    early (D2 view-opening is covered in tests/test_gui_views.py)."""
+    app = GuiApp()
+    build_shell(app)
+    dpg.get_item_callback(MI_SEGMENTS)()
+    dpg.get_item_callback(MI_DISASM)()
+    assert app.tools == []
+    assert len(_error_popups()) == 0
+
+
+def test_find_inspector_tool_matches_kind_and_path(dpg_context) -> None:
+    """The focus guard matches (view_kind, path) across open tools."""
+    app = GuiApp()
+    app.tools.append(
+        SimpleNamespace(controller=SimpleNamespace(view_kind="segments", path="/x/a"))
+    )
+    app.tools.append(
+        SimpleNamespace(controller=SimpleNamespace(view_kind="symbols", path="/x/a"))
+    )
+    app.tools.append(
+        SimpleNamespace(controller=SimpleNamespace(view_kind="segments", path="/x/b"))
+    )
+    assert find_inspector_tool(app, "segments", "/x/a") is app.tools[0]
+    assert find_inspector_tool(app, "symbols", "/x/a") is app.tools[1]
+    assert find_inspector_tool(app, "segments", "/x/b") is app.tools[2]
+    assert find_inspector_tool(app, "exports", "/x/a") is None
+    assert find_inspector_tool(app, "segments", "/x/zzz") is None
+    # Tools without the inspector attributes (e.g. hex editors) never match.
+    app.tools.append(SimpleNamespace(controller=object()))
+    assert find_inspector_tool(app, "", "") is None

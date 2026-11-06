@@ -23,31 +23,89 @@ from __future__ import annotations
 
 import argparse
 import os
+import struct
 import subprocess
 import sys
 import tempfile
+
+NOP = b"\x1f\x20\x03\xd5"  # arm64 nop — the fixture's __text payload
 
 CHILD_MAIN = "from cheerleader.gui import main; main()"
 
 
 def _write_inputs(tmp: str) -> tuple[str, str]:
+    # a: valid minimal Mach-O (one LC_SEGMENT_64/__text) + payload — the
+    # editor flow's pick exercises the background binary parse and the D2
+    # table views get a real segment row (plan v3, D1+D2).
     a = os.path.join(tmp, "a.bin")
     b = os.path.join(tmp, "b.bin")
+    header = b"\xcf\xfa\xed\xfe" + struct.pack(
+        "<IIIIIII",
+        0x0100000C,  # cputype: arm64 (0x0100000D would be arm64e — unmapped)
+        0,  # cpusubtype
+        2,  # filetype: MH_EXECUTE
+        1,  # ncmds
+        152,  # sizeofcmds: one LC_SEGMENT_64 + one section
+        0,  # flags
+        0,  # reserved
+    )
+    segment = (
+        struct.pack("<II", 0x19, 152)
+        + b"__TEXT".ljust(16, b"\x00")
+        + struct.pack(
+            "<QQQQIIII",
+            0x100000000,  # vmaddr
+            0x1000,  # vmsize
+            0,  # fileoff
+            0x1000,  # filesize
+            5,  # maxprot r-x
+            5,  # initprot r-x
+            1,  # nsects
+            0,  # flags
+        )
+    )
+    section = (
+        b"__text".ljust(16, b"\x00")
+        + b"__TEXT".ljust(16, b"\x00")
+        + struct.pack(
+            "<QQIIIIIIII",
+            0x100000000,  # addr
+            0x100,  # size
+            0xB8,  # offset: 32-byte header + 152-byte load commands (184)
+            3,  # align (2^3)
+            0,  # reloff
+            0,  # nreloc
+            0,  # flags
+            0,  # reserved1
+            0,  # reserved2
+            0,  # reserved3
+        )
+    )
     with open(a, "wb") as fh:
-        fh.write(bytes(range(256)))
+        fh.write(header + segment + section + NOP * 64)
     with open(b, "wb") as fh:
         fh.write(bytes((i + 1) % 256 for i in range(256)))
     return a, b
 
 
 def _join_worker(app) -> None:
-    """Join every tool's in-flight worker (compare scan) and drain events."""
+    """Join every tool's in-flight worker, then dispatch drained events."""
     for tool in app.tools:
         worker = getattr(tool.controller, "busy", None)
         worker = worker.worker if worker else None
         if worker is not None and worker.thread is not None:
             worker.thread.join(timeout=10.0)
-    app.bridge.drain()
+    for event in app.bridge.drain():
+        app.dispatch(event)
+
+
+def _settle_parse(app) -> None:
+    """Join the shell's Open File… parse worker and dispatch its event."""
+    worker = app._parse_worker
+    if worker is not None and worker.thread is not None:
+        worker.thread.join(timeout=10.0)
+    for event in app.bridge.drain():
+        app.dispatch(event)
 
 
 def headless_checks() -> None:
@@ -82,12 +140,59 @@ def headless_checks() -> None:
             assert dpg.get_item_configuration(MI_EDITOR)["enabled"] is True
             assert dpg.get_item_configuration(SHELL_STATUS_BAR)["show"] is True
             assert dpg.get_value(SHELL_STATUS) == a
+            # a is a valid Mach-O: the background parse un-grays the
+            # Disassembler menu (plan v3 D1) and auto-opens the Disassembly
+            # view (plan v3 D3).
+            _settle_parse(app)
+            from cheerleader.gui.app import DISASM_ITEMS
+
+            assert app.current_info is not None
+            assert app.current_info.path == a
+            for tag in DISASM_ITEMS:
+                assert dpg.get_item_configuration(tag)["enabled"] is True
+            assert len(app.tools) == 1
+            assert app.tools[0].controller.view_kind == "disasm"
             dpg.get_item_callback(MI_EDITOR)()
             app.tick()  # grid maintenance must be display-safe
             _join_worker(app)
+            # the auto-opened disassembly worker landed its __text decode
+            assert len(app.tools[0].controller.grid.instrs()) == 64
         finally:
             dpg.destroy_context()
         print("  ok  editor: open-file flow builds headless")
+
+        dpg.create_context()
+        try:
+            app = GuiApp()
+            build_shell(app)
+            # Disassembler menu → table views (plan v3 D2): menu callbacks
+            # open floating read-only views over the parsed binary.
+            from cheerleader.gui.app import MI_SEGMENTS, MI_SYMBOLS
+
+            dpg.get_item_callback(DLG_OPEN)(DLG_OPEN, {"selections": {"file_1": a}})
+            _settle_parse(app)
+            assert app.current_info is not None
+            assert len(app.tools) == 1  # D3 auto-open; close it for a clean D2 run
+            app.close_tool(app.tools[0])
+            dpg.get_item_callback(MI_SEGMENTS)()
+            dpg.get_item_callback(MI_SYMBOLS)()
+            assert len(app.tools) == 2
+            seg_tool, sym_tool = app.tools
+            assert seg_tool.controller.view_kind == "segments"
+            seg_rows = dpg.get_item_children(seg_tool.controller.table_tag)[1]
+            assert len(seg_rows) == 1  # the fixture's __TEXT segment
+            assert "1 segments" in dpg.get_value(seg_tool.status_tag)
+            assert sym_tool.controller._filter == "no-stabs"  # TUI parity
+            # focus guard: re-firing Segments… must not duplicate
+            dpg.get_item_callback(MI_SEGMENTS)()
+            assert len(app.tools) == 2
+            app.tick()  # views must be tick-safe
+            for tool in list(app.tools):
+                app.close_tool(tool)
+            assert app.tools == []
+        finally:
+            dpg.destroy_context()
+        print("  ok  views: menu-open segments/symbols + focus guard headless")
 
         dpg.create_context()
         try:
