@@ -105,10 +105,9 @@ views in floating windows: **Segments, Sections, Imports, Symbols,
 Exports** and **Fixups** — columns and filters ported from the terminal
 UI's tabs (Symbols filters stabs/external/undefined; Fixups filters
 binds/rebases). The **Disassembly** window opens automatically on a
-successful open: an executable-section list on the left (TUI selection
-rule), a virtualized one-instruction-per-row grid (address, bytes,
-mnemonic, operands — multi-GB sections scroll as smoothly as small ones),
-and `h` to flip the right pane to a hex view of the section bytes.
+successful open: an executable-section dropdown at the top (TUI selection
+rule) and a virtualized one-instruction-per-row grid (address, bytes,
+mnemonic, operands — multi-GB sections scroll as smoothly as small ones).
 Disassembly runs in the background (`Esc` cancels; capstone is used when
 importable, else `objdump`). Binary parsing happens in the background;
 re-opening a different file replaces the views' target while already-open
