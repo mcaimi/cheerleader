@@ -86,12 +86,14 @@ uv run cheerleader-gui
 ```
 
 The GUI takes **no CLI switches**: launching shows an empty window with a
-**Tools** menu bar. Open tools from there — `Tools → Hex Editor…` shows a
-file dialog and loads the pick in a floating editor window; `Tools → Hex
-Compare…` opens a picker with a **Source file** and a **Target file** row
-(each an editable path with its own `Browse…` button) and opens a
-side-by-side diff on `Compare`; `Tools → Quit` (quite like `Ctrl+Q`) exits.
-Several tool windows can be open at once, each with its own status strip.
+**File** / **Tools** menu bar. `File → Open File…` (`Ctrl+O`) loads a file —
+once loaded, the main window shows a bottom bar with the file's path, and
+`Tools → Hex Editor…` (grayed out until then) displays it in a floating
+editor window. `Tools → Hex Compare…` opens a picker with
+a **Source file** and a **Target file** row (each an editable path with its
+own `Browse…` button) and opens a side-by-side diff on `Compare`;
+`File → Quit` (quite like `Ctrl+Q`) exits. Several tool windows can be
+open at once, each with its own status strip.
 
 Like the terminal UI, files are read on demand — multi-GB files open
 instantly — and searches, saves and diff comparisons stream in the
@@ -103,6 +105,7 @@ sanity check (live part needs a display).
 
 | Key | Action |
 | --- | --- |
+| `Ctrl+O` | Open a file (enables `Tools → Hex Editor…`) |
 | `Ctrl+Q` | Quit (one aggregate confirmation when any window has unsaved edits) |
 | ←→↑↓ · PgUp/PgDn · Home/End · Ctrl+Home/End | Move the cursor (editor) or scroll both panes (compare); clicking a byte selects it |
 | hex digits | Type over the cursor — two digits commit and advance; `u` undoes |
@@ -515,7 +518,7 @@ src/cheerleader/
 │   └── highlight.py         # Syntax highlighting for disassembly
 ├── gui/                     # Optional Dear PyGui front-end ([gui] extra)
 │   ├── __init__.py          # cheerleader-gui entry point (no CLI switches)
-│   ├── app.py               # Shell: Tools menu, floating tool windows, dispatch
+│   ├── app.py               # Shell: File/Tools menus, tool windows, dispatch
 │   ├── hexgrid.py           # Virtualized hex + ASCII grid widget
 │   ├── editor.py            # Hex editor tool controller
 │   ├── compare.py           # Side-by-side hex compare tool controller

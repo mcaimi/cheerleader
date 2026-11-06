@@ -21,9 +21,19 @@ STATUS_RESERVE = 36
 WIN_TAG = "gui-main-window"
 MENU_TAG = "gui-menubar"
 
-# Shell-level open-file dialog (shown from the Tools menu); the compare
-# picker owns its two file dialogs privately (see dialogs.CompareOpenDialog).
-DLG_EDITOR = "gui-dlg-open-editor"
+# Shell bottom bar: shows the loaded file's path once File → Open File…
+# succeeds. The filler child reserves the area above it (same negative-
+# height pattern as the tool windows' status strips).
+SHELL_FILL = "gui-shell-fill"
+SHELL_STATUS_BAR = "gui-shell-status-bar"
+SHELL_STATUS = "gui-shell-status"
+
+# Shell-level file dialog (File → Open File…). The compare picker owns its
+# two file dialogs privately (see dialogs.CompareOpenDialog).
+DLG_OPEN = "gui-dlg-open-file"
+
+# Tools menu items that change enabled-state at runtime.
+MI_EDITOR = "gui-mi-hex-editor"
 
 # Floating tool windows. Tags are namespaced per tool:
 # gui-tool-{ns} / gui-tool-{ns}-content / gui-tool-{ns}-status.

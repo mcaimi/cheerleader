@@ -2,10 +2,11 @@
 Dear PyGui application shell for the cheerleader hex UI.
 
 ``cheerleader-gui`` takes no CLI switches: launching shows an empty shell
-window with a **Tools** menu bar; ``Tools → Hex Editor…`` opens a file
-dialog and ``Tools → Hex Compare…`` a two-file picker (Source/Target);
-tools show in **floating windows** — several may be open at once, each
-with its own status strip.
+window with a **File** / **Tools** menu bar. ``File → Open File…`` (Ctrl+O)
+loads a file; ``Tools → Hex Editor…`` — grayed out until a file is loaded —
+displays it in a floating editor window, and ``Tools → Hex Compare…`` opens
+a two-file picker (Source/Target). Tools show in **floating windows** —
+several may be open at once, each with its own status strip.
 
 Frame loop::
 
@@ -37,15 +38,19 @@ from typing import Protocol
 from cheerleader.gui.const import (
     COMPARE_WIN_H,
     COMPARE_WIN_W,
-    DLG_EDITOR,
+    DLG_OPEN,
     EDITOR_WIN_H,
     EDITOR_WIN_W,
     FONT_CANDIDATES,
     FONT_ENV_VAR,
     FONT_SIZE,
     MENU_TAG,
+    MI_EDITOR,
     MIN_VIEWPORT_H,
     MIN_VIEWPORT_W,
+    SHELL_FILL,
+    SHELL_STATUS,
+    SHELL_STATUS_BAR,
     SLIDER_RESERVE,
     STATUS_RESERVE,
     TOOL_MIN_H,
@@ -120,6 +125,10 @@ class GuiApp:
         self.tools: list[Tool] = []
         self._quit_dlg: ConfirmDialog | None = None
         self._ns_counter = itertools.count(1)
+        # File loaded via File → Open File… (enables Tools → Hex Editor…);
+        # None until the first successful open. Closing an editor window
+        # does not unload it.
+        self.current_file: str | None = None
 
     def next_ns(self) -> str:
         """Unique per-app namespace for a new tool's tags/registries."""
@@ -150,7 +159,7 @@ class GuiApp:
 
     def request_quit(self) -> None:
         """
-        Quit the app — the funnel for Ctrl+Q and the Tools → Quit item.
+        Quit the app — the funnel for Ctrl+Q and the File → Quit item.
 
         With unsaved edits anywhere, show **one** aggregate confirmation
         instead of per-tool dialogs; answering No keeps the app up.
@@ -244,6 +253,16 @@ def _on_quit_key(app: GuiApp):
     def _handler(_sender, _app_data) -> None:
         if dpg.is_key_down(dpg.mvKey_LControl) or dpg.is_key_down(dpg.mvKey_RControl):
             app.request_quit()
+
+    return _handler
+
+
+def _on_open_key(app: GuiApp):
+    """Global Ctrl+O handler: show the File → Open File… dialog."""
+
+    def _handler(_sender, _app_data) -> None:
+        if dpg.is_key_down(dpg.mvKey_LControl) or dpg.is_key_down(dpg.mvKey_RControl):
+            dpg.configure_item(DLG_OPEN, show=True)
 
     return _handler
 
@@ -404,10 +423,42 @@ def _show_dialog(tag: int | str):
     return _open
 
 
-def _editor_picked(app: GuiApp, app_data) -> None:
+def _file_picked(app: GuiApp, app_data) -> None:
+    """File → Open File… pick: validate and hold as the shell's current file.
+
+    The file is *loaded* here (a `HexDocument` is constructed to fail fast
+    on vanished/unreadable paths, then released) — the editor itself is
+    displayed only when Tools → Hex Editor… is clicked, which stays grayed
+    out until a file has been picked successfully.
+    """
     path = picked_path(app_data)
-    if path:
-        open_editor(app, path)
+    if not path:
+        return  # OK with an empty selection — treat like a cancel
+    try:
+        doc = HexDocument(path)
+    except OSError as e:
+        ErrorPopup(f"Cannot open {path}:\n{e}")
+        return
+    doc.close()
+    app.current_file = path
+    dpg.configure_item(MI_EDITOR, enabled=True)
+    dpg.configure_item(SHELL_STATUS_BAR, show=True)
+    dpg.set_value(SHELL_STATUS, path)
+
+
+def _editor_menu_opener(app: GuiApp):
+    """Tools → Hex Editor… callback: open the editor for the loaded file.
+
+    The menu item is disabled (grayed) until a file has been loaded via
+    File → Open File…; `open_editor`'s duplicate-open guard focuses the
+    existing window when the file is already being edited.
+    """
+
+    def _open(*_args) -> None:
+        if app.current_file is not None:
+            open_editor(app, app.current_file)
+
+    return _open
 
 
 def _compare_dialog_opener(app: GuiApp):
@@ -428,14 +479,34 @@ def build_shell(app: GuiApp) -> int | str:
     """
     _build_theme()
     _build_font()
-    with dpg.window(tag=WIN_TAG), dpg.menu_bar(tag=MENU_TAG), dpg.menu(label="Tools"):
-        dpg.add_menu_item(label="Hex Editor…", callback=_show_dialog(DLG_EDITOR))
-        dpg.add_menu_item(label="Hex Compare…", callback=_compare_dialog_opener(app))
-        dpg.add_menu_item(label="Quit", callback=app.request_quit)
+    with dpg.window(tag=WIN_TAG), dpg.menu_bar(tag=MENU_TAG):
+        with dpg.menu(label="File"):
+            dpg.add_menu_item(label="Open File…", callback=_show_dialog(DLG_OPEN))
+            dpg.add_menu_item(label="Quit", callback=app.request_quit)
+        with dpg.menu(label="Tools"):
+            dpg.add_menu_item(
+                label="Hex Editor…",
+                tag=MI_EDITOR,
+                enabled=False,
+                callback=_editor_menu_opener(app),
+            )
+            dpg.add_menu_item(
+                label="Hex Compare…", callback=_compare_dialog_opener(app)
+            )
 
-    # Open-file dialog (all-files filter + dict payload).
+    # Bottom bar: hidden until a file is loaded via File → Open File…; the
+    # filler child pins the bar to the bottom of the (resizable) window.
+    # (Explicit parents: the context stack is empty outside the with block.)
+    dpg.add_child_window(
+        tag=SHELL_FILL, parent=WIN_TAG, border=False, height=-STATUS_RESERVE
+    )
+    with dpg.group(tag=SHELL_STATUS_BAR, horizontal=False, show=False, parent=WIN_TAG):
+        dpg.add_separator()
+        dpg.add_text("", tag=SHELL_STATUS)
+
+    # File → Open File… dialog (all-files filter + dict payload).
     dpg.add_file_dialog(
-        tag=DLG_EDITOR,
+        tag=DLG_OPEN,
         directory_selector=False,
         show=False,
         modal=True,
@@ -443,13 +514,14 @@ def build_shell(app: GuiApp) -> int | str:
         width=560,
         height=400,
         default_path=os.getcwd(),
-        callback=lambda _s, a: _editor_picked(app, a),
+        callback=lambda _s, a: _file_picked(app, a),
         cancel_callback=lambda *_a: None,
     )
-    add_all_files_filter(DLG_EDITOR)
+    add_all_files_filter(DLG_OPEN)
 
     with dpg.handler_registry(tag="gui-global-keys"):
         dpg.add_key_press_handler(key=dpg.mvKey_Q, callback=_on_quit_key(app))
+        dpg.add_key_press_handler(key=dpg.mvKey_O, callback=_on_open_key(app))
 
     return WIN_TAG
 

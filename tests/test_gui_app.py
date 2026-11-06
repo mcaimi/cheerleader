@@ -19,8 +19,11 @@ pytest.importorskip("dearpygui")
 import dearpygui.dearpygui as dpg
 
 from cheerleader.gui.app import (
-    DLG_EDITOR,
+    DLG_OPEN,
     MENU_TAG,
+    MI_EDITOR,
+    SHELL_STATUS,
+    SHELL_STATUS_BAR,
     WIN_TAG,
     GuiApp,
     build_shell,
@@ -64,18 +67,41 @@ def _menu_labels() -> list[str]:
 # ── shell ─────────────────────────────────────────────────────────────────────
 
 
+def _menu_item(label: str):
+    """Find a menu item by label across all menus (None when absent)."""
+    for menu in dpg.get_item_children(MENU_TAG)[1]:
+        for item in dpg.get_item_children(menu)[1]:
+            if dpg.get_item_label(item) == label:
+                return item
+    return None
+
+
 def test_build_shell_minimal(dpg_context) -> None:
     app = GuiApp()
     build_shell(app)
     assert dpg.does_item_exist(WIN_TAG)
     assert dpg.does_item_exist(MENU_TAG)
-    assert _menu_labels() == ["Tools", "Hex Editor…", "Hex Compare…", "Quit"]
-    # Pre-built open dialog exists, hidden until the menu shows it. The
-    # compare picker owns its two file dialogs privately (CompareOpenDialog).
-    assert dpg.does_item_exist(DLG_EDITOR)
-    assert dpg.get_item_configuration(DLG_EDITOR)["show"] is False
-    # Global Ctrl+Q registry is registered.
+    assert _menu_labels() == [
+        "File",
+        "Open File…",
+        "Quit",
+        "Tools",
+        "Hex Editor…",
+        "Hex Compare…",
+    ]
+    # File → Open File… dialog exists, hidden until the menu shows it.
+    assert dpg.does_item_exist(DLG_OPEN)
+    assert dpg.get_item_configuration(DLG_OPEN)["show"] is False
+    # The compare picker owns its two file dialogs privately.
+    # Hex Editor… starts grayed out — no file loaded yet.
+    assert dpg.get_item_configuration(MI_EDITOR)["enabled"] is False
+    assert app.current_file is None
+    # Bottom bar exists but stays hidden until a file is loaded.
+    assert dpg.does_item_exist(SHELL_STATUS_BAR)
+    assert dpg.get_item_configuration(SHELL_STATUS_BAR)["show"] is False
+    # Global key registry: Ctrl+Q quit + Ctrl+O open.
     assert dpg.does_item_exist("gui-global-keys")
+    assert len(dpg.get_item_children("gui-global-keys")[1]) == 2
     assert app.tools == []
 
 
@@ -88,13 +114,9 @@ def test_compare_menu_item_opens_picker(dpg_context) -> None:
     """Tools → Hex Compare… opens the two-file picker, not a file dialog."""
     app = GuiApp()
     build_shell(app)
-    items = dpg.get_item_children(MENU_TAG)[1]
-    for item in dpg.get_item_children(items[0])[1]:
-        if dpg.get_item_label(item) == "Hex Compare…":
-            dpg.get_item_callback(item)()
-            break
-    else:  # pragma: no cover - menu wiring asserted elsewhere
-        pytest.fail("Hex Compare… menu item not found")
+    item = _menu_item("Hex Compare…")
+    assert item is not None
+    dpg.get_item_callback(item)()
     pickers = [
         alias
         for w in dpg.get_windows()
@@ -108,6 +130,70 @@ def test_compare_menu_item_opens_picker(dpg_context) -> None:
 
 
 # ── open flows ────────────────────────────────────────────────────────────────
+
+
+def test_open_file_flow_enables_then_opens_editor(dpg_context, tmp_path) -> None:
+    """File → Open File… loads; Tools → Hex Editor… (now enabled) displays."""
+    path = tmp_path / "sample.bin"
+    path.write_bytes(DATA)
+    app = GuiApp()
+    build_shell(app)
+    # Grayed-out item is inert even if something fired it.
+    dpg.get_item_callback(MI_EDITOR)()
+    assert app.tools == []
+    # Pick a file exactly as the file dialog's OK would.
+    dpg.get_item_callback(DLG_OPEN)(DLG_OPEN, {"selections": {"file_1": str(path)}})
+    assert app.current_file == str(path)
+    assert dpg.get_item_configuration(MI_EDITOR)["enabled"] is True
+    # Bottom bar appears with the loaded file's full path.
+    assert dpg.get_item_configuration(SHELL_STATUS_BAR)["show"] is True
+    assert dpg.get_value(SHELL_STATUS) == str(path)
+    assert app.tools == []  # loaded, not displayed yet
+    dpg.get_item_callback(MI_EDITOR)()
+    assert len(app.tools) == 1
+    assert app.tools[0].controller.doc.path == str(path)
+    # Clicking again focuses the existing editor (no second window).
+    dpg.get_item_callback(MI_EDITOR)()
+    assert len(app.tools) == 1
+
+
+def test_open_file_missing_shows_error_and_stays_disabled(
+    dpg_context, tmp_path
+) -> None:
+    app = GuiApp()
+    build_shell(app)
+    dpg.get_item_callback(DLG_OPEN)(
+        DLG_OPEN, {"selections": {"file_1": str(tmp_path / "vanished.bin")}}
+    )
+    assert app.current_file is None
+    assert dpg.get_item_configuration(MI_EDITOR)["enabled"] is False
+    assert dpg.get_item_configuration(SHELL_STATUS_BAR)["show"] is False
+    assert len(_error_popups()) == 1
+
+
+def test_open_file_updates_bottom_bar(dpg_context, tmp_path) -> None:
+    """A second Open File… pick replaces the bar's path (and the editor
+    item's target); an editor opened for the first file stays open."""
+    a = tmp_path / "a.bin"
+    b = tmp_path / "b.bin"
+    for p in (a, b):
+        p.write_bytes(DATA)
+    app = GuiApp()
+    build_shell(app)
+    pick = lambda p: dpg.get_item_callback(DLG_OPEN)(
+        DLG_OPEN, {"selections": {"file_1": str(p)}}
+    )
+    pick(a)
+    dpg.get_item_callback(MI_EDITOR)()
+    assert len(app.tools) == 1
+    pick(b)
+    assert dpg.get_value(SHELL_STATUS) == str(b)
+    assert app.current_file == str(b)
+    assert len(app.tools) == 1  # the first editor window is untouched
+    dpg.get_item_callback(MI_EDITOR)()  # now opens b in a second window
+    assert len(app.tools) == 2
+    assert app.tools[0].controller.doc.path == str(a)  # old editor intact
+    assert app.tools[1].controller.doc.path == str(b)
 
 
 def test_open_editor_flow(dpg_context, tmp_path) -> None:

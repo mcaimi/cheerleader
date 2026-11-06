@@ -54,7 +54,7 @@ def headless_checks() -> None:
     """Build the shell and drive the open flows in throwaway DPG contexts."""
     import dearpygui.dearpygui as dpg
 
-    from cheerleader.gui.app import GuiApp, build_shell, open_compare, open_editor
+    from cheerleader.gui.app import DLG_OPEN, GuiApp, build_shell, open_compare
 
     with tempfile.TemporaryDirectory() as tmp:
         a, b = _write_inputs(tmp)
@@ -72,12 +72,22 @@ def headless_checks() -> None:
         try:
             app = GuiApp()
             build_shell(app)
-            open_editor(app, a)
+            # Drive the real menu path: File → Open File… pick loads the file
+            # and enables Tools → Hex Editor…; clicking it opens the editor.
+            from cheerleader.gui.app import MI_EDITOR
+            from cheerleader.gui.const import SHELL_STATUS, SHELL_STATUS_BAR
+
+            dpg.get_item_callback(DLG_OPEN)(DLG_OPEN, {"selections": {"file_1": a}})
+            assert app.current_file == a
+            assert dpg.get_item_configuration(MI_EDITOR)["enabled"] is True
+            assert dpg.get_item_configuration(SHELL_STATUS_BAR)["show"] is True
+            assert dpg.get_value(SHELL_STATUS) == a
+            dpg.get_item_callback(MI_EDITOR)()
             app.tick()  # grid maintenance must be display-safe
             _join_worker(app)
         finally:
             dpg.destroy_context()
-        print("  ok  editor: open_editor flow builds headless")
+        print("  ok  editor: open-file flow builds headless")
 
         dpg.create_context()
         try:
