@@ -109,10 +109,23 @@ successful open: an executable-section dropdown at the top (TUI selection
 rule) and a virtualized one-instruction-per-row grid (address, bytes,
 mnemonic, operands — multi-GB sections scroll as smoothly as small ones).
 Disassembly runs in the background (`Esc` cancels; capstone is used when
-importable, else `objdump`). Binary parsing happens in the background;
-re-opening a different file replaces the views' target while already-open
-windows keep their snapshot. Call-flow / CFG windows and a Strings view
-are being added incrementally — see `docs/gui-disasm-plan.md`.
+importable, else `objdump`). Press `c` on a selected row to open the
+**call flow** tree for the enclosing function (click a callee/caller to
+drill in, `b` to go back) or `f` to open its **CFG** — a read-only node
+graph (dpg Node Editor): one block per node with its instructions, one
+colored link per jump/fall-through edge (fall/cond/jump/ret/indirect),
+back-edge and external-target annotations, a minimap for large graphs;
+nodes are fixed and the topology can't be broken. Both are independent
+floating windows that keep their snapshot even if the Disassembly window
+closes. **Strings** scans the binary for printable runs (≥ 4 chars) on a
+background worker and lists them with offset / address / section — the
+search box filters live as you type, and clicking a row jumps to that
+offset in an already-open hex editor. The **Disassembler ▸ Engine**
+submenu switches the disassembly engine (Auto picks capstone when
+importable, else `objdump`; a forced engine that isn't installed fails
+soft) — it affects newly opened views. Binary parsing happens in the
+background; re-opening a different file replaces the views' target while
+already-open windows keep their snapshot.
 
 Like the terminal UI, files are read on demand — multi-GB files open
 instantly — and searches, saves and diff comparisons stream in the
@@ -134,7 +147,10 @@ sanity check (live part needs a display).
 | `/` | Go to an offset or search hex bytes / text; `n` / `N` next / previous match (wraps) |
 | `n` / `p` | Compare: jump to the next / previous difference |
 | `r` | Reload the file(s) from disk (compare mode restarts the diff scan) |
-| `Esc` | Cancel a running search / comparison / dialog |
+| `c` | Disassembly: open the call-flow tree for the cursor's function |
+| `f` | Disassembly: open the CFG block view for the cursor's function |
+| `b` | Call-flow window: go back one drill-in level (at the root: close) |
+| `Esc` | Cancel a running search / comparison / dialog / string extraction, or close a call-flow / CFG window |
 | window `X` | Close the tool window (asks before discarding unsaved edits) |
 
 Unsaved bytes are shown in yellow; in compare mode matching bytes are green
