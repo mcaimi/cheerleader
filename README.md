@@ -71,6 +71,55 @@ the next / previous difference.
 
 ---
 
+## GUI (optional)
+
+A native [Dear PyGui](https://github.com/hoffstadt/DearPyGui) front-end for
+the hex modes, shipped as an optional extra so the default toolchain never
+pulls it in:
+
+```sh
+uv sync --extra gui            # or: uv pip install 'cheerleader[gui]'
+```
+
+```sh
+uv run cheerleader-gui
+```
+
+The GUI takes **no CLI switches**: launching shows an empty window with a
+**Tools** menu bar. Open tools from there — `Tools → Hex Editor…` shows a
+file dialog and loads the pick in a floating editor window; `Tools → Hex
+Compare…` opens a picker with a **Source file** and a **Target file** row
+(each an editable path with its own `Browse…` button) and opens a
+side-by-side diff on `Compare`; `Tools → Quit` (quite like `Ctrl+Q`) exits.
+Several tool windows can be open at once, each with its own status strip.
+
+Like the terminal UI, files are read on demand — multi-GB files open
+instantly — and searches, saves and diff comparisons stream in the
+background (`Esc` cancels). `make gui-smoke` boots the shell and drives the
+open flows headlessly, plus a watchdog launch of the window as a quick
+sanity check (live part needs a display).
+
+### GUI keybindings
+
+| Key | Action |
+| --- | --- |
+| `Ctrl+Q` | Quit (one aggregate confirmation when any window has unsaved edits) |
+| ←→↑↓ · PgUp/PgDn · Home/End · Ctrl+Home/End | Move the cursor (editor) or scroll both panes (compare); clicking a byte selects it |
+| hex digits | Type over the cursor — two digits commit and advance; `u` undoes |
+| `Enter` | Edit at the cursor: `de ad be ef`, `0x7f`, `#127` (decimal) or `"text` |
+| `u` | Undo the last edit |
+| `s` | Save via a file dialog (background write with progress) |
+| `/` | Go to an offset or search hex bytes / text; `n` / `N` next / previous match (wraps) |
+| `n` / `p` | Compare: jump to the next / previous difference |
+| `r` | Reload the file(s) from disk (compare mode restarts the diff scan) |
+| `Esc` | Cancel a running search / comparison / dialog |
+| window `X` | Close the tool window (asks before discarding unsaved edits) |
+
+Unsaved bytes are shown in yellow; in compare mode matching bytes are green
+and differing bytes red, exactly like the terminal UI.
+
+---
+
 ## Standalone build
 
 Build a single-file CLI that bundles the application **and** every dependency
@@ -452,14 +501,36 @@ src/cheerleader/
 │   ├── __init__.py
 │   ├── types.py             # Shared dataclasses (BinaryInfo, Section, Symbol, …)
 │   ├── disasm.py            # Format-agnostic disassembly + string extraction
-│   └── cfg.py               # Call graph + control flow graph builders
-└── tui/
+│   ├── cfg.py               # Call graph + control flow graph builders
+│   ├── objdump.py           # External objdump / llvm-objdump backend
+│   └── hexdoc.py            # Paged hex document, edit overlay, diff kernel
+├── tui/
+│   ├── __init__.py
+│   ├── app.py               # Textual App + top-level widgets
+│   ├── tabs.py              # One TabPane per data view
+│   ├── screens.py           # Modal screens (SlicePicker, CallFlow, CFG)
+│   ├── widgets.py           # Shared widget helpers
+│   ├── hexparse.py          # Hex edit/search expression parsing
+│   ├── hexrender.py         # Shared hex-row layout + rendering
+│   └── highlight.py         # Syntax highlighting for disassembly
+├── gui/                     # Optional Dear PyGui front-end ([gui] extra)
+│   ├── __init__.py          # cheerleader-gui entry point (no CLI switches)
+│   ├── app.py               # Shell: Tools menu, floating tool windows, dispatch
+│   ├── hexgrid.py           # Virtualized hex + ASCII grid widget
+│   ├── editor.py            # Hex editor tool controller
+│   ├── compare.py           # Side-by-side hex compare tool controller
+│   ├── dialogs.py           # Dialogs (edit, search, save, confirm, compare picker)
+│   ├── workers.py           # Background workers + UiBridge event queue
+│   └── const.py             # GUI constants
+├── agent/                   # Optional AI features (LLM integration)
+│   ├── __init__.py
+│   ├── agent.py             # LLM agent (langchain / deepagents)
+│   └── agent_settings.py    # .env configuration resolution
+└── util/
     ├── __init__.py
-    ├── app.py               # Textual App + top-level widgets
-    ├── tabs.py              # One TabPane per data view
-    ├── screens.py           # Modal screens (SlicePicker, CallFlow, CFG)
-    ├── widgets.py           # Shared widget helpers
-    └── highlight.py         # Syntax highlighting for disassembly
+    ├── json_parse.py        # JSON parsing helpers for env vars
+    ├── utils.py             # Misc helpers
+    └── uuids.py             # UUID utilities
 ```
 
 ### Format detection
@@ -689,17 +760,22 @@ Seeds a function address map from `N_SECT`-typed symbols and export entries, the
 
 Four-pass basic-block builder: (1) identify leaders from branch targets and post-branch instructions, (2) group instructions into `CFGBlock`s, (3) compute successor edges (`fall`, `cond`, `jump`, `ret`, `indirect`), (4) back-fill predecessor lists. The CFG screen renders blocks in BFS order from the entry block.
 
+### `hexdoc.HexDocument`
+
+Paged, lazily-read view of a file's bytes shared by the TUI and GUI hex views: 64 KiB pages read on demand (LRU-capped), a sparse overlay of pending edits (`{offset: byte}`), undo, save, and chunked background search with cancel/progress callbacks. The same module hosts the compare kernel: `compute_diff_blocks` (block-aligned differing offsets, 8-byte blocks) and `iter_diff` (streaming two-document diff) used by the side-by-side hex compare in both front-ends.
+
 ---
 
 ## Dependencies
 
-| Package    | Role                                                       |
-|------------|------------------------------------------------------------|
-| `textual`  | TUI framework (widgets, layout, events)                    |
-| `capstone` | Cross-platform disassembly engine (x86, ARM, ARM64, RISC-V)|
-| `rich`     | Rich text rendering (pulled in by textual)                 |
+| Package     | Role                                                        |
+|-------------|-------------------------------------------------------------|
+| `textual`   | TUI framework (widgets, layout, events)                     |
+| `capstone`  | Cross-platform disassembly engine (x86, ARM, ARM64, RISC-V) |
+| `rich`      | Rich text rendering (pulled in by textual)                  |
+| `dearpygui` | Optional native GUI front-end (`cheerleader[gui]` extra)    |
 
-The parser cores (`macho.py`, `elf.py`) use only Python stdlib (`struct`, `os`, `dataclasses`, `enum`). `capstone` is imported lazily inside `disassemble_section()` so all other features work even without it.
+The parser cores (`macho.py`, `elf.py`) use only Python stdlib (`struct`, `os`, `dataclasses`, `enum`). `capstone` is imported lazily inside `disassemble_section()` so all other features work even without it. `dearpygui` is an optional extra (`uv sync --extra gui`) — everything TUI-side runs without it.
 
 ---
 
