@@ -38,6 +38,7 @@ from cheerleader.gui.disasmgrid import DisasmGrid
 from cheerleader.gui.tooling import (
     ReadOnlyController,
     add_tool_menu,
+    arch_suffix,
     build_tool_window,
     ctrl_down,
     find_tool,
@@ -136,6 +137,16 @@ def pick_engine() -> str | None:
     return _ENGINE or None
 
 
+def engine_label() -> str:
+    """The engine choice as shown to the user: ``Auto (capstone)``,
+    ``objdump``, ``objdump (unavailable)``, ``Auto (none available)``."""
+    choice = engine_override()
+    engine = pick_engine()
+    if choice == "auto":
+        return f"Auto ({engine or 'none available'})"
+    return choice if engine else f"{choice} (unavailable)"
+
+
 def exec_sections(info: BinaryInfo) -> list[tuple[str, str]]:
     """Executable sections in TUI order: ``initprot & 0x4`` segments,
     skipping empty/unmapped sections (``size == 0 or offset == 0``)."""
@@ -193,8 +204,9 @@ class DisasmController(ReadOnlyController):
         self.grid = grid
         self.combo_tag = combo_tag
         self.ns = ns
-        self.view_kind = "disasm"  # focus-guard key (find_tool)
+        self.view_kind = "disasm"  # focus-guard keys (find_tool)
         self.path = info.path
+        self.slice_offset = info.slice_offset
         self.sections: list[tuple[str, str]] = []
         self._labels: list[str] = []  # combo items, parallel to sections
         self.call_graph: CallGraph | None = None
@@ -462,7 +474,7 @@ class DisasmController(ReadOnlyController):
         found = self._cursor_function()
         if found is not None:
             graph, func_name, _ = found
-            open_call_flow(self.app, self.path, graph, func_name)
+            open_call_flow(self.app, self.path, graph, func_name, info=self.info)
 
     def _open_cfg(self, *_args) -> None:
         """``f``: slice the cursor's function and open its CFG window."""
@@ -476,7 +488,7 @@ class DisasmController(ReadOnlyController):
             dpg.set_value(self.status_tag, "No instructions found for this function")
             return
         cfg = build_cfg(func_instrs, func_name, func_addr)
-        open_cfg(self.app, self.path, cfg)
+        open_cfg(self.app, self.path, cfg, info=self.info)
 
     def shutdown(self) -> None:
         super().shutdown()
@@ -497,12 +509,17 @@ def open_disassembly(app: GuiApp, path: str) -> None:
     info = app.current_info
     if info is None or info.path != path:
         return
-    existing = find_tool(app, view_kind="disasm", path=path)
+    existing = find_tool(
+        app, view_kind="disasm", path=path, slice_offset=info.slice_offset
+    )
     if existing is not None:
         focus_tool(existing)
         return
     ns, window, content, status_tag = build_tool_window(
-        app, f"Disassembly — {os.path.basename(path)}", DISASM_WIN_W, DISASM_WIN_H
+        app,
+        f"Disassembly — {os.path.basename(path)}{arch_suffix(info)}",
+        DISASM_WIN_W,
+        DISASM_WIN_H,
     )
     combo_tag = f"{ns}-section-combo"
     pane_tag = f"{ns}-gridpane"

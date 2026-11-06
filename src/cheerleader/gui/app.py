@@ -40,10 +40,13 @@ from __future__ import annotations
 
 import itertools
 import os
+import platform
 import sys
 from collections.abc import Callable
 
+from cheerleader.formats import detect_format
 from cheerleader.formats import parse as parse_binary
+from cheerleader.formats.macho import list_fat_slices
 from cheerleader.gui import disasm, strings, views
 from cheerleader.gui.compare import CompareController
 from cheerleader.gui.const import (
@@ -76,6 +79,8 @@ from cheerleader.gui.const import (
     SHELL_FILL,
     SHELL_STATUS,
     SHELL_STATUS_BAR,
+    SHELL_STATUS_RIGHT,
+    SLICE_MENU,
     SLIDER_RESERVE,
     SRC_URL,
     STATUS_RESERVE,
@@ -153,6 +158,35 @@ class GuiApp:
         self._pos_counter = itertools.count()
         self._font_base_scale = 1.0  # 0.5 when a 2x font is loaded (HiDPI)
         self._shortcuts_dlg: ShortcutsDialog | None = None
+        # Architecture slices of current_file: [(index, arch)] — more than
+        # one for a fat (universal) Mach-O — and the one being inspected.
+        self.current_slices: list[tuple[int, str]] = []
+        self.current_slice = 0
+        # Shown after the path in the bottom bar (e.g. why the Disassembler
+        # is unavailable); cleared whenever a file or slice is (re)loaded.
+        self.status_note = ""
+
+    @property
+    def is_fat(self) -> bool:
+        return len(self.current_slices) > 1
+
+    def select_slice(self, index: int) -> None:
+        """Inspect another slice of the current fat binary.
+
+        Windows of the previous slice stay open as snapshots; the new
+        slice is parsed in the background and opens its own Disassembly
+        view when done (a quick second switch supersedes the first parse).
+        """
+        if self.current_file is None or not self.is_fat or index == self.current_slice:
+            return
+        if index not in (i for i, _ in self.current_slices):
+            return
+        self.current_slice = index
+        self.current_info = None
+        self.status_note = ""
+        _set_disasm_enabled(False)
+        self._start_parse(self.current_file)
+        _refresh_slice_ui(self)
 
     def next_window_pos(self) -> list[int]:
         """Cascade position for the next tool window."""
@@ -257,9 +291,14 @@ class GuiApp:
         supersedes an in-flight one purely by handle identity.
         """
 
+        slice_index = self.current_slice  # Mach-O slice (fat files)
+
         def _job(_handle: WorkerHandle) -> None:
             try:
-                info = parse_binary(path)
+                if slice_index:
+                    info = parse_binary(path, slice_index=slice_index)
+                else:
+                    info = parse_binary(path)
             except Exception as e:  # noqa: BLE001 - defensive: parsers are
                 # non-fatal by design (they return .error); never crash the
                 # shell on a malformed file.
@@ -283,10 +322,8 @@ class GuiApp:
             # normal use, not an error.
             self.current_info = None
             _set_disasm_enabled(False)
-            dpg.set_value(
-                SHELL_STATUS,
-                f"{self.current_file}  │  Disassembler unavailable: {info.error}",
-            )
+            self.status_note = f"Disassembler unavailable: {info.error}"
+            _refresh_status(self)
             _refresh_landing(self)
             # Nothing to disassemble: show the bytes instead, so opening a
             # file always puts something on screen.
@@ -295,7 +332,7 @@ class GuiApp:
             return
         self.current_info = info
         _set_disasm_enabled(True)
-        _refresh_landing(self)
+        _refresh_slice_ui(self)
         # Plan v3 decision 4: a successful open shows the Disassembly view
         # in a new window (focus guard dedupes same-file re-opens).
         if self.current_file is not None:
@@ -551,15 +588,100 @@ def open_file(app: GuiApp, path: str) -> None:
     app.settings.add_recent(path)
     _refresh_recent_menu(app)
     app.current_file = path
+    app.current_slices = file_slices(path)
+    app.current_slice = default_slice(app.current_slices)
+    app.status_note = ""
     # The previous file's binary model no longer applies: gray the
     # Disassembler menu until this file's parse completes.
     app.current_info = None
     _set_disasm_enabled(False)
     dpg.configure_item(MI_EDITOR, enabled=True)
     dpg.configure_item(SHELL_STATUS_BAR, show=True)
-    dpg.set_value(SHELL_STATUS, path)
     app._start_parse(path)
+    _refresh_slice_ui(app)
+
+
+def file_slices(path: str) -> list[tuple[int, str]]:
+    """``(index, arch)`` per architecture slice of a Mach-O file (several
+    for a fat binary); ``[]`` for anything else."""
+    try:
+        if detect_format(path) != "macho":
+            return []
+        return list_fat_slices(path)
+    except (OSError, ValueError, IndexError):  # truncated / unreadable header
+        return []
+
+
+def default_slice(slices: list[tuple[int, str]]) -> int:
+    """The slice to inspect first: this machine's architecture — an exact
+    match (``arm64``), else a variant of it (``arm64e``) — else slice 0."""
+    native = platform.machine()
+    for i, arch in slices:
+        if arch == native:
+            return i
+    for i, arch in slices:
+        if arch.startswith(native):
+            return i
+    return slices[0][0] if slices else 0
+
+
+def _slice_label(index: int, arch: str) -> str:
+    return f"[{index}] {arch}"
+
+
+def _current_arch(app: GuiApp) -> str:
+    return dict(app.current_slices).get(app.current_slice, "")
+
+
+def _refresh_slice_ui(app: GuiApp) -> None:
+    """Everything showing the current slice: status bar, Slice submenu,
+    summary card."""
+    _refresh_status(app)
+    _refresh_slice_menu(app)
     _refresh_landing(app)
+
+
+def _refresh_status(app: GuiApp) -> None:
+    """Bottom bar: the file path (+ note) on the left; the architecture
+    being inspected and the disassembly engine on the right."""
+    if not dpg.does_item_exist(SHELL_STATUS) or app.current_file is None:
+        return
+    left = app.current_file
+    if app.status_note:
+        left += f"  │  {app.status_note}"
+    dpg.set_value(SHELL_STATUS, left)
+    dpg.set_value(SHELL_STATUS_RIGHT, status_right_text(app))
+
+
+def status_right_text(app: GuiApp) -> str:
+    """``arm64e  (slice 2 of 3)   │   engine: Auto (capstone)``."""
+    info = app.current_info
+    arch = info.arch if info is not None else _current_arch(app)
+    if not arch:
+        arch = "detecting…" if app._parse_worker is not None else "—"
+    if app.is_fat:
+        position = [i for i, _ in app.current_slices].index(app.current_slice)
+        arch += f"  (slice {position + 1} of {len(app.current_slices)})"
+    return f"{arch}   │   engine: {disasm.engine_label()}"
+
+
+def _refresh_slice_menu(app: GuiApp) -> None:
+    """Disassembler ▸ Slice: one radio item per slice (``● `` = current)."""
+    if not dpg.does_item_exist(SLICE_MENU):
+        return
+    dpg.delete_item(SLICE_MENU, children_only=True)
+    if not app.is_fat:
+        dpg.add_menu_item(
+            label="(single architecture)", enabled=False, parent=SLICE_MENU
+        )
+        return
+    for index, arch in app.current_slices:
+        mark = "● " if index == app.current_slice else ""
+        dpg.add_menu_item(
+            label=f"{mark}{_slice_label(index, arch)}",
+            parent=SLICE_MENU,
+            callback=lambda *_a, i=index: app.select_slice(i),
+        )
 
 
 def _set_disasm_enabled(enabled: bool) -> None:
@@ -588,13 +710,14 @@ def _inspector_menu_opener(app: GuiApp, kind: str):
     return _open
 
 
-def _engine_menu_pick(value: str):
+def _engine_menu_pick(app: GuiApp, value: str):
     """Disassembler ▸ Engine submenu callback factory: set the radio
-    choice and refresh the "● " markers."""
+    choice, refresh the "● " markers and the bottom bar."""
 
     def _pick(*_args) -> None:
         disasm.set_engine_override(value)
         _mark_engine_items()
+        _refresh_status(app)
 
     return _pick
 
@@ -685,6 +808,18 @@ def _landing_summary(app: GuiApp, path: str) -> None:
     except OSError:
         size = "?"
     dpg.add_text(f"{path}   ·   {size}", color=COL_DIM)
+    if app.is_fat:
+        labels = [_slice_label(i, arch) for i, arch in app.current_slices]
+        with dpg.group(horizontal=True):
+            dpg.add_text(f"Universal binary — {len(labels)} slices   ")
+            dpg.add_combo(
+                labels,
+                default_value=_slice_label(app.current_slice, _current_arch(app)),
+                width=200,
+                callback=lambda _s, label: app.select_slice(
+                    app.current_slices[labels.index(label)][0]
+                ),
+            )
     if info is not None:
         dpg.add_text(
             f"{info.file_type} · {info.arch} · {info.bits}-bit   —   "
@@ -780,13 +915,12 @@ def close_all_windows(app: GuiApp) -> None:
     for tool in list(app.tools):
         if tool.controller.dirty_edit_count() == 0:
             app.close_tool(tool)
-    if app.tools and dpg.does_item_exist(SHELL_STATUS):
+    if app.tools:
         n = len(app.tools)
-        dpg.configure_item(SHELL_STATUS_BAR, show=True)
-        dpg.set_value(
-            SHELL_STATUS,
-            f"{n} window{'s' if n != 1 else ''} with unsaved edits left open",
+        app.status_note = (
+            f"{n} window{'s' if n != 1 else ''} with unsaved edits left open"
         )
+        _refresh_status(app)
 
 
 def _info_opener(app: GuiApp):
@@ -847,6 +981,10 @@ def build_shell(app: GuiApp) -> int | str:
                     callback=_inspector_menu_opener(app, kind),
                 )
 
+            # Slice radio submenu: the architecture slice of a fat binary
+            # (rebuilt per open file; a placeholder item for thin files).
+            dpg.add_menu(label="Slice", tag=SLICE_MENU)
+
             # Engine radio submenu (plan v3 §5, D5): process-global
             # preference, applies to newly opened/re-run views — kept
             # enabled even without a loaded binary.
@@ -855,7 +993,7 @@ def build_shell(app: GuiApp) -> int | str:
                     dpg.add_menu_item(
                         label=label,
                         tag=tag,
-                        callback=_engine_menu_pick(value),
+                        callback=_engine_menu_pick(app, value),
                     )
             _mark_engine_items()
 
@@ -889,9 +1027,16 @@ def build_shell(app: GuiApp) -> int | str:
     dpg.add_child_window(
         tag=SHELL_FILL, parent=WIN_TAG, border=False, height=-STATUS_RESERVE
     )
+    # Path on the left; architecture + engine on the right: a fixed-width
+    # column fits (and re-fits) its text and hugs the right edge.
     with dpg.group(tag=SHELL_STATUS_BAR, horizontal=False, show=False, parent=WIN_TAG):
         dpg.add_separator()
-        dpg.add_text("", tag=SHELL_STATUS)
+        with dpg.table(header_row=False, policy=dpg.mvTable_SizingFixedFit):
+            dpg.add_table_column(width_stretch=True, init_width_or_weight=1.0)
+            dpg.add_table_column(width_fixed=True)
+            with dpg.table_row():
+                dpg.add_text("", tag=SHELL_STATUS)
+                dpg.add_text("", tag=SHELL_STATUS_RIGHT, color=COL_DIM)
 
     # File → Open File… dialog (all-files filter + dict payload).
     dpg.add_file_dialog(
@@ -927,7 +1072,7 @@ def build_shell(app: GuiApp) -> int | str:
 
     _refresh_recent_menu(app)
     _refresh_window_menu(app)
-    _refresh_landing(app)
+    _refresh_slice_ui(app)
     return WIN_TAG
 
 

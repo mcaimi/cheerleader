@@ -137,6 +137,8 @@ def test_build_shell_minimal(dpg_context) -> None:
         "Exports…",
         "Fixups…",
         "Strings…",
+        "Slice",
+        "(single architecture)",
         "Engine",
         "● Auto",
         "Capstone",

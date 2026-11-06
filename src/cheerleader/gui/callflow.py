@@ -39,12 +39,13 @@ from cheerleader.gui.theme import (
 )
 from cheerleader.gui.tooling import (
     ReadOnlyController,
+    arch_suffix,
     build_tool_window,
     find_tool,
     focus_tool,
 )
 from cheerleader.libs.cfg import CallGraph, ControlFlowGraph
-from cheerleader.libs.types import DisasmInstruction
+from cheerleader.libs.types import BinaryInfo, DisasmInstruction
 
 if TYPE_CHECKING:
     from cheerleader.gui.app import GuiApp
@@ -145,6 +146,7 @@ class CallFlowController(ReadOnlyController):
 
     view_kind = "callflow"
     keys_prefix = "callflow"
+    slice_offset = 0  # fat-binary slice of the snapshot (focus-guard key)
 
     def __init__(
         self,
@@ -244,6 +246,7 @@ class CFGController(ReadOnlyController):
 
     view_kind = "cfg"
     keys_prefix = "cfg"
+    slice_offset = 0  # fat-binary slice of the snapshot (focus-guard key)
 
     def __init__(
         self,
@@ -418,15 +421,29 @@ class CFGController(ReadOnlyController):
 # ── openers ──────────────────────────────────────────────────────────────────
 
 
-def open_call_flow(app: GuiApp, path: str, graph: CallGraph, func_name: str) -> None:
-    """Open the call-flow window for *func_name* (focus-guarded per function)."""
-    # focus guard per (kind, path, function)
-    existing = find_tool(app, view_kind="callflow", path=path, func_name=func_name)
+def open_call_flow(
+    app: GuiApp,
+    path: str,
+    graph: CallGraph,
+    func_name: str,
+    *,
+    info: BinaryInfo | None = None,
+) -> None:
+    """Open the call-flow window for *func_name* (focus-guarded per function
+    and, for fat binaries, per slice of *info*)."""
+    slice_offset = info.slice_offset if info is not None else 0
+    existing = find_tool(
+        app,
+        view_kind="callflow",
+        path=path,
+        func_name=func_name,
+        slice_offset=slice_offset,
+    )
     if existing is not None:
         focus_tool(existing)
         return
     ns, window, content, status_tag = build_tool_window(
-        app, f"Call flow — {func_name}", TABLE_WIN_W, TABLE_WIN_H
+        app, f"Call flow — {func_name}{arch_suffix(info)}", TABLE_WIN_W, TABLE_WIN_H
     )
     tree_tag = f"{ns}-tree"
     dpg.add_group(tag=tree_tag, parent=content)
@@ -440,18 +457,32 @@ def open_call_flow(app: GuiApp, path: str, graph: CallGraph, func_name: str) -> 
         tree_tag=tree_tag,
         ns=ns,
     )
+    controller.slice_offset = slice_offset
     controller.populate(func_name)
     app.register_tool(window, status_tag, controller)
 
 
-def open_cfg(app: GuiApp, path: str, cfg: ControlFlowGraph) -> None:
-    """Open the CFG window for *cfg* (focus-guarded per function)."""
-    existing = find_tool(app, view_kind="cfg", path=path, func_name=cfg.func_name)
+def open_cfg(
+    app: GuiApp, path: str, cfg: ControlFlowGraph, *, info: BinaryInfo | None = None
+) -> None:
+    """Open the CFG window for *cfg* (focus-guarded per function and, for
+    fat binaries, per slice of *info*)."""
+    slice_offset = info.slice_offset if info is not None else 0
+    existing = find_tool(
+        app,
+        view_kind="cfg",
+        path=path,
+        func_name=cfg.func_name,
+        slice_offset=slice_offset,
+    )
     if existing is not None:
         focus_tool(existing)
         return
     n = len(cfg.blocks)
-    title = f"CFG — {cfg.func_name}  ·  {n} block{'s' if n != 1 else ''}"
+    title = (
+        f"CFG — {cfg.func_name}{arch_suffix(info)}"
+        f"  ·  {n} block{'s' if n != 1 else ''}"
+    )
     ns, window, content, status_tag = build_tool_window(
         app, title, TABLE_WIN_W, TABLE_WIN_H
     )
@@ -463,5 +494,6 @@ def open_cfg(app: GuiApp, path: str, cfg: ControlFlowGraph) -> None:
         status_tag=status_tag,
         ns=ns,
     )
+    controller.slice_offset = slice_offset
     controller.build_editor(content)
     app.register_tool(window, status_tag, controller)

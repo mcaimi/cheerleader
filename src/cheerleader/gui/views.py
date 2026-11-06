@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from cheerleader.gui.const import TABLE_WIN_H, TABLE_WIN_W
 from cheerleader.gui.tooling import (
     ReadOnlyController,
+    arch_suffix,
     build_tool_window,
     find_tool,
     focus_tool,
@@ -382,9 +383,10 @@ class TableController(ReadOnlyController):
         self.search_tag = f"{ns}-search"
         self.filter_buttons: dict[str, int | str] = {}
         self._columns: list[int | str] = []  # column tags, in column order
-        # Focus-guard keys used by find_tool.
+        # Focus-guard keys used by find_tool (the slice of a fat binary too).
         self.view_kind = spec.kind
         self.path = info.path
+        self.slice_offset = info.slice_offset
         self._filter = spec.default_filter
         self._query = ""  # search text currently applied
         self._sort: tuple[int, bool] | None = None  # (column, descending)
@@ -586,7 +588,9 @@ def open_inspector(app: GuiApp, kind: str, path: str) -> None:
     info = app.current_info
     if spec is None or info is None or info.path != path:
         return
-    existing = find_tool(app, view_kind=kind, path=path)
+    existing = find_tool(
+        app, view_kind=kind, path=path, slice_offset=info.slice_offset
+    )
     if existing is not None:
         focus_tool(existing)
         return
@@ -595,7 +599,7 @@ def open_inspector(app: GuiApp, kind: str, path: str) -> None:
         lambda window, status_tag, ns: TableController(
             app, spec, info, window=window, status_tag=status_tag, ns=ns
         ),
-        f"{spec.title} — {os.path.basename(path)}",
+        f"{spec.title} — {os.path.basename(path)}{arch_suffix(info)}",
     )
     controller.refresh()
 

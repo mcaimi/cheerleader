@@ -94,8 +94,11 @@ File…, Compare two files…, your recent files) under a **File / View /
 Disassembler / Tools / Window / Help** menu bar. `File → Open File…`
 (`Ctrl+O`, or `File → Open Recent`) loads a file: the main window then
 shows a summary card (path, size, format · arch, segment/symbol counts)
-with buttons for the hex editor, disassembly, strings and compare. A file
-that isn't a Mach-O / ELF binary opens straight in the hex editor.
+with buttons for the hex editor, disassembly, strings and compare, and the
+bottom bar shows the file's path on the left and, on the right, the
+architecture being inspected (with the slice number for a fat binary) and
+the selected disassembly engine. A file that isn't a Mach-O / ELF binary
+opens straight in the hex editor.
 `Tools → Hex Compare…` opens a picker with a **Source file** and a
 **Target file** row (each an editable path with its own `Browse…` button)
 and opens a side-by-side diff on `Compare`. Several tool windows can be
@@ -137,6 +140,17 @@ importable, else `objdump`; a forced engine that isn't installed fails
 soft) — it affects newly opened views. Binary parsing happens in the
 background; re-opening a different file replaces the views' target while
 already-open windows keep their snapshot.
+
+For a **universal (fat) Mach-O**, the slice matching this Mac's
+architecture is loaded first (`arm64`, or a variant such as `arm64e`, on
+Apple Silicon; `x86_64` on Intel). `Disassembler ▸ Slice` — or the slice
+dropdown on the summary card — switches to another slice: it is parsed in
+the background and opens its own Disassembly window, while windows of the
+previous slice stay open. Every window of a fat file is titled with its
+slice's architecture (e.g. `Symbols — lipo [x86_64]`). The hex editor
+always shows the whole file; jumps from the views land on the selected
+slice's bytes. On macOS the objdump engine is llvm-objdump (it selects the
+slice with `--arch`); GNU objdump is only used on Linux.
 
 Like the terminal UI, files are read on demand — multi-GB files open
 instantly — and searches, saves and diff comparisons stream in the

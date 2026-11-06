@@ -156,6 +156,14 @@ def delete_if_exists(tag: int | str) -> None:
         dpg.delete_item(tag)
 
 
+def arch_suffix(info) -> str:
+    """Window-title suffix naming the slice of a fat binary (``" [arm64e]"``).
+
+    Only fat-file slices start past offset 0, so thin files get no suffix.
+    """
+    return f" [{info.arch}]" if info is not None and info.slice_offset else ""
+
+
 def human_size(size: int) -> str:
     """Human-readable byte size: '300 bytes', '1.0 KiB', '336.5 MiB'."""
     if size >= 1024 * 1024 * 1024:

@@ -34,6 +34,24 @@ CHILD_MAIN = "from cheerleader.gui import main; main()"
 CONFIG_DIR_ENV = "CHEERLEADER_CONFIG_DIR"  # see cheerleader.gui.settings
 
 
+def _write_fat(tmp: str, thin: str) -> str:
+    """Wrap the thin Mach-O *thin* twice into a fat file: an x86_64 slice
+    (cputype patched) at 0x1000 and the arm64 original at 0x2000."""
+    with open(thin, "rb") as fh:
+        arm = fh.read()
+    x86 = arm[:4] + struct.pack("<Ii", 0x01000007, 3) + arm[12:]
+    slices = [(0x01000007, 3, x86), (0x0100000C, 0, arm)]
+    header = struct.pack(">II", 0xCAFEBABE, len(slices))
+    for i, (cputype, cpusubtype, data) in enumerate(slices):
+        offset = 0x1000 * (i + 1)
+        header += struct.pack(">iiIII", cputype, cpusubtype, offset, len(data), 12)
+    body = b"".join(data.ljust(0x1000, b"\x00") for _, _, data in slices)
+    path = os.path.join(tmp, "fat.bin")
+    with open(path, "wb") as fh:
+        fh.write(header.ljust(0x1000, b"\x00") + body)
+    return path
+
+
 def _write_inputs(tmp: str) -> tuple[str, str]:
     # a: valid minimal Mach-O (one LC_SEGMENT_64/__text) + payload — the
     # editor flow's pick exercises the background binary parse and the D2
@@ -42,7 +60,7 @@ def _write_inputs(tmp: str) -> tuple[str, str]:
     b = os.path.join(tmp, "b.bin")
     header = b"\xcf\xfa\xed\xfe" + struct.pack(
         "<IIIIIII",
-        0x0100000C,  # cputype: arm64 (0x0100000D would be arm64e — unmapped)
+        0x0100000C,  # cputype: arm64
         0,  # cpusubtype
         2,  # filetype: MH_EXECUTE
         1,  # ncmds
@@ -290,6 +308,35 @@ def headless_checks() -> None:
         finally:
             dpg.destroy_context()
         print("  ok  engine: radio submenu + override pick headless")
+
+        dpg.create_context()
+        try:
+            # Fat binary: slices listed, the native one parsed first, and
+            # Disassembler ▸ Slice switches while the old window stays.
+            from cheerleader.gui import app as app_mod
+            from cheerleader.gui.const import SLICE_MENU
+
+            fat = _write_fat(tmp, a)
+            app = GuiApp()
+            build_shell(app)
+            dpg.get_item_callback(DLG_OPEN)(DLG_OPEN, {"selections": {"f": fat}})
+            _settle_parse(app)
+            assert app.current_slices == [(0, "x86_64"), (1, "arm64")]
+            assert app.current_slice == app_mod.default_slice(app.current_slices)
+            assert app.current_info is not None
+            other = 1 - app.current_slice
+            items = dpg.get_item_children(SLICE_MENU)[1]
+            dpg.get_item_configuration(items[other])["callback"]()
+            _settle_parse(app)
+            assert app.current_slice == other
+            disasm = [t for t in app.tools if t.controller.view_kind == "disasm"]
+            assert len(disasm) == 2  # one window per slice
+            assert {t.controller.slice_offset for t in disasm} == {0x1000, 0x2000}
+            app.tick()
+            _join_worker(app)
+        finally:
+            dpg.destroy_context()
+        print("  ok  slices: fat binary — native default + slice switch headless")
 
 
 def _launch(name: str, timeout: float) -> bool:

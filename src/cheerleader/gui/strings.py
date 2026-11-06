@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING
 import dearpygui.dearpygui as dpg
 
 from cheerleader.gui.const import KEY_ESCAPE
-from cheerleader.gui.tooling import find_tool, focus_tool
+from cheerleader.gui.tooling import arch_suffix, find_tool, focus_tool
 from cheerleader.gui.views import TableController, ViewSpec, open_table_view
 from cheerleader.gui.workers import BusyTracker, EventKind, WorkerHandle, start_worker
 from cheerleader.libs.disasm import extract_strings
@@ -167,7 +167,9 @@ def open_strings(app: GuiApp, path: str) -> None:
     info = app.current_info
     if info is None or info.path != path:
         return
-    existing = find_tool(app, view_kind="strings", path=path)
+    existing = find_tool(
+        app, view_kind="strings", path=path, slice_offset=info.slice_offset
+    )
     if existing is not None:
         focus_tool(existing)
         return
@@ -176,7 +178,7 @@ def open_strings(app: GuiApp, path: str) -> None:
         lambda window, status_tag, ns: StringsController(
             app, info, window=window, status_tag=status_tag, ns=ns
         ),
-        f"Strings — {os.path.basename(path)}",
+        f"Strings — {os.path.basename(path)}{arch_suffix(info)}",
     )
     controller._install_keys()
     controller.start()

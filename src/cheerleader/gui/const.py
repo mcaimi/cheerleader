@@ -37,7 +37,8 @@ MENU_TAG = "gui-menubar"
 # height pattern as the tool windows' status strips).
 SHELL_FILL = "gui-shell-fill"
 SHELL_STATUS_BAR = "gui-shell-status-bar"
-SHELL_STATUS = "gui-shell-status"
+SHELL_STATUS = "gui-shell-status"  # left: the file path (+ a note)
+SHELL_STATUS_RIGHT = "gui-shell-status-right"  # right: architecture · engine
 
 # Shell-level file dialog (File → Open File…). The compare picker owns its
 # two file dialogs privately (see dialogs.CompareOpenDialog).
@@ -62,6 +63,7 @@ MI_INFO = "gui-mi-info"
 MI_SHORTCUTS = "gui-mi-shortcuts"
 MI_RECENT = "gui-mi-recent"  # File ▸ Open Recent submenu (rebuilt on change)
 WINDOW_MENU = "gui-window-menu"  # Window menu (rebuilt when tools open/close)
+SLICE_MENU = "gui-slice-menu"  # Disassembler ▸ Slice radio submenu (fat files)
 DISASM_MENU_ITEMS: tuple[tuple[str, str, str], ...] = (
     # (label, menu-item tag, inspector kind — key of app.INSPECTOR_OPENERS)
     ("Disassembly…", MI_DISASM, "disasm"),
