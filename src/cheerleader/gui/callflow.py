@@ -55,20 +55,17 @@ try:
 except ImportError:
     dpg = None  # type: ignore[assignment]
 
+from cheerleader.gui.const import (
+    NODE_W,  # estimated content width of a full-instruction node + margin
+    LINE_H,  # one text row inside a node
+    NODE_PAD_H,  # title bar + attribute padding
+    X_GAP,  # horizontal gap between depth columns
+    Y_GAP,  # vertical gap between stacked nodes
+)
+
 def edge_color(etype: str) -> tuple[int, int, int, int]:
     """DPG color for a CFG edge type (TUI ``_EDGE_STYLE`` parity)."""
     return EDGE_COLORS.get(etype, COL_DIM)
-
-
-# ── CFG node-graph layout (pure; unit-tested without a display) ──────────────
-
-# Estimated node geometry (px). DPG nodes auto-size to their content; the
-# layout only needs plausible boxes so columns/stacks don't overlap.
-NODE_W = 480  # estimated content width of a full-instruction node + margin
-LINE_H = 19  # one text row inside a node
-NODE_PAD_H = 46  # title bar + attribute padding
-X_GAP = 70  # horizontal gap between depth columns
-Y_GAP = 40  # vertical gap between stacked nodes
 
 
 def _raw_hex(raw: bytes, limit: int | None = 6) -> str:

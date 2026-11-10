@@ -7,7 +7,7 @@ over a start panel (open, compare, recent files). ``File → Open File…``
 (Ctrl+O) or ``File → Open Recent`` loads a file (parsed in the
 background) and turns the panel into the file's summary card; a supported
 binary (Mach-O/ELF) opens the Disassembly view and enables the
-**Disassembler** menu's inspection views (plan v3), anything else opens
+**Disassembler** menu's inspection views, anything else opens
 in the hex editor. Tools show in cascaded **floating windows** — several
 may be open at once, each with its own menu bar and status strip; the
 **Window** menu lists and arranges them. Recent files and the View zoom
@@ -149,7 +149,7 @@ class GuiApp:
         # None until the first successful open. Closing an editor window
         # does not unload it.
         self.current_file: str | None = None
-        # Parsed model of current_file (plan v3): set by the background
+        # Parsed model of current_file: set by the background
         # parse worker; gates the Disassembler menu. None for files that
         # are not supported executables (hex tools still work).
         self.current_info: BinaryInfo | None = None
@@ -283,7 +283,7 @@ class GuiApp:
                 tool.tick()
 
     def _start_parse(self, path: str) -> None:
-        """Parse *path* on a worker thread (plan v3, D1).
+        """Parse *path* on a worker thread.
 
         `formats.parse` reads the whole file, so — like the TUI's load — it
         runs off the render thread. The completion event is owned by this
@@ -333,8 +333,7 @@ class GuiApp:
         self.current_info = info
         _set_disasm_enabled(True)
         _refresh_slice_ui(self)
-        # Plan v3 decision 4: a successful open shows the Disassembly view
-        # in a new window (focus guard dedupes same-file re-opens).
+        
         if self.current_file is not None:
             INSPECTOR_OPENERS["disasm"](self, self.current_file)
 
@@ -985,7 +984,7 @@ def build_shell(app: GuiApp) -> int | str:
             # (rebuilt per open file; a placeholder item for thin files).
             dpg.add_menu(label="Slice", tag=SLICE_MENU)
 
-            # Engine radio submenu (plan v3 §5, D5): process-global
+            # Engine radio submenu: process-global
             # preference, applies to newly opened/re-run views — kept
             # enabled even without a loaded binary.
             with dpg.menu(label="Engine", tag=ENGINE_MENU):

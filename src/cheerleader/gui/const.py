@@ -220,3 +220,13 @@ SHORTCUTS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         ),
     ),
 )
+
+# ── CFG node-graph layout (pure; unit-tested without a display) ──────────────
+
+# Estimated node geometry (px). DPG nodes auto-size to their content; the
+# layout only needs plausible boxes so columns/stacks don't overlap.
+NODE_W = 480  # estimated content width of a full-instruction node + margin
+LINE_H = 19  # one text row inside a node
+NODE_PAD_H = 46  # title bar + attribute padding
+X_GAP = 70  # horizontal gap between depth columns
+Y_GAP = 40  # vertical gap between stacked nodes
