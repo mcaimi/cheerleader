@@ -2,52 +2,21 @@
 
 from __future__ import annotations
 
-import re
-
 from rich.text import Text
 
 from cheerleader.libs.cfg import ControlFlowGraph
+from cheerleader.libs.highlight import mnemonic_kind, operand_spans
 
-_MNEM_RET = frozenset({"ret", "retq", "retn", "eret", "iret", "iretq"})
-_MNEM_NOP = frozenset({"nop", "nopw", "nopl", "fnop"})
-_MNEM_STACK = frozenset({"push", "pop", "pushf", "popf", "pushfq", "popfq"})
-_MNEM_CMP = frozenset({
-    "cmp", "test", "tst", "cmn", "fcmp", "ftst",
-    "ucomisd", "ucomiss", "comisd", "comiss",
-})
-_MNEM_BRANCH = frozenset({
-    "call", "bl", "blr", "blx", "br", "b",
-    "jmp", "je", "jne", "jz", "jnz", "jl", "jg", "jle", "jge",
-    "ja", "jb", "jae", "jbe", "jc", "jnc", "js", "jns", "jo", "jno",
-    "jp", "jnp", "jcxz", "jecxz", "jrcxz",
-    "cbz", "cbnz", "tbz", "tbnz",
-})
-_MNEM_LOGIC = frozenset({
-    "and", "or", "xor", "not", "neg", "inc", "dec", "adc", "sbc",
-    "madd", "msub", "sdiv", "udiv", "lsl", "lsr", "asr", "ror",
-    "shl", "shr", "sar", "rol", "adcs", "subs", "adds", "ands",
-    "orr", "eor", "bic", "mvn",
-})
-
-_X86_REG_RE = re.compile(
-    r'\b('
-    r'r(?:ax|bx|cx|dx|si|di|sp|bp|ip|flags)|'
-    r'r(?:1[0-5]|[89])[bwd]?|'
-    r'e(?:ax|bx|cx|dx|si|di|sp|bp|ip|flags)|'
-    r'[abcd][xhl]|(?:si|di|sp|bp)l?|'
-    r'(?:xmm|ymm|zmm)(?:[12]?\d|3[01])|'
-    r'mm[0-7]|[cdefgs]s|cr[0-8]|dr[0-7]'
-    r')\b',
-    re.IGNORECASE,
-)
-_ARM_REG_RE = re.compile(
-    r'\b('
-    r'[xw](?:[12]?\d|30)|sp|lr|xzr|wzr|fp|pc|'
-    r'[vqdsb](?:[12]?\d|3[01])(?:\.\d[bBhHsS])?'
-    r')\b',
-)
-_HEX_RE = re.compile(r'#?-?0x[0-9a-fA-F]+')
-_DEC_IMM_RE = re.compile(r'#-?\d+(?!\w)')
+_MNEM_STYLE = {
+    "ret": "bold red",
+    "branch": "bold yellow",
+    "nop": "dim",
+    "stack": "cyan",
+    "cmp": "magenta",
+    "mem": "green",
+    "arith": "blue",
+}
+_OPERAND_STYLE = {"imm": "yellow", "reg": "bright_green"}
 
 _EDGE_STYLE = {
     "fall":     ("green",   "fall"),
@@ -59,54 +28,18 @@ _EDGE_STYLE = {
 
 
 def _colorize_mnemonic(mnemonic: str) -> Text:
-    m = mnemonic.lower()
-    if m in _MNEM_RET:
-        return Text(mnemonic, style="bold red")
-    if m in _MNEM_BRANCH or m.startswith("b.") or (m.startswith("j") and len(m) > 1):
-        return Text(mnemonic, style="bold yellow")
-    if m in _MNEM_NOP:
-        return Text(mnemonic, style="dim")
-    if m in _MNEM_STACK:
-        return Text(mnemonic, style="cyan")
-    if m in _MNEM_CMP:
-        return Text(mnemonic, style="magenta")
-    if m.startswith(("mov", "ldr", "str", "ldp", "stp", "lea", "ld", "st")):
-        return Text(mnemonic, style="green")
-    if m in _MNEM_LOGIC or m.startswith(("add", "sub", "mul", "imul", "div", "idiv")):
-        return Text(mnemonic, style="blue")
-    return Text(mnemonic)
+    style = _MNEM_STYLE.get(mnemonic_kind(mnemonic))
+    return Text(mnemonic, style=style) if style else Text(mnemonic)
 
 
 def _colorize_operands(op_str: str, arch: str) -> Text:
-    if not op_str:
-        return Text("")
-    reg_re = _ARM_REG_RE if "arm" in arch.lower() else _X86_REG_RE
-
-    spans: list[tuple[int, int, str]] = []
-    for m in _HEX_RE.finditer(op_str):
-        spans.append((m.start(), m.end(), "yellow"))
-    for m in _DEC_IMM_RE.finditer(op_str):
-        spans.append((m.start(), m.end(), "yellow"))
-    for m in reg_re.finditer(op_str):
-        spans.append((m.start(), m.end(), "bright_green"))
-
-    spans.sort(key=lambda x: x[0])
-    deduped: list[tuple[int, int, str]] = []
-    last = 0
-    for s, e, style in spans:
-        if s >= last:
-            deduped.append((s, e, style))
-            last = e
-
     result = Text()
-    pos = 0
-    for s, e, style in deduped:
-        if pos < s:
-            result.append(op_str[pos:s])
-        result.append(op_str[s:e], style=style)
-        pos = e
-    if pos < len(op_str):
-        result.append(op_str[pos:])
+    for text, kind in operand_spans(op_str, arch):
+        style = _OPERAND_STYLE.get(kind)
+        if style:
+            result.append(text, style=style)
+        else:
+            result.append(text)
     return result
 
 
@@ -197,9 +130,7 @@ def _render_cfg(cfg: ControlFlowGraph) -> str:
         for i, (tgt, etype) in enumerate(succs):
             prefix = "   └──" if i == len(succs) - 1 else "   ├──"
             color, label = _EDGE_STYLE.get(etype, ("dim", etype))
-            if etype == "ret":
-                lines.append(f"{prefix} [{color}]{label}[/{color}]")
-            elif etype == "indirect":
+            if etype == "ret" or etype == "indirect":
                 lines.append(f"{prefix} [{color}]{label}[/{color}]")
             else:
                 tgt_num = block_idx.get(tgt)
