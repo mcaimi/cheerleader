@@ -40,16 +40,20 @@ def _detect_objdump() -> Optional[tuple[str, bool]]:
 
     Returns ``(path, is_llvm)`` or ``None`` if not found.
 
-    On macOS llvm-objdump is tried first (it handles Mach-O slices well);
-    elsewhere GNU objdump is preferred for stable output — llvm-objdump 23
-    replaces stripped binaries with content-less debuginfod copies when
-    DEBUGINFOD_URLS is set, emitting ``...`` instead of instructions.
+    On macOS only an LLVM objdump is accepted: ``llvm-objdump``, or an
+    ``objdump`` that is LLVM-based (Xcode's is). It selects the slice of a
+    fat binary with ``--arch``; GNU objdump cannot, and fat binaries only
+    exist on macOS. Elsewhere GNU objdump is preferred for stable output —
+    llvm-objdump 23 replaces stripped binaries with content-less debuginfod
+    copies when DEBUGINFOD_URLS is set, emitting ``...`` instead of
+    instructions.
     """
     global _objdump_info
     if _objdump_info is not None:
         return _objdump_info
 
-    if platform.system() == "Darwin":
+    darwin = platform.system() == "Darwin"
+    if darwin:
         candidates = ("llvm-objdump", "objdump")
     else:
         candidates = ("objdump", "llvm-objdump")
@@ -59,6 +63,8 @@ def _detect_objdump() -> Optional[tuple[str, bool]]:
         if path is None:
             continue
         is_llvm = _check_llvm(path)
+        if darwin and not is_llvm:
+            continue  # GNU objdump on macOS: no fat-slice selection
         _objdump_info = (path, is_llvm)
         return _objdump_info
     return None
@@ -79,17 +85,19 @@ def _check_llvm(path: str) -> bool:
 
 # ---- arch mapping ----------------------------------------------------------
 
-_LLVM_ARCH = {
-    "x86_64": "x86_64",
-    "x86": "i386",
-    "arm64": "arm64",
-    "arm64e": "arm64",
-    "arm64_32": "arm64_32",
-    "aarch64": "aarch64",
-    "arm": "arm",
-    "riscv": "riscv64",
-    "riscv64": "riscv64",
-}
+# Mach-O architecture names (formats.macho.cpu_arch_name: "x86_64",
+# "x86_64h", "arm64", "arm64e", "arm64e.x1", …) are llvm-objdump --arch
+# names already; only the 32-bit x86 family is spelled differently. The
+# name must be exact: --arch=arm64 does not match an arm64e slice.
+_LLVM_ARCH_RENAME = {"x86": "i386"}
+
+
+def _llvm_arch(arch: str) -> str | None:
+    """``--arch`` value selecting the slice of *arch*, or ``None`` when the
+    architecture is unknown (``0x…`` cputype / ``?``)."""
+    if not arch or arch == "?" or arch.startswith("0x"):
+        return None
+    return _LLVM_ARCH_RENAME.get(arch, arch)
 
 
 # ---- command building ------------------------------------------------------
@@ -134,7 +142,7 @@ def _build_command(
 
     # Architecture selector for fat Mach-O
     if not is_elf and is_llvm:
-        llvm_arch = _LLVM_ARCH.get(arch)
+        llvm_arch = _llvm_arch(arch)
         if llvm_arch:
             cmd.append(f"--arch={llvm_arch}")
 
@@ -155,6 +163,10 @@ def _parse_output(
     """
     instructions: list[DisasmInstruction] = []
     func_labels: dict[int, str] = {}
+    # llvm-objdump prints a requested section twice for a fat (universal)
+    # binary (plain disassembly, then "Contents of (__TEXT,__text)
+    # section"): keep each address once.
+    seen: set[int] = set()
 
     for line in text.splitlines():
         # Try function label first (cheaper check)
@@ -171,6 +183,9 @@ def _parse_output(
 
         addr_s, hex_s, mnemonic, op_str = m.groups()
         addr = int(addr_s, 16)
+        if addr in seen:
+            continue
+        seen.add(addr)
         raw = bytes.fromhex(hex_s.replace(" ", "").replace("\t", ""))
         mnemonic = mnemonic.strip()
         op_str = (op_str or "").strip()

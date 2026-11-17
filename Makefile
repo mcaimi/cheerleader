@@ -14,7 +14,7 @@ STAGE_VENV := $(BUILD_DIR)/venv
 SP_DIR     := $(STAGE_VENV)/lib/python3.11/site-packages
 ARTIFACT   := cheerleader-$(VERSION)-$(PLATFORM)
 
-.PHONY: standalone standalone-test standalone-tui-test test clean
+.PHONY: standalone standalone-test standalone-tui-test gui-smoke test clean
 
 ## Run the unit tests
 test:
@@ -54,6 +54,10 @@ standalone-tui-test:
 		rc=$$?; [ $$rc -eq 124 ] || exit $$rc; \
 	fi
 	@echo "TUI launch test passed"
+
+## Smoke-test the GUI: headless shell checks + watchdog launches per mode
+gui-smoke:
+	uv run python scripts/gui_smoke.py
 
 clean:
 	rm -rf $(BUILD_DIR) $(DIST) build wheels

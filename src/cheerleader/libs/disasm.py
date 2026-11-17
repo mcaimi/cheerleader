@@ -11,7 +11,7 @@ def _cs_arch_mode(arch: str, bits: int) -> tuple[int, int]:
         return capstone.CS_ARCH_X86, capstone.CS_MODE_64
     if "x86" in arch:
         return capstone.CS_ARCH_X86, capstone.CS_MODE_32
-    if arch in ("arm64", "arm64e", "arm64_32", "aarch64"):
+    if arch.startswith("arm64") or arch == "aarch64":  # arm64e, arm64e.x1, …
         return capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM
     if arch.startswith("arm"):
         return capstone.CS_ARCH_ARM, capstone.CS_MODE_ARM
@@ -105,12 +105,18 @@ def extract_strings(info: BinaryInfo, min_len: int = 4) -> list[BinaryString]:
     with open(info.path, "rb") as fh:
         data = fh.read()
 
+    # Segment/section file offsets are relative to the parsed slice; the
+    # slice itself starts at slice_offset in a fat binary (0 otherwise).
+    # Reported offsets are absolute file offsets.
+    base = info.slice_offset
+
     # Build a sorted list of (file_start, file_end, "seg,sect") for annotation.
     sec_ranges: list[tuple[int, int, str]] = []
     for seg in info.segments:
         for sect in seg.sections:
             if sect.offset and sect.size:
-                sec_ranges.append((sect.offset, sect.offset + sect.size,
+                start = base + sect.offset
+                sec_ranges.append((start, start + sect.size,
                                    f"{sect.segment},{sect.name}"))
     sec_ranges.sort()
 
@@ -130,7 +136,8 @@ def extract_strings(info: BinaryInfo, min_len: int = 4) -> list[BinaryString]:
     for seg in info.segments:
         if seg.filesize == 0:
             continue
-        seg_data = data[seg.fileoff: seg.fileoff + seg.filesize]
+        seg_start = base + seg.fileoff
+        seg_data = data[seg_start: seg_start + seg.filesize]
         i = 0
         while i < len(seg_data):
             if seg_data[i] in _PRINTABLE:
@@ -138,7 +145,7 @@ def extract_strings(info: BinaryInfo, min_len: int = 4) -> list[BinaryString]:
                 while j < len(seg_data) and seg_data[j] in _PRINTABLE:
                     j += 1
                 if j - i >= min_len:
-                    abs_off = seg.fileoff + i
+                    abs_off = seg_start + i
                     vaddr = (seg.vmaddr + i) if seg.vmaddr else 0
                     results.append(BinaryString(
                         file_offset=abs_off,

@@ -10,7 +10,7 @@ Two related bugs motivated these tests:
 
 2. ``_detect_objdump`` used to prefer ``llvm-objdump`` everywhere.  GNU
    objdump is now preferred on non-Darwin systems for stable output, while
-   macOS keeps llvm-objdump first (it handles Mach-O slices well).
+   macOS accepts LLVM objdump only (it selects fat-binary slices).
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ import subprocess
 import pytest
 
 from cheerleader.libs import objdump as od
-
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -135,3 +134,70 @@ class TestDetectObjdumpPreference:
         monkeypatch.setattr(od.shutil, "which", _which_factory({}))
 
         assert od._detect_objdump() is None
+
+    def test_gnu_objdump_rejected_on_darwin(self, monkeypatch):
+        """A GNU objdump on macOS cannot pick a fat slice: never used."""
+        monkeypatch.setattr(od.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(
+            od.shutil, "which", _which_factory({"objdump": "/opt/bin/objdump"})
+        )
+        monkeypatch.setattr(od, "_check_llvm", lambda path: False)
+
+        assert od._detect_objdump() is None
+
+    def test_llvm_based_objdump_accepted_on_darwin(self, monkeypatch):
+        """Xcode's ``objdump`` is LLVM: fine as the fallback."""
+        monkeypatch.setattr(od.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(
+            od.shutil, "which", _which_factory({"objdump": "/usr/bin/objdump"})
+        )
+        monkeypatch.setattr(od, "_check_llvm", lambda path: True)
+
+        assert od._detect_objdump() == ("/usr/bin/objdump", True)
+
+
+# ── fat-slice selection ──────────────────────────────────────────────────────
+
+
+class TestArchSelector:
+    @pytest.mark.parametrize(
+        "arch, expected",
+        [
+            ("arm64", "--arch=arm64"),
+            ("arm64e", "--arch=arm64e"),  # exact: arm64 does not match it
+            ("arm64e.x1", "--arch=arm64e.x1"),
+            ("x86_64h", "--arch=x86_64h"),
+            ("x86", "--arch=i386"),
+        ],
+    )
+    def test_macho_arch_flag(self, arch, expected):
+        cmd = od._build_command("llvm-objdump", "/b", arch, False, True)
+        assert expected in cmd
+
+    @pytest.mark.parametrize("arch", ["0x0000002A", "?", ""])
+    def test_unknown_arch_has_no_flag(self, arch):
+        cmd = od._build_command("llvm-objdump", "/b", arch, False, True)
+        assert not any(c.startswith("--arch") for c in cmd)
+
+    def test_elf_and_gnu_never_get_arch(self):
+        assert not any(
+            c.startswith("--arch")
+            for c in od._build_command("objdump", "/b", "arm64", True, True)
+            + od._build_command("objdump", "/b", "arm64", False, False)
+        )
+
+
+class TestParseOutput:
+    def test_fat_binary_double_listing_is_deduplicated(self):
+        """llvm-objdump repeats the section for universal binaries."""
+        block = (
+            "0000000100000460 <_main>:\n"
+            "100000460: ff 43 00 d1\tsub\tsp, sp, #0x10\n"
+            "100000464: c0 03 5f d6\tret\n"
+        )
+        text = (
+            "/usr/bin/fat:\n" + block + "Contents of (__TEXT,__text) section\n" + block
+        )
+        instrs, labels = od._parse_output(text)
+        assert [i.addr for i in instrs] == [0x100000460, 0x100000464]
+        assert labels == {0x100000460: "_main"}

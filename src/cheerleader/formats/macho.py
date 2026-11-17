@@ -35,6 +35,25 @@ CPU_TYPE = {
     0x0200000C: "arm64_32",
 }
 
+# cpusubtype → precise architecture name, as reported by Apple's tools
+# (``lipo -archs``) and accepted by ``llvm-objdump --arch``. The top byte of
+# cpusubtype holds capability bits (e.g. pointer-auth ABI) and is ignored.
+CPU_SUBTYPE_MASK = 0x00FFFFFF
+CPU_SUBTYPE_NAME = {
+    (0x0100000C, 1): "arm64v8",
+    (0x0100000C, 2): "arm64e",
+    (0x0100000C, 12): "arm64e.x1",
+    (0x01000007, 8): "x86_64h",
+}
+
+
+def cpu_arch_name(cputype: int, cpusubtype: int) -> str:
+    """Architecture name of a (cputype, cpusubtype) pair: the subtype-
+    specific name when known (``arm64e``), else the CPU family name."""
+    family = CPU_TYPE.get(cputype, f"0x{cputype:08X}")
+    return CPU_SUBTYPE_NAME.get((cputype, cpusubtype & CPU_SUBTYPE_MASK), family)
+
+
 FILE_TYPE = {
     0x1: "MH_OBJECT",
     0x2: "MH_EXECUTE",
@@ -520,7 +539,7 @@ def parse(path: str, slice_index: int = 0) -> MachOInfo:
     hdr = struct.unpack_from(hdr_fmt, data, arch_offset)
     _, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags = hdr[:7]
 
-    arch = CPU_TYPE.get(cputype, f"0x{cputype:08X}")
+    arch = cpu_arch_name(cputype, cpusubtype)
     file_type = FILE_TYPE.get(filetype, f"0x{filetype:02X}")
 
     info = MachOInfo(
@@ -681,12 +700,13 @@ def list_fat_slices(path: str) -> list[tuple[int, str]]:
 
     if fat_magic not in (FAT_MAGIC, FAT_CIGAM):
         with open(path, "rb") as f:
-            hdr = f.read(8)
+            hdr = f.read(12)
         thin_magic = struct.unpack_from("<I", hdr, 0)[0]
         if thin_magic in (MH_MAGIC, MH_CIGAM, MH_MAGIC_64, MH_CIGAM_64):
             endian = "<" if thin_magic in (MH_MAGIC, MH_MAGIC_64) else ">"
-            ct = struct.unpack_from(f"{endian}I", hdr, 4)[0]
-            return [(0, CPU_TYPE.get(ct, f"0x{ct:08X}"))]
+            hdr = hdr.ljust(12, b"\0")  # truncated file: subtype 0
+            ct, st = struct.unpack_from(f"{endian}Ii", hdr, 4)
+            return [(0, cpu_arch_name(ct, st))]
         return [(0, "unknown")]
 
     fat_endian = ">" if fat_magic == FAT_MAGIC else "<"
@@ -696,6 +716,6 @@ def list_fat_slices(path: str) -> list[tuple[int, str]]:
     slices = []
     for i in range(nfat):
         off = i * 20
-        cputype = struct.unpack_from(f"{fat_endian}i", full, off)[0]
-        slices.append((i, CPU_TYPE.get(cputype, f"0x{cputype:08X}")))
+        cputype, cpusubtype = struct.unpack_from(f"{fat_endian}ii", full, off)
+        slices.append((i, cpu_arch_name(cputype, cpusubtype)))
     return slices

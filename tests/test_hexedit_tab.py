@@ -240,10 +240,11 @@ def test_save_flow_reopens_and_clears_busy(tmp_path):
             doc.write(256, b"JELLO")
             dst = tmp_path / "saved.bin"
             tab._run_save(str(dst))
-            done = await _wait_until(lambda: tab._busy is None)
-            assert done, "save never completed"
-            # _save_done re-opened the document at the saved path
-            assert tab._doc.path == str(dst)
+            # _busy is not set on this direct-call path; wait for the actual
+            # completion effect — _save_done re-opening the document — which
+            # arrives via call_from_thread from the save worker.
+            reopened = await _wait_until(lambda: tab._doc.path == str(dst))
+            assert reopened, "save never completed"
             assert tab._doc.read(256, 5) == b"JELLO"
             assert not tab._doc.modified
         finally:
@@ -256,6 +257,7 @@ def test_save_failure_notifies_and_clears_busy(tmp_path, monkeypatch):
     async def scenario():
         app, pilot_ctx, pilot, tab = await _boot(tmp_path)
         try:
+
             def boom(self, path, progress=None):
                 raise OSError("disk full")
 

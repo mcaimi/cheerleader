@@ -4,6 +4,10 @@ A terminal-based binary inspector for macOS and Linux. Opens Mach-O executables,
 
 ![cheerleader.png](assets/cheerleader.png)
 
+An experimental GUI is being developed:
+
+![cheerleader-gui.png](assets/cheerleader-gui.png)
+
 ---
 
 ## Requirements
@@ -68,6 +72,123 @@ Unsaved bytes are shown in yellow; `q` and `r` ask before discarding them.
 differing bytes red (bytes past the end of the shorter file count as
 differing). Files are compared offset by offset. Press `n` / `p` to jump to
 the next / previous difference.
+
+---
+
+## GUI (optional)
+
+A native [Dear PyGui](https://github.com/hoffstadt/DearPyGui) front-end for
+the hex modes, shipped as an optional extra so the default toolchain never
+pulls it in:
+
+```sh
+uv sync --extra gui            # or: uv pip install 'cheerleader[gui]'
+```
+
+```sh
+uv run cheerleader-gui
+```
+
+The GUI takes **no CLI switches**: launching shows a start panel (Open
+File…, Compare two files…, your recent files) under a **File / View /
+Disassembler / Tools / Window / Help** menu bar. `File → Open File…`
+(`Ctrl+O`, or `File → Open Recent`) loads a file: the main window then
+shows a summary card (path, size, format · arch, segment/symbol counts)
+with buttons for the hex editor, disassembly, strings and compare, and the
+bottom bar shows the file's path on the left and, on the right, the
+architecture being inspected (with the slice number for a fat binary) and
+the selected disassembly engine. A file that isn't a Mach-O / ELF binary
+opens straight in the hex editor.
+`Tools → Hex Compare…` opens a picker with a **Source file** and a
+**Target file** row (each an editable path with its own `Browse…` button)
+and opens a side-by-side diff on `Compare`. Several tool windows can be
+open at once (they open cascaded), each with its own menu bar listing its
+actions and shortcuts, and its own status strip; the **Window** menu lists
+them, re-cascades them, or closes every window without unsaved edits.
+`View` zooms all text (`Ctrl+=` / `Ctrl+-` / `Ctrl+0`); recent files and
+the zoom level are remembered in `~/.config/cheerleader/gui.json`.
+`Help → Keyboard Shortcuts` (`F1`) lists every binding.
+
+When the loaded file is a supported binary (Mach-O / ELF), the
+**Disassembler** menu (grayed out otherwise) offers read-only inspection
+views in floating windows: **Segments, Sections, Imports, Symbols,
+Exports** and **Fixups** — columns and filters ported from the terminal
+UI's tabs (Symbols filters stabs/external/undefined; Fixups filters
+binds/rebases). Every table sorts by clicking a column header; Imports,
+Symbols, Exports and Fixups have a live search box; clicking a row shows
+its bytes in the hex editor (opening one if needed). The **Disassembly** window opens automatically on a
+successful open: an executable-section dropdown at the top (TUI selection
+rule) and a virtualized one-instruction-per-row grid (address, bytes,
+mnemonic, operands — multi-GB sections scroll as smoothly as small ones).
+Disassembly runs in the background (`Esc` cancels; capstone is used when
+importable, else `objdump`). `Ctrl+G` jumps to an address; right-click a
+row for call flow, CFG, *Show in hex editor* and *Copy address*. Press
+`c` on a selected row to open the
+**call flow** tree for the enclosing function (click a callee/caller to
+drill in, `b` to go back) or `f` to open its **CFG** — a read-only node
+graph (dpg Node Editor): one block per node with its instructions, one
+colored link per jump/fall-through edge (fall/cond/jump/ret/indirect),
+back-edge and external-target annotations, a minimap for large graphs;
+nodes are fixed and the topology can't be broken. Both are independent
+floating windows that keep their snapshot even if the Disassembly window
+closes. **Strings** scans the binary for printable runs (≥ 4 chars) on a
+background worker and lists them with offset / address / section — the
+search box filters live as you type, and clicking a row shows that
+offset in the hex editor (opening one if needed). The **Disassembler ▸ Engine**
+submenu switches the disassembly engine (Auto picks capstone when
+importable, else `objdump`; a forced engine that isn't installed fails
+soft) — it affects newly opened views. Binary parsing happens in the
+background; re-opening a different file replaces the views' target while
+already-open windows keep their snapshot.
+
+For a **universal (fat) Mach-O**, the slice matching this Mac's
+architecture is loaded first (`arm64`, or a variant such as `arm64e`, on
+Apple Silicon; `x86_64` on Intel). `Disassembler ▸ Slice` — or the slice
+dropdown on the summary card — switches to another slice: it is parsed in
+the background and opens its own Disassembly window, while windows of the
+previous slice stay open. Every window of a fat file is titled with its
+slice's architecture (e.g. `Symbols — lipo [x86_64]`). The hex editor
+always shows the whole file; jumps from the views land on the selected
+slice's bytes. On macOS the objdump engine is llvm-objdump (it selects the
+slice with `--arch`); GNU objdump is only used on Linux.
+
+Like the terminal UI, files are read on demand — multi-GB files open
+instantly — and searches, saves and diff comparisons stream in the
+background (`Esc` cancels). `make gui-smoke` boots the shell and drives the
+open flows headlessly, plus a watchdog launch of the window as a quick
+sanity check (live part needs a display).
+
+### GUI keybindings
+
+| Key | Action |
+| --- | --- |
+Keys act on the focused window only (`F1` shows this list in the app).
+
+| Key | Action |
+| --- | --- |
+| `Ctrl+O` | Open a file |
+| `Ctrl+Q` | Quit (one aggregate confirmation when any window has unsaved edits) |
+| `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | Zoom in / out / reset |
+| `F1` | Keyboard shortcuts |
+| ←→↑↓ · PgUp/PgDn · Home/End | Move the cursor (editor) or scroll both panes (compare); clicking a byte selects it |
+| `Ctrl+Home` / `Ctrl+End` | Editor: jump to the first / last byte |
+| hex digits | Type over the cursor — two digits commit and advance |
+| `Enter` | Edit at the cursor: `de ad be ef`, `0x7f`, `#127` (decimal) or `"text` |
+| `Ctrl+Z` or `u` | Undo the last edit |
+| `Ctrl+S` or `s` | Save via a file dialog (background write with progress) |
+| `Ctrl+F` / `Ctrl+G` or `/` | Go to an offset or search hex bytes / text |
+| `F3` / `Shift+F3` or `n` / `N` | Next / previous match (wraps) |
+| `n` / `p` | Compare: jump to the next / previous difference |
+| `r` | Reload the file(s) from disk (compare mode restarts the diff scan) |
+| `c` | Disassembly: open the call-flow tree for the cursor's function |
+| `f` | Disassembly: open the CFG block view for the cursor's function |
+| `Ctrl+G` | Disassembly: go to an address |
+| `b` | Call-flow window: go back one drill-in level (at the root: close) |
+| `Esc` | Cancel a running search / comparison / dialog / string extraction, or close a call-flow / CFG window |
+| window `X` | Close the tool window (asks before discarding unsaved edits) |
+
+The editor's cursor byte is white on blue; unsaved bytes are shown in yellow; in compare mode matching bytes are green
+and differing bytes red, exactly like the terminal UI.
 
 ---
 
@@ -452,14 +573,45 @@ src/cheerleader/
 │   ├── __init__.py
 │   ├── types.py             # Shared dataclasses (BinaryInfo, Section, Symbol, …)
 │   ├── disasm.py            # Format-agnostic disassembly + string extraction
-│   └── cfg.py               # Call graph + control flow graph builders
-└── tui/
+│   ├── cfg.py               # Call graph + control flow graph builders
+│   ├── objdump.py           # External objdump / llvm-objdump backend
+│   └── hexdoc.py            # Paged hex document, edit overlay, diff kernel
+├── tui/
+│   ├── __init__.py
+│   ├── app.py               # Textual App + top-level widgets
+│   ├── tabs.py              # One TabPane per data view
+│   ├── screens.py           # Modal screens (SlicePicker, CallFlow, CFG)
+│   ├── widgets.py           # Shared widget helpers
+│   ├── hexparse.py          # Hex edit/search expression parsing
+│   ├── hexrender.py         # Shared hex-row layout + rendering
+│   └── highlight.py         # Syntax highlighting for disassembly
+├── gui/                     # Optional Dear PyGui front-end ([gui] extra)
+│   ├── __init__.py          # cheerleader-gui entry point (no CLI switches)
+│   ├── app.py               # Shell: menus, start panel, tool windows, dispatch
+│   ├── tooling.py           # Tool-window plumbing, key focus scoping, menus
+│   ├── virtualgrid.py       # Virtualized row-grid base (pool, scroll, repaint)
+│   ├── hexgrid.py           # Hex + ASCII grid widget
+│   ├── disasmgrid.py        # Instruction grid widget
+│   ├── editor.py            # Hex editor tool controller
+│   ├── compare.py           # Side-by-side hex compare tool controller
+│   ├── views.py             # Sortable/searchable table views (segments, …)
+│   ├── strings.py           # Strings view (background extraction)
+│   ├── disasm.py            # Disassembly window controller
+│   ├── callflow.py          # Call-flow tree + CFG node-graph windows
+│   ├── dialogs.py           # Dialogs (edit, search, save, confirm, shortcuts, …)
+│   ├── workers.py           # Background workers + UiBridge event queue
+│   ├── settings.py          # Persisted preferences (recent files, zoom)
+│   ├── theme.py             # Palette + global theme
+│   └── const.py             # GUI constants + shortcut table
+├── agent/                   # Optional AI features (LLM integration)
+│   ├── __init__.py
+│   ├── agent.py             # LLM agent (langchain / deepagents)
+│   └── agent_settings.py    # .env configuration resolution
+└── util/
     ├── __init__.py
-    ├── app.py               # Textual App + top-level widgets
-    ├── tabs.py              # One TabPane per data view
-    ├── screens.py           # Modal screens (SlicePicker, CallFlow, CFG)
-    ├── widgets.py           # Shared widget helpers
-    └── highlight.py         # Syntax highlighting for disassembly
+    ├── json_parse.py        # JSON parsing helpers for env vars
+    ├── utils.py             # Misc helpers
+    └── uuids.py             # UUID utilities
 ```
 
 ### Format detection
@@ -689,17 +841,22 @@ Seeds a function address map from `N_SECT`-typed symbols and export entries, the
 
 Four-pass basic-block builder: (1) identify leaders from branch targets and post-branch instructions, (2) group instructions into `CFGBlock`s, (3) compute successor edges (`fall`, `cond`, `jump`, `ret`, `indirect`), (4) back-fill predecessor lists. The CFG screen renders blocks in BFS order from the entry block.
 
+### `hexdoc.HexDocument`
+
+Paged, lazily-read view of a file's bytes shared by the TUI and GUI hex views: 64 KiB pages read on demand (LRU-capped), a sparse overlay of pending edits (`{offset: byte}`), undo, save, and chunked background search with cancel/progress callbacks. The same module hosts the compare kernel: `compute_diff_blocks` (block-aligned differing offsets, 8-byte blocks) and `iter_diff` (streaming two-document diff) used by the side-by-side hex compare in both front-ends.
+
 ---
 
 ## Dependencies
 
-| Package    | Role                                                       |
-|------------|------------------------------------------------------------|
-| `textual`  | TUI framework (widgets, layout, events)                    |
-| `capstone` | Cross-platform disassembly engine (x86, ARM, ARM64, RISC-V)|
-| `rich`     | Rich text rendering (pulled in by textual)                 |
+| Package     | Role                                                        |
+|-------------|-------------------------------------------------------------|
+| `textual`   | TUI framework (widgets, layout, events)                     |
+| `capstone`  | Cross-platform disassembly engine (x86, ARM, ARM64, RISC-V) |
+| `rich`      | Rich text rendering (pulled in by textual)                  |
+| `dearpygui` | Optional native GUI front-end (`cheerleader[gui]` extra)    |
 
-The parser cores (`macho.py`, `elf.py`) use only Python stdlib (`struct`, `os`, `dataclasses`, `enum`). `capstone` is imported lazily inside `disassemble_section()` so all other features work even without it.
+The parser cores (`macho.py`, `elf.py`) use only Python stdlib (`struct`, `os`, `dataclasses`, `enum`). `capstone` is imported lazily inside `disassemble_section()` so all other features work even without it. `dearpygui` is an optional extra (`uv sync --extra gui`) — everything TUI-side runs without it.
 
 ---
 
