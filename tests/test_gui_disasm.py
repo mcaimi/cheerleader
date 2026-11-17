@@ -41,11 +41,15 @@ from cheerleader.gui.disasmgrid import (
     ADDR_W,
     BYTES_W,
     MNEM_W,
+    OPERAND_SEGS,
     DisasmGeometry,
     DisasmGrid,
     bytes_text,
+    operand_cells,
     row_texts,
 )
+from cheerleader.gui.theme import COL_CURSOR as THEME_COL_CURSOR
+from cheerleader.gui.theme import MNEM_COLORS, OPERAND_COLORS
 from cheerleader.gui.workers import EventKind, UiEvent, WorkerHandle
 from cheerleader.libs.types import (
     BinaryInfo,
@@ -352,6 +356,65 @@ def test_grid_paint_cursor_row_highlight(dpg_context) -> None:
     other = dpg.get_item_children(f"{grid._grid_tag}-r0")[1]
     cfg0 = dpg.get_item_configuration(other[1])["color"]
     assert tuple(round(c * 255) for c in cfg0) != COL_CURSOR
+
+
+# ── syntax highlighting ───────────────────────────────────────────────────────
+
+
+def _color(tag) -> tuple[int, ...]:
+    return tuple(round(c * 255) for c in dpg.get_item_configuration(tag)["color"])
+
+
+def _ops_text(row: str) -> str:
+    return "".join(dpg.get_value(f"{row}-o{i}") for i in range(OPERAND_SEGS))
+
+
+def test_operand_cells_pad_and_fold() -> None:
+    cells = operand_cells("x0, x1", "arm64")
+    assert len(cells) == OPERAND_SEGS
+    assert cells[:3] == (("x0", "reg"), (", ", "plain"), ("x1", "reg"))
+    assert all(c == ("", "plain") for c in cells[3:])
+    many = ", ".join(f"x{i}" for i in range(10))  # 19 pieces
+    folded = operand_cells(many, "arm64")
+    assert len(folded) == OPERAND_SEGS
+    assert "".join(t for t, _ in folded) == many
+    assert folded[-1][1] == "reg"  # kind of the last folded piece
+
+
+def test_grid_paints_syntax_colors(dpg_context) -> None:
+    instrs = [
+        DisasmInstruction(
+            addr=BASE, size=4, mnemonic="stp", op_str="x29, x30, [sp, #-0x10]!",
+            raw=NOP,
+        ),
+        DisasmInstruction(addr=BASE + 4, size=4, mnemonic="ret", op_str="", raw=NOP),
+    ]
+    with dpg.window(tag="win-hl"):
+        pass
+    grid = DisasmGrid(name="hl")
+    grid.build("win-hl")
+    grid.set_instrs(instrs, arch="arm64")
+    grid.move_to(1)  # cursor on ret; row 0 shows the syntax colors
+    grid.tick()
+    r0 = f"{grid._grid_tag}-r0"
+    assert _ops_text(r0) == "x29, x30, [sp, #-0x10]!"
+    assert _color(f"{r0}-c1") == MNEM_COLORS["mem"]
+    assert dpg.get_value(f"{r0}-o0") == "x29"
+    assert _color(f"{r0}-o0") == OPERAND_COLORS["reg"]
+    assert _color(f"{r0}-o1") == OPERAND_COLORS["plain"]
+    imm = next(
+        i for i in range(OPERAND_SEGS) if dpg.get_value(f"{r0}-o{i}") == "#-0x10"
+    )
+    assert _color(f"{r0}-o{imm}") == OPERAND_COLORS["imm"]
+    # cursor row: every cell overridden with the cursor color
+    r1 = f"{grid._grid_tag}-r1"
+    assert _color(f"{r1}-c1") == THEME_COL_CURSOR
+    assert all(
+        _color(f"{r1}-o{i}") == THEME_COL_CURSOR for i in range(OPERAND_SEGS)
+    )
+    grid.move_to(0)
+    grid.tick()
+    assert _color(f"{r1}-c1") == MNEM_COLORS["ret"]
 
 
 def test_grid_click_selects_row(dpg_context, monkeypatch) -> None:
