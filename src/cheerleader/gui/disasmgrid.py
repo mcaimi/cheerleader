@@ -1,8 +1,9 @@
 """
 Virtualized disassembly grid for the Dear PyGui front-end.
 
-One :class:`~cheerleader.libs.types.DisasmInstruction` per row — four fixed-
-width text cells (address, bytes, mnemonic, operands) in a horizontal group.
+One :class:`~cheerleader.libs.types.DisasmInstruction` per row — fixed-width
+text cells (address, bytes, mnemonic) plus ``OPERAND_SEGS`` operand segments
+in a horizontal group.
 Rendering is *virtualized* exactly like :class:`~cheerleader.gui.hexgrid.HexGrid`:
 a fixed pool of row widgets covers only the visible window; sections with
 10⁵–10⁶ instructions cost the same as a 20-instruction one.
@@ -10,11 +11,20 @@ a fixed pool of row widgets covers only the visible window; sections with
 Row layout (monospace font, zero item spacing — the HexGrid theme trick):
 
     0x0000000100000000  1f 20 03 d5 …           pacibsp      x29, sp
-    └ addr (18 ch)      └ bytes (24 ch)         └ mnemonic (10 ch)
+    └ addr (18 ch)      └ bytes (24 ch)         └ mnemonic   └ operand segments
+                                                  (10 ch)
 
 The bytes cell shows at most 8 bytes (a ``~`` marks longer instructions) so
 the mnemonic column stays aligned; addresses are cyan-dim (``COL_ADDR``),
 bytes dim (``COL_SEP``), cursor row bright (``COL_CURSOR``).
+
+Syntax highlighting: the mnemonic is colored by its
+:func:`~cheerleader.libs.highlight.mnemonic_kind` (``MNEM_COLORS``) and the
+operands are split into ``(text, kind)`` pieces by
+:func:`~cheerleader.libs.highlight.operand_spans`, one colored text item per
+piece (``OPERAND_COLORS``). Zero item spacing + a monospace font make the
+segments read as one string; pieces beyond ``OPERAND_SEGS`` are folded into
+the last segment. The cursor row overrides every color with ``COL_CURSOR``.
 
 Pool, scrollbar, wheel and repaint machinery come from
 :class:`~cheerleader.gui.virtualgrid.VirtualGrid` (shared with HexGrid):
@@ -27,6 +37,9 @@ HexGrid's; headless tests drive the grid through its state methods and the
 same geometry-simulation monkeypatching used by ``tests/test_gui_hexgrid.py``.
 """
 
+from functools import lru_cache
+
+from cheerleader.libs.highlight import mnemonic_kind, operand_spans
 from cheerleader.libs.types import DisasmInstruction
 
 try:
@@ -46,6 +59,8 @@ from cheerleader.gui.theme import (
     COL_CURSOR,
     COL_SEP,
     COL_TEXT,
+    MNEM_COLORS,
+    OPERAND_COLORS,
 )
 from cheerleader.gui.virtualgrid import VirtualGrid
 
@@ -54,6 +69,7 @@ ADDR_W = 18  # "0x" + 16 hex digits
 BYTES_W = 26  # 8 bytes "de ad be ef 00 11 22 33" + truncation marker
 MNEM_W = 10
 MAX_BYTES_SHOWN = 8
+OPERAND_SEGS = 8  # colored text items per row for the operand pieces
 
 
 def bytes_text(raw: bytes) -> str:
@@ -74,6 +90,23 @@ def row_texts(insn: DisasmInstruction) -> tuple[str, str, str, str]:
     )
 
 
+@lru_cache(maxsize=8192)
+def operand_cells(op_str: str, arch: str) -> tuple[tuple[str, str], ...]:
+    """Exactly ``OPERAND_SEGS`` ``(text, kind)`` operand cells.
+
+    Pieces past the last segment are folded into it (keeping the last
+    piece's kind); unused segments are ``("", "plain")``. Cached: the same
+    operand strings recur constantly and repaints happen per frame.
+    """
+    pieces = operand_spans(op_str, arch)
+    if len(pieces) > OPERAND_SEGS:
+        head = pieces[: OPERAND_SEGS - 1]
+        tail = pieces[OPERAND_SEGS - 1 :]
+        pieces = [*head, ("".join(t for t, _ in tail), tail[-1][1])]
+    pieces += [("", "plain")] * (OPERAND_SEGS - len(pieces))
+    return tuple(pieces)
+
+
 class DisasmGeometry:
     """Measured row geometry (HexGrid's :class:`GridGeometry`, row-level)."""
 
@@ -86,8 +119,8 @@ class DisasmGeometry:
         return self.cw > 2.0 and self.row_h > 4.0 and self.origin_y >= 0.0
 
 
-def _blank_row() -> tuple[str, str, str, str]:
-    return (" " * ADDR_W, " " * BYTES_W, " " * MNEM_W, "")
+def _blank_row() -> tuple[str, ...]:
+    return (" " * ADDR_W, " " * BYTES_W, " " * MNEM_W) + ("",) * OPERAND_SEGS
 
 
 class DisasmGrid(VirtualGrid):
@@ -98,15 +131,20 @@ class DisasmGrid(VirtualGrid):
     def __init__(self, *, name: str = "disasm") -> None:
         super().__init__(name=name)
         self._instrs: list[DisasmInstruction] = []
+        self._arch = ""  # selects the register set for operand highlighting
 
     # ── widget construction ───────────────────────────────────────────────
 
     def _build_row(self, base: str) -> tuple[str, tuple[int | str, ...]]:
         addr = dpg.add_text(" " * ADDR_W, tag=f"{base}-addr", color=COL_ADDR)
         cells = tuple(
-            dpg.add_text(" ", tag=f"{base}-c{i}", color=COL_TEXT) for i in range(3)
+            dpg.add_text(" ", tag=f"{base}-c{i}", color=COL_TEXT) for i in range(2)
         )
-        return (base, (addr, *cells))
+        segs = tuple(
+            dpg.add_text("", tag=f"{base}-o{i}", color=COL_TEXT)
+            for i in range(OPERAND_SEGS)
+        )
+        return (base, (addr, *cells, *segs))
 
     def _key_bindings(self):
         """HexGrid navigation parity, one row per instruction."""
@@ -121,9 +159,14 @@ class DisasmGrid(VirtualGrid):
 
     # ── data ───────────────────────────────────────────────────────────────
 
-    def set_instrs(self, instrs: list[DisasmInstruction]) -> None:
-        """Replace the instruction list (resets cursor + scroll)."""
+    def set_instrs(self, instrs: list[DisasmInstruction], *, arch: str = "") -> None:
+        """Replace the instruction list (resets cursor + scroll).
+
+        *arch* (``BinaryInfo.arch``) picks the register set highlighted in
+        the operands.
+        """
         self._instrs = instrs
+        self._arch = arch
         self._cursor = 0
         self._top = 0
         self._dirty_all = True
@@ -228,19 +271,24 @@ class DisasmGrid(VirtualGrid):
             self._geometry = geom
 
     def _paint_slot(self, slot: int) -> None:
-        _base, tags = self._pool[slot]  # tags: addr, bytes, mnemonic, operands
+        _base, tags = self._pool[slot]  # tags: addr, bytes, mnemonic, op segs
         index = self._top + slot
         if index >= self._total_rows():
             texts = _blank_row()
-            colors = (COL_ADDR, COL_SEP, COL_TEXT, COL_TEXT)
+            colors = (COL_ADDR, COL_SEP) + (COL_TEXT,) * (1 + OPERAND_SEGS)
         else:
-            texts = row_texts(self._instrs[index])
-            cursor_row = index == self._cursor
-            colors = (
-                COL_ADDR_CURSOR if cursor_row else COL_ADDR,
-                COL_CURSOR if cursor_row else COL_SEP,
-                COL_CURSOR if cursor_row else COL_TEXT,
-                COL_CURSOR if cursor_row else COL_TEXT,
-            )
+            insn = self._instrs[index]
+            addr, byts, mnem, _ops = row_texts(insn)
+            ops = operand_cells(insn.op_str, self._arch)
+            texts = (addr, byts, mnem, *(t for t, _ in ops))
+            if index == self._cursor:
+                colors = (COL_ADDR_CURSOR,) + (COL_CURSOR,) * (2 + OPERAND_SEGS)
+            else:
+                colors = (
+                    COL_ADDR,
+                    COL_SEP,
+                    MNEM_COLORS[mnemonic_kind(insn.mnemonic)],
+                    *(OPERAND_COLORS[k] for _, k in ops),
+                )
         for tag, text, color in zip(tags, texts, colors, strict=True):
             self._emit(tag, text, color)

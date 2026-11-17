@@ -33,6 +33,24 @@ ERR_COLOR: Color = COL_RED  # inline dialog errors
 COL_ADDR: Color = COL_DIM
 COL_ADDR_CURSOR: Color = COL_BRIGHT
 COL_CURSOR: Color = COL_BLUE  # foreground-only cursor (no background drawn)
+
+# Disassembly syntax highlighting, keyed by cheerleader.libs.highlight kinds.
+# Arithmetic is slate, not the TUI's blue, so no row mimics the blue cursor.
+MNEM_COLORS: dict[str, Color] = {
+    "ret": COL_RED,
+    "branch": COL_YELLOW,
+    "nop": COL_SEP,
+    "stack": (100, 210, 220, 255),  # cyan
+    "cmp": (220, 130, 230, 255),  # magenta
+    "mem": COL_GREEN,
+    "arith": (170, 180, 215, 255),  # slate
+    "plain": COL_TEXT,
+}
+OPERAND_COLORS: dict[str, Color] = {
+    "imm": COL_YELLOW,
+    "reg": (150, 240, 150, 255),  # bright green
+    "plain": COL_TEXT,
+}
 COL_CURSOR_BG: Color = (40, 80, 160, 255)  # drawn cursor background (editor)
 COL_EDITED: Color = COL_YELLOW
 COL_MATCH: Color = (255, 110, 255, 255)  # stands in for black-on-magenta

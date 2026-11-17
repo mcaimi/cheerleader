@@ -291,7 +291,7 @@ class DisasmController(ReadOnlyController):
             return
         seg, sect, instrs, graph = event.payload
         self.call_graph = graph
-        self.grid.set_instrs(instrs)
+        self.grid.set_instrs(instrs, arch=self.info.arch)
         if not instrs:
             engine = pick_engine()
             reason = (
